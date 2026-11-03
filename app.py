@@ -312,7 +312,7 @@ st.markdown("""
 # ==========================================
 # 2. TRAVA DE SEGURANÇA QUE SOME APÓS DIGITAR A SENHA
 # ==========================================
-SENHA_MESTRE = "praesidium2026"  # Altere aqui quando quiser cortar o acesso de teste
+SENHA_MESTRE = "praesidium2026"
 
 if "autenticado" not in st.session_state:
     st.session_state["autenticado"] = False
@@ -432,8 +432,16 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente"):
         else:
             st.sidebar.warning("Preencha Razão Social, CNPJ e CNAE Principal.")
 
-empresas_res = supabase.table("empresas_monitoradas").select("id, razao_social, cnpj, regime_tributario.").execute()
-lista_empresas = empresas_res.data if empresas_res.data else []
+# CONSULTA CORRIGIDA E BLINDADA CONTRA ERROS DE API NA NUVEM
+try:
+    empresas_res = supabase.table("empresas_monitoradas").select("id, razao_social, cnpj, regime_tributario, cnae_principal").execute()
+    lista_empresas = empresas_res.data if empresas_res.data else []
+except Exception:
+    try:
+        empresas_res = supabase.table("empresas_monitoradas").select("*").execute()
+        lista_empresas = empresas_res.data if empresas_res.data else []
+    except Exception:
+        lista_empresas = []
 
 if not lista_empresas:
     st.markdown("""
