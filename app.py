@@ -432,7 +432,7 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente"):
         else:
             st.sidebar.warning("Preencha Razão Social, CNPJ e CNAE Principal.")
 
-empresas_res = supabase.table("empresas_monitoradas").select("id, razao_social, cnpj, regime_tributario, cnae_principal").execute()
+empresas_res = supabase.table("empresas_monitoradas").select("id, razao_social, cnpj, regime_tributario.").execute()
 lista_empresas = empresas_res.data if empresas_res.data else []
 
 if not lista_empresas:
