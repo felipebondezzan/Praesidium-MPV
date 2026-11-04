@@ -1,4 +1,3 @@
-import os
 import io
 import zipfile
 import logging
@@ -328,16 +327,14 @@ st.markdown(CSS_DARK_LUXURY.replace("\n\n", "\n"), unsafe_allow_html=True)
 # ==========================================
 # 2. CONEXÃO SUPABASE (EM CACHE DE ALTA VELOCIDADE)
 # ==========================================
-url_secret = ""
-key_secret = ""
+url = ""
+key = ""
 try:
-    url_secret = st.secrets.get("SUPABASE_URL", "")
-    key_secret = st.secrets.get("SUPABASE_KEY", "")
+    url = str(st.secrets["SUPABASE_URL"]).strip()
+    key = str(st.secrets["SUPABASE_KEY"]).strip()
 except Exception:
-    pass
-
-url: str = str(url_secret or "").strip() or os.environ.get("SUPABASE_URL", "").strip()
-key: str = str(key_secret or "").strip() or os.environ.get("SUPABASE_KEY", "").strip()
+    url = ""
+    key = ""
 
 
 @st.cache_resource
@@ -351,22 +348,17 @@ url_validada = urlparse(url)
 if not url or not key:
     erro_conexao_supabase = (
         "Credenciais do Supabase ausentes. Configure SUPABASE_URL e SUPABASE_KEY "
-        "em st.secrets ou como variáveis de ambiente."
+        "em st.secrets."
     )
 elif url_validada.scheme not in {"https", "http"} or not url_validada.netloc:
     erro_conexao_supabase = "SUPABASE_URL inválida. Informe uma URL completa com http:// ou https://."
-elif not key.startswith(("sb_secret_", "sb_publishable_", "eyJ")):
-    erro_conexao_supabase = (
-        "SUPABASE_KEY tem formato não reconhecido. Use uma chave Supabase secret, "
-        "publishable ou JWT legado."
-    )
 else:
     try:
         supabase = iniciar_conexao_supabase(url, key)
     except Exception:
         erro_conexao_supabase = (
             "Não foi possível inicializar a conexão Supabase. Confira SUPABASE_URL "
-            "e SUPABASE_KEY em st.secrets ou nas variáveis de ambiente."
+            "e SUPABASE_KEY em st.secrets."
         )
 
 if erro_conexao_supabase:
