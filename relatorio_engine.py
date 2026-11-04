@@ -64,12 +64,13 @@ def injetar_css_blindado_relatorio():
     """, unsafe_allow_html=True)
 
 
+@st.cache_data(show_spinner=False)
 def montar_dataframe_relacional(notas: list, itens: list) -> pd.DataFrame:
     if not notas:
         return pd.DataFrame()
 
     mapa_notas = {
-        n["id"]: {
+        n.get("id", f"sem_id_{idx}"): {
             "chave_acesso": str(n.get("chave_acesso", "")),
             "cnpj_emitente": str(n.get("cnpj_emitente", "")),
             "valor_total_nf": float(n.get("valor_total_nf", 0.0)),
@@ -77,7 +78,7 @@ def montar_dataframe_relacional(notas: list, itens: list) -> pd.DataFrame:
             "hash_sha256_xml": str(n.get("hash_sha256_xml", "")),
             "created_at": n.get("created_at", str(date.today()))
         }
-        for n in notas
+        for idx, n in enumerate(notas)
     }
 
     linhas = []
@@ -142,6 +143,7 @@ def montar_dataframe_relacional(notas: list, itens: list) -> pd.DataFrame:
     return pd.DataFrame(linhas)
 
 
+@st.cache_data(show_spinner=False)
 def gerar_html_dossie_analitico(
     empresa_ativa: dict,
     modalidade_fechamento: str,
@@ -282,6 +284,11 @@ def gerar_html_dossie_analitico(
 </html>"""
 
 
+@st.cache_data(show_spinner=False)
+def gerar_csv_auditado(df_filtrado: pd.DataFrame) -> bytes:
+    return df_filtrado.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig") if not df_filtrado.empty else b"Sem dados"
+
+
 def renderizar_modulo_relatorio(
     empresa_ativa,
     imposto_bruto_mes,
@@ -293,7 +300,7 @@ def renderizar_modulo_relatorio(
 ):
     injetar_css_blindado_relatorio()
 
-    with st.expander("📁 6. 📄 Central de Dossiês Analíticos, Filtros de Notas & Exportação ERP", expanded=True):
+    with st.expander("📁 6. 📄 Central de Dossiês Analíticos, Filtros de Notas & Exportação ERP", expanded=False):
         st.markdown(
             f"Configuração do escopo de auditoria para <b>{empresa_ativa['razao_social']}</b> com cruzamento relacional e filtros dinâmicos.",
             unsafe_allow_html=True
@@ -441,7 +448,7 @@ def renderizar_modulo_relatorio(
             empresa_ativa, modalidade_fechamento, imposto_bruto_mes, credito_validado_tempo_real,
             imposto_quarentena, imposto_estornado, notas_filtradas, df_filtrado
         )
-        csv_bytes = df_filtrado.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig") if not df_filtrado.empty else b"Sem dados"
+        csv_bytes = gerar_csv_auditado(df_filtrado)
 
         b1, b2 = st.columns(2)
         with b1:

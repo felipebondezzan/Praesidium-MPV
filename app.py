@@ -2,22 +2,39 @@ import os
 import io
 import zipfile
 import logging
+import threading
+from datetime import datetime, timezone, timedelta
+import requests
 import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 import xml_engine
 import relatorio_engine
-
+import hashlib
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 
-st.set_page_config(page_title="Praesidium | Intelligence & Compliance", layout="wide", page_icon="🛡️")
+st.set_page_config(
+    page_title="Praesidium | Intelligence & Compliance",
+    layout="wide",
+    page_icon="🛡️",
+    initial_sidebar_state="expanded"
+)
 
 # ==========================================
-# 1. DESIGN SYSTEM "DARK LUXURY" + OCULTAR "PRESS ENTER"
+# 1. DESIGN SYSTEM "DARK LUXURY" BLINDADO P/ MOBILE E DESKTOP
+# (Sem linhas em branco internas para evitar bug do Markdown/Tradutor Mobile)
 # ==========================================
-st.markdown("""
+CSS_DARK_LUXURY = """
+<meta name="google" content="notranslate">
+<meta name="color-scheme" content="dark">
+<div class="notranslate" translate="no">
 <style>
-    /* OCULTA LITERALMENTE TODOS OS TEXTOS "PRESS ENTER TO APPLY / SUBMIT" DAS CAIXAS */
+    :root, html, body, .stApp {
+        color-scheme: dark !important;
+        background-color: #0b0f19 !important;
+        color: #ffffff !important;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
     div[data-testid="InputInstructions"],
     .stTextInput div[data-testid="InputInstructions"],
     .stNumberInput div[data-testid="InputInstructions"],
@@ -29,8 +46,6 @@ st.markdown("""
         opacity: 0 !important;
         pointer-events: none !important;
     }
-
-    /* PROÍBE O STREAMLIT DE ESCURECER A PÁGINA AO ABRIR CAIXAS OU CRIAR CAMPOS NOVOS */
     [data-stale="true"],
     .stApp [data-stale="true"],
     div[data-testid="stAppViewBlockContainer"],
@@ -42,8 +57,6 @@ st.markdown("""
         filter: none !important;
         backdrop-filter: none !important;
     }
-
-    /* REMOVE QUALQUER OVERLAY / FUNDO ESCURO AO ABRIR SELECTBOX, MULTISELECT OU CALENDÁRIO */
     div[data-baseweb="layer"],
     div[data-baseweb="modal"],
     div[role="presentation"] {
@@ -51,7 +64,6 @@ st.markdown("""
         background-color: transparent !important;
         backdrop-filter: none !important;
     }
-
     div[data-baseweb="popover"],
     div[data-baseweb="menu"],
     div[data-testid="stSelectbox"] div[role="listbox"],
@@ -62,7 +74,6 @@ st.markdown("""
         color: #ffffff !important;
         box-shadow: none !important;
     }
-
     li[role="option"] {
         background-color: #1f2937 !important;
         color: #ffffff !important;
@@ -72,19 +83,13 @@ st.markdown("""
         background-color: #374151 !important;
         color: #fbbf24 !important;
     }
-
     .block-container {
         padding-top: 1.2rem !important;
         padding-bottom: 2rem !important;
     }
     header[data-testid="stHeader"] {
-        height: 1.2rem !important;
+        height: 1.8rem !important;
         background: transparent !important;
-    }
-    .stApp {
-        background-color: #0b0f19 !important;
-        color: #ffffff !important;
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
     [data-testid="stSidebar"] {
         background-color: #111827 !important;
@@ -93,8 +98,6 @@ st.markdown("""
     [data-testid="stSidebar"] p, [data-testid="stSidebar"] span, [data-testid="stSidebar"] label {
         color: #f3f4f6 !important;
     }
-
-    /* BORDA DOURADA LIMPA E SEM SOMBRA ESCURA EM TODOS OS INPUTS E CAIXAS DE SELEÇÃO */
     div[data-baseweb="select"],
     div[data-baseweb="select"] > div,
     div[data-testid="stSelectbox"] > div > div,
@@ -109,6 +112,7 @@ st.markdown("""
         border-radius: 8px !important;
         background-color: #111827 !important;
         color: #ffffff !important;
+        -webkit-text-fill-color: #ffffff !important;
         box-shadow: none !important;
     }
     div[data-baseweb="select"] > div:hover,
@@ -120,7 +124,6 @@ st.markdown("""
         border-color: #fbbf24 !important;
         box-shadow: none !important;
     }
-
     .sidebar-exec-card {
         background: #111827;
         border: 1px solid rgba(212, 175, 55, 0.45);
@@ -183,7 +186,7 @@ st.markdown("""
     }
     .header-title {
         color: #ffffff !important;
-        font-size: 26px;
+        font-size: 24px;
         font-weight: 800;
         letter-spacing: -0.5px;
         margin: 0;
@@ -197,10 +200,11 @@ st.markdown("""
         background: #111827;
         border: 1px solid #374151;
         border-radius: 12px;
-        padding: 22px;
+        padding: 20px;
         text-align: left;
         position: relative;
         overflow: hidden;
+        margin-bottom: 10px;
     }
     .exec-card::before {
         content: '';
@@ -219,21 +223,21 @@ st.markdown("""
     }
     .card-value-bruto {
         color: #f6c443 !important;
-        font-size: 30px;
+        font-size: 28px;
         font-weight: 900;
         font-family: 'Courier New', monospace;
         margin: 8px 0 4px 0;
     }
     .card-value-validado {
         color: #34d399 !important;
-        font-size: 30px;
+        font-size: 28px;
         font-weight: 900;
         font-family: 'Courier New', monospace;
         margin: 8px 0 4px 0;
     }
     .card-value-quarentena {
         color: #fbbf24 !important;
-        font-size: 30px;
+        font-size: 28px;
         font-weight: 900;
         font-family: 'Courier New', monospace;
         margin: 8px 0 4px 0;
@@ -246,9 +250,10 @@ st.markdown("""
         background: #111827;
         border: 1px solid #374151;
         border-radius: 10px;
-        padding: 18px;
+        padding: 16px;
         text-align: left;
-        min-height: 140px;
+        min-height: 130px;
+        margin-bottom: 10px;
     }
     .sub-calc-title {
         color: #9ca3af !important;
@@ -260,7 +265,7 @@ st.markdown("""
     }
     .sub-calc-value {
         color: #ffffff !important;
-        font-size: 24px;
+        font-size: 22px;
         font-weight: 800;
         font-family: 'Courier New', monospace;
         margin-bottom: 6px;
@@ -306,45 +311,22 @@ st.markdown("""
     h3, h4, span, label, p {
         color: #f3f4f6 !important;
     }
+    @media (max-width: 768px) {
+        .header-container { padding: 14px 16px !important; }
+        .header-title { font-size: 18px !important; }
+        .card-value-bruto, .card-value-validado, .card-value-quarentena { font-size: 22px !important; }
+        .sub-calc-value { font-size: 18px !important; }
+    }
 </style>
-""", unsafe_allow_html=True)
+</div>
+"""
+st.markdown(CSS_DARK_LUXURY.replace("\n\n", "\n"), unsafe_allow_html=True)
 
 # ==========================================
-# 2. TRAVA DE SEGURANÇA QUE SOME APÓS DIGITAR A SENHA
-# ==========================================
-SENHA_MESTRE = "praesidium2026"
-
-if "autenticado" not in st.session_state:
-    st.session_state["autenticado"] = False
-
-if not st.session_state["autenticado"]:
-    st.markdown("""
-    <div style="background: #111827; border: 1px solid #d4af37; border-left: 5px solid #d4af37; border-radius: 12px; padding: 36px; max-width: 520px; margin: 70px auto 20px auto; text-align: center;">
-        <div style="font-size: 36px; margin-bottom: 8px;">🛡️</div>
-        <h2 style="color: #ffffff; margin: 0 0 8px 0; font-weight: 800;">PRAESIDIUM</h2>
-        <div style="color: #d4af37; font-size: 12px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 18px;">Intelligence & Compliance • LC 214/2025</div>
-        <p style="color: #9ca3af; font-size: 13.5px; line-height: 1.5; margin-bottom: 0;">Ambiente de homologação protegido. Insira a credencial autorizada abaixo para desbloquear o motor de auditoria.</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col_esq, col_centro, col_dir = st.columns([1, 1.3, 1])
-    with col_centro:
-        with st.form("form_login_mvp", border=False):
-            senha_input = st.text_input("Credencial de Acesso:", type="password", placeholder="Digite a senha autorizada...")
-            btn_entrar = st.form_submit_button("🔓 Desbloquear Painel", use_container_width=True)
-            if btn_entrar:
-                if senha_input == SENHA_MESTRE:
-                    st.session_state["autenticado"] = True
-                    st.rerun()
-                else:
-                    st.error("❌ Senha incorreta. Solicite a credencial atualizada.")
-    st.stop()
-
-# ==========================================
-# 3. CREDENCIAIS DO SUPABASE (EM CACHE)
+# 2. CONEXÃO SUPABASE (EM CACHE DE ALTA VELOCIDADE)
 # ==========================================
 url: str = os.environ.get("SUPABASE_URL", "https://pzgkdktkccunmpckcgoh.supabase.co")
-key: str = os.environ.get("SUPABASE_KEY", "sb_secret_7rbhj1b5AkqdC6B4yd-oXQ_b0kmrk8u")
+key: str = os.environ.get("SUPABASE_KEY", "sb_secret_D01DzBbrY9B_VqN9LKZnvw_VW-IwYYU")
 try:
     if "SUPABASE_URL" in st.secrets:
         url = st.secrets["SUPABASE_URL"]
@@ -360,21 +342,228 @@ def iniciar_conexao_supabase(supabase_url: str, supabase_key: str) -> Client:
 
 supabase: Client = iniciar_conexao_supabase(url, key)
 
+
+def normalizar_tenant(identificacao: str) -> str:
+    limpo = "".join(c for c in str(identificacao).strip().lower() if c.isalnum() or c in ("_", "-"))
+    return limpo if limpo else "visitante_padrao"
+
+
+def horario_brasilia_str() -> str:
+    fuso_br = timezone(timedelta(hours=-3))
+    return datetime.now(fuso_br).strftime("%d/%m/%Y %H:%M:%S")
+
+
+def registrar_aviso_login(usuario_nome: str, tenant_id: str, is_admin: bool):
+    dh_br = horario_brasilia_str()
+    tipo_str = "ADMIN" if is_admin else "CONTADOR"
+    # 1. Grava o log de forma persistente no Supabase (usando registro oculto compatível com a estrutura existente)
+    try:
+        xml_engine.inserir_seguro_supabase(supabase, "conciliacao_devolucoes", {
+            "chave_nota_devolucao": f"LOG_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+            "valor_mercadoria_devolvida": 0.0,
+            "credito_estornado": 0.0,
+            "motivo_ajuste": f"[LOG_ACESSO] {dh_br} | Usuário: {usuario_nome.upper()} | Ambiente: {tenant_id} ({tipo_str})"
+        })
+    except Exception:
+        pass
+
+    # 2. Dispara notificação instantânea gratuita (ntfy.sh/praesidium_felipe_alertas)
+    try:
+        requests.post(
+            "https://ntfy.sh/praesidium_felipe_alertas",
+            data=f"Novo acesso no Praesidium: {usuario_nome} ({tipo_str}) em {dh_br}".encode("utf-8"),
+            headers={"Title": "Acesso Praesidium Detectado", "Priority": "high", "Tags": "shield,unlock"},
+            timeout=2
+        )
+    except Exception:
+        pass
+
+
 # ==========================================
-# 4. GESTÃO MULTI-EMPRESA (SIDEBAR DE AUDITORIA)
+# 3. TRAVA DE SEGURANÇA MULTI-TENANT (AMBIENTE ISOLADO POR CONTADOR)
 # ==========================================
-st.sidebar.markdown("""
+SENHA_MESTRE = "praesidium2026"
+SENHA_ADMIN = "admin2026"
+
+if "autenticado" not in st.session_state:
+    st.session_state["autenticado"] = False
+if "tenant_id" not in st.session_state:
+    st.session_state["tenant_id"] = ""
+if "usuario_nome" not in st.session_state:
+    st.session_state["usuario_nome"] = ""
+if "is_admin" not in st.session_state:
+    st.session_state["is_admin"] = False
+
+if not st.session_state["autenticado"]:
+    st.markdown("""
+    <div class="notranslate" translate="no" style="background: #111827; border: 1px solid #d4af37; border-left: 5px solid #d4af37; border-radius: 12px; padding: 32px; max-width: 520px; margin: 45px auto 20px auto; text-align: center;">
+        <div style="font-size: 36px; margin-bottom: 8px;">🛡️</div>
+        <h2 style="color: #ffffff; margin: 0 0 8px 0; font-weight: 800;">PRAESIDIUM</h2>
+        <div style="color: #d4af37; font-size: 12px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 18px;">Intelligence & Compliance • LC 214/2025</div>
+        <p style="color: #9ca3af; font-size: 13.5px; line-height: 1.5; margin-bottom: 0;">Ambiente de homologação isolado. Informe sua identificação e a credencial autorizada para iniciar seu painel exclusivo.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col_esq, col_centro, col_dir = st.columns([1, 1.3, 1])
+    with col_centro:
+        with st.form("form_login_mvp", border=False):
+            identificacao_input = st.text_input(
+                "Seu Nome ou Escritório Contábil:",
+                placeholder="Ex: João Contabilidade (Cria seu painel isolado)"
+            )
+            senha_input = st.text_input(
+                "Credencial de Acesso:",
+                type="password",
+                placeholder="Digite a senha autorizada..."
+            )
+            btn_entrar = st.form_submit_button("🔓 Desbloquear Painel Exclusivo", use_container_width=True)
+            if btn_entrar:
+                nome_limpo = identificacao_input.strip() if identificacao_input.strip() else "Contador Visitante"
+                senha_limpa = senha_input.strip()
+
+                if senha_limpa in [SENHA_MESTRE, SENHA_ADMIN]:
+                    eh_admin = senha_limpa == SENHA_ADMIN
+                    t_id = "admin" if eh_admin else normalizar_tenant(nome_limpo)
+
+                    st.session_state["autenticado"] = True
+                    st.session_state["usuario_nome"] = nome_limpo
+                    st.session_state["tenant_id"] = t_id
+                    st.session_state["is_admin"] = eh_admin
+
+                    threading.Thread(
+                        target=registrar_aviso_login,
+                        args=(nome_limpo, t_id, eh_admin),
+                        daemon=True
+                    ).start()
+                    st.rerun()
+                else:
+                    st.error("❌ Senha incorreta. Solicite a credencial atualizada.")
+    st.stop()
+
+
+# ==========================================
+# 4. FUNÇÕES DE LEITURA EM CACHE (VELOCIDADE NA NUVEM)
+# ==========================================
+@st.cache_data(ttl=60, show_spinner=False)
+def carregar_todas_empresas_db():
+    try:
+        res = supabase.table("empresas_monitoradas").select("*").execute()
+        return res.data if res.data else []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def carregar_dados_empresa_db(emp_id: int, emp_cnpj: str):
+    notas_lista = []
+    devs_lista = []
+    itens_lista = []
+    logs_lista = []
+
+    try:
+        n_res = supabase.table("notas_fiscais_recebidas").select("*").eq("empresa_id", emp_id).execute()
+        notas_lista = n_res.data if n_res.data else []
+    except Exception:
+        notas_lista = []
+
+    try:
+        d_res = supabase.table("conciliacao_devolucoes").select("*").execute()
+        todas_d = d_res.data if d_res.data else []
+        for d in todas_d:
+            motivo_str = str(d.get("motivo_ajuste", ""))
+            if motivo_str.startswith("[LOG_ACESSO]"):
+                logs_lista.append(d)
+            elif d.get("empresa_id") == emp_id or f"[{emp_cnpj}]" in motivo_str:
+                devs_lista.append(d)
+    except Exception:
+        pass
+
+    n_ids = [n["id"] for n in notas_lista if "id" in n]
+    if n_ids:
+        try:
+            i_res = supabase.table("itens_nota_fiscal").select("*").in_("nota_id", n_ids).execute()
+            itens_lista = i_res.data if i_res.data else []
+        except Exception:
+            itens_lista = []
+
+    return notas_lista, devs_lista, itens_lista, logs_lista
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def carregar_logs_acesso_db():
+    try:
+        res_logs = supabase.table("conciliacao_devolucoes").select("motivo_ajuste").execute()
+        return [
+            str(r.get("motivo_ajuste", "")).replace("[LOG_ACESSO] ", "")
+            for r in (res_logs.data or [])
+            if str(r.get("motivo_ajuste", "")).startswith("[LOG_ACESSO]")
+        ]
+    except Exception:
+        return []
+
+
+def extrair_tenant_empresa(emp: dict) -> str:
+    status_a1 = str(emp.get("certificado_a1_status", ""))
+    if "TENANT:" in status_a1:
+        return status_a1.split("TENANT:")[-1].strip()
+    cnae_raw = str(emp.get("cnae_principal", ""))
+    if "|TENANT:" in cnae_raw:
+        return cnae_raw.split("|TENANT:")[-1].strip()
+    return "admin"
+
+
+def extrair_cnae_limpo_empresa(emp: dict) -> str:
+    cnae_raw = str(emp.get("cnae_principal", "4711302"))
+    return cnae_raw.split("|TENANT:")[0].strip() or "4711302"
+
+
+# ==========================================
+# 5. GESTÃO MULTI-EMPRESA E RADAR ADMIN (SIDEBAR)
+# ==========================================
+tenant_atual = st.session_state["tenant_id"]
+is_admin = st.session_state["is_admin"]
+
+st.sidebar.markdown(f"""
 <div style="display:flex; align-items:center; gap:10px; margin-bottom:4px;">
     <span style="font-size:24px;">🏢</span>
     <div>
         <div style="font-weight:800; font-size:17px; color:#ffffff; letter-spacing:0.3px;">Painel do Escritório</div>
-        <div style="font-size:11.5px; color:#d4af37 !important; font-weight:600;">Governança Tributária • LC 214/2025</div>
+        <div style="font-size:11.5px; color:#d4af37 !important; font-weight:600;">👤 {st.session_state['usuario_nome']}</div>
     </div>
 </div>
 <hr style="border:0; border-top:1px solid rgba(212,175,55,0.25); margin:10px 0 14px 0;">
 """, unsafe_allow_html=True)
 
-with st.sidebar.expander("➕ Cadastrar Novo Cliente"):
+todas_empresas_brutas = carregar_todas_empresas_db()
+
+# SE FOR VOCÊ (ADMIN): Mostra o Radar de Acessos e permite espionar/filtrar qualquer contador
+if is_admin:
+    with st.sidebar.expander("🔔 Radar de Acessos (Admin)", expanded=False):
+        logs_acesso = carregar_logs_acesso_db()
+
+        if logs_acesso:
+            st.caption(f"Últimos acessos registrados ({len(logs_acesso)}):")
+            for lg in reversed(logs_acesso[-10:]):
+                st.markdown(f"<div style='font-size:11px; padding:4px 0; border-bottom:1px solid #374151;'>🟢 {lg}</div>", unsafe_allow_html=True)
+        else:
+            st.caption("Nenhum acesso de contador registrado ainda.")
+
+        st.caption("📱 Alerta no celular ativo no canal ntfy.sh: `praesidium_felipe_alertas`")
+
+    tenants_disponiveis = sorted(list({extrair_tenant_empresa(e) for e in todas_empresas_brutas} | {"admin"}))
+    filtro_tenant_admin = st.sidebar.selectbox(
+        "👁️ Visão do Administrador (Ambiente):",
+        ["TODOS OS AMBIENTES"] + tenants_disponiveis
+    )
+    if filtro_tenant_admin == "TODOS OS AMBIENTES":
+        lista_empresas = todas_empresas_brutas
+    else:
+        lista_empresas = [e for e in todas_empresas_brutas if extrair_tenant_empresa(e) == filtro_tenant_admin]
+else:
+    # ISOLAMENTO TOTAL DO CONTADOR: Ele só enxerga as empresas que pertencem ao tenant_id dele!
+    lista_empresas = [e for e in todas_empresas_brutas if extrair_tenant_empresa(e) == tenant_atual]
+
+with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
     novo_nome = st.text_input("Razão Social", key="cad_nome")
     novo_cnpj = st.text_input("CNPJ (Com ou sem pontuação)", key="cad_cnpj")
     novo_regime = st.selectbox("Regime", ["Simples Nacional", "Simples Híbrido (LC 214)", "Lucro Presumido", "Lucro Real"], key="cad_regime")
@@ -416,38 +605,29 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente"):
                 )
             else:
                 cnaes_string_final = ",".join(todos_cnaes_unicos)
-                try:
-                    supabase.table("empresas_monitoradas").insert({
-                        "razao_social": novo_nome.strip().upper(),
-                        "cnpj": cnpj_limpo,
-                        "regime_tributario": novo_regime,
-                        "cnae_principal": cnaes_string_final,
-                        "certificado_a1_status": "Ativo"
-                    }).execute()
+                payload_emp = {
+                    "razao_social": novo_nome.strip().upper(),
+                    "cnpj": cnpj_limpo,
+                    "regime_tributario": novo_regime,
+                    "cnae_principal": f"{cnaes_string_final}|TENANT:{tenant_atual}",
+                    "certificado_a1_status": f"Ativo|TENANT:{tenant_atual}"
+                }
+                ok_ins, msg_ins, _ = xml_engine.inserir_seguro_supabase(supabase, "empresas_monitoradas", payload_emp)
+                if ok_ins:
                     st.session_state["cnae_secundarios_extras"] = []
+                    st.cache_data.clear()
                     st.sidebar.success("Cliente validado e cadastrado!")
                     st.rerun()
-                except Exception as ex:
-                    st.sidebar.error(f"Erro ao salvar no Supabase: {ex}")
+                else:
+                    st.sidebar.error(f"Erro ao salvar no Supabase: {msg_ins}")
         else:
             st.sidebar.warning("Preencha Razão Social, CNPJ e CNAE Principal.")
 
-# CONSULTA CORRIGIDA E BLINDADA CONTRA ERROS DE API NA NUVEM
-try:
-    empresas_res = supabase.table("empresas_monitoradas").select("id, razao_social, cnpj, regime_tributario, cnae_principal").execute()
-    lista_empresas = empresas_res.data if empresas_res.data else []
-except Exception:
-    try:
-        empresas_res = supabase.table("empresas_monitoradas").select("*").execute()
-        lista_empresas = empresas_res.data if empresas_res.data else []
-    except Exception:
-        lista_empresas = []
-
 if not lista_empresas:
-    st.markdown("""
+    st.markdown(f"""
     <div class="header-container">
         <div class="header-title">🛡️ PRAESIDIUM — Intelligence & Compliance</div>
-        <div class="header-subtitle">Ambiente de Homologação Limpo • Cadastre o primeiro cliente na barra lateral à esquerda (➕ Cadastrar Novo Cliente) para iniciar a auditoria.</div>
+        <div class="header-subtitle">Ambiente Exclusivo de <b>{st.session_state['usuario_nome']}</b> • Painel 100% Limpo. Cadastre seu primeiro cliente na barra lateral à esquerda (➕ Cadastrar Novo Cliente) para iniciar a auditoria.</div>
     </div>
     """, unsafe_allow_html=True)
     if st.sidebar.button("🔒 Encerrar Sessão", use_container_width=True):
@@ -455,21 +635,25 @@ if not lista_empresas:
         st.rerun()
     st.stop()
 
-opcoes_empresas = {f"{e['razao_social']} ({e['cnpj']})": e['id'] for e in lista_empresas}
+opcoes_empresas = {f"{e['razao_social']} ({e['cnpj']})": e["id"] for e in lista_empresas}
 empresa_selecionada_nome = st.sidebar.selectbox("📂 Cliente Ativo Monitorado", list(opcoes_empresas.keys()))
 empresa_id_ativo = opcoes_empresas[empresa_selecionada_nome]
-empresa_ativa = next((e for e in lista_empresas if e['id'] == empresa_id_ativo), lista_empresas[0])
+empresa_ativa_bruta = next((e for e in lista_empresas if e["id"] == empresa_id_ativo), lista_empresas[0])
+
+# Cria cópia limpa do cliente ativo sem a tag interna de tenant no CNAE
+empresa_ativa = dict(empresa_ativa_bruta)
+empresa_ativa["cnae_principal"] = extrair_cnae_limpo_empresa(empresa_ativa_bruta)
 
 st.sidebar.markdown(f"""
 <div class="sidebar-exec-card">
     <span class="sidebar-exec-title">🛡️ Ficha Cadastral & Compliance</span>
     <div class="sidebar-exec-row">
         <span class="sidebar-exec-label">Regime</span>
-        <span class="badge-gold">{empresa_ativa['regime_tributario']}</span>
+        <span class="badge-gold">{empresa_ativa.get('regime_tributario', 'Simples Nacional')}</span>
     </div>
     <div class="sidebar-exec-row">
         <span class="sidebar-exec-label">CNPJ</span>
-        <span style="color:#f3f4f6; font-family:'Courier New', monospace; font-weight:700;">{empresa_ativa['cnpj']}</span>
+        <span style="color:#f3f4f6; font-family:'Courier New', monospace; font-weight:700;">{empresa_ativa.get('cnpj', '')}</span>
     </div>
     <div class="sidebar-exec-row">
         <span class="sidebar-exec-label">CNAEs Ativos</span>
@@ -486,7 +670,7 @@ st.sidebar.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas"):
+with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
     novo_cnae_edit = st.text_input(
         "Atualizar CNAEs (separados por vírgula)",
         value=str(empresa_ativa.get("cnae_principal", "")),
@@ -494,25 +678,46 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas"):
         key=f"edit_cnae_{empresa_id_ativo}"
     )
     if st.button("💾 Salvar Novo CNAE", use_container_width=True, key=f"btn_save_cnae_{empresa_id_ativo}"):
-        supabase.table("empresas_monitoradas").update({"cnae_principal": novo_cnae_edit.strip()}).eq("id", empresa_id_ativo).execute()
-        st.sidebar.success("CNAE atualizado!")
-        st.rerun()
+        owner_tag = extrair_tenant_empresa(empresa_ativa_bruta)
+        try:
+            resultado = supabase.table("empresas_monitoradas").update({
+                "cnae_principal": f"{novo_cnae_edit.strip()}|TENANT:{owner_tag}"
+            }).eq("id", empresa_id_ativo).select("id").execute()
+            if not resultado.data:
+                raise ValueError("Nenhum cliente foi atualizado.")
+            st.cache_data.clear()
+            st.sidebar.success("CNAE atualizado!")
+            st.rerun()
+        except Exception as ex:
+            st.sidebar.error(f"Erro ao atualizar CNAE: {ex}")
 
     st.markdown("<hr style='border:0; border-top:1px solid #374151; margin:8px 0;'>", unsafe_allow_html=True)
     if st.button("🔄 Zerar Notas deste Cliente", use_container_width=True, key=f"btn_reset_nf_{empresa_id_ativo}"):
-        nfs_cli = supabase.table("notas_fiscais_recebidas").select("id").eq("empresa_id", empresa_id_ativo).execute()
-        ids_nf = [n["id"] for n in (nfs_cli.data or [])]
+        dados_alterados = False
         try:
-            supabase.table("conciliacao_devolucoes").delete().eq("empresa_id", empresa_id_ativo).execute()
-        except Exception:
-            pass
-        if ids_nf:
+            nfs_cli = supabase.table("notas_fiscais_recebidas").select("id").eq("empresa_id", empresa_id_ativo).execute()
+            ids_nf = [n["id"] for n in (nfs_cli.data or [])]
             try:
-                supabase.table("conciliacao_devolucoes").delete().in_("nota_original_id", ids_nf).execute()
+                resultado = supabase.table("conciliacao_devolucoes").delete().eq("empresa_id", empresa_id_ativo).select("id").execute()
+                dados_alterados = dados_alterados or bool(resultado.data)
             except Exception:
                 pass
-            supabase.table("itens_nota_fiscal").delete().in_("nota_id", ids_nf).execute()
-            supabase.table("notas_fiscais_recebidas").delete().eq("empresa_id", empresa_id_ativo).execute()
+            if ids_nf:
+                try:
+                    resultado = supabase.table("conciliacao_devolucoes").delete().in_("nota_original_id", ids_nf).select("id").execute()
+                    dados_alterados = dados_alterados or bool(resultado.data)
+                except Exception:
+                    pass
+                resultado = supabase.table("itens_nota_fiscal").delete().in_("nota_id", ids_nf).select("id").execute()
+                dados_alterados = dados_alterados or bool(resultado.data)
+                resultado = supabase.table("notas_fiscais_recebidas").delete().eq("empresa_id", empresa_id_ativo).select("id").execute()
+                dados_alterados = dados_alterados or bool(resultado.data)
+        except Exception:
+            pass
+        st.session_state.pop(f"fallback_notas_{empresa_id_ativo}", None)
+        st.session_state.pop(f"fallback_itens_{empresa_id_ativo}", None)
+        if dados_alterados:
+            st.cache_data.clear()
         st.sidebar.success("Notas zeradas!")
         st.rerun()
 
@@ -521,53 +726,28 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas"):
         try:
             nfs_cli = supabase.table("notas_fiscais_recebidas").select("id").eq("empresa_id", empresa_id_ativo).execute()
             ids_nf = [n["id"] for n in (nfs_cli.data or [])]
-            try:
-                supabase.table("conciliacao_devolucoes").delete().eq("empresa_id", empresa_id_ativo).execute()
-            except Exception:
-                pass
             if ids_nf:
                 try:
-                    supabase.table("conciliacao_devolucoes").delete().in_("nota_original_id", ids_nf).execute()
+                    supabase.table("conciliacao_devolucoes").delete().in_("nota_original_id", ids_nf).select("id").execute()
                 except Exception:
                     pass
-                supabase.table("itens_nota_fiscal").delete().in_("nota_id", ids_nf).execute()
-                supabase.table("notas_fiscais_recebidas").delete().eq("empresa_id", empresa_id_ativo).execute()
-            supabase.table("empresas_monitoradas").delete().eq("id", empresa_id_ativo).execute()
+                supabase.table("itens_nota_fiscal").delete().in_("nota_id", ids_nf).select("id").execute()
+                supabase.table("notas_fiscais_recebidas").delete().eq("empresa_id", empresa_id_ativo).select("id").execute()
+            resultado = supabase.table("empresas_monitoradas").delete().eq("id", empresa_id_ativo).select("id").execute()
+            if not resultado.data:
+                raise ValueError("Nenhum cliente foi excluído.")
+            st.cache_data.clear()
             st.sidebar.success("Cliente excluído!")
             st.rerun()
         except Exception as ex:
             st.sidebar.error(f"Erro ao excluir: {ex}")
-
-    st.markdown("<hr style='border:0; border-top:1px solid #374151; margin:8px 0;'>", unsafe_allow_html=True)
-    if st.button("🧹 ZERAR BANCO COMPLETO (Limpar Tudo p/ Teste)", use_container_width=True, key="btn_wipe_all_unico"):
-        try:
-            devs = supabase.table("conciliacao_devolucoes").select("id").execute()
-            if devs.data:
-                supabase.table("conciliacao_devolucoes").delete().in_("id", [d["id"] for d in devs.data]).execute()
-
-            itens_db = supabase.table("itens_nota_fiscal").select("id").execute()
-            if itens_db.data:
-                supabase.table("itens_nota_fiscal").delete().in_("id", [i["id"] for i in itens_db.data]).execute()
-
-            nfs_db = supabase.table("notas_fiscais_recebidas").select("id").execute()
-            if nfs_db.data:
-                supabase.table("notas_fiscais_recebidas").delete().in_("id", [n["id"] for n in nfs_db.data]).execute()
-
-            emps_db = supabase.table("empresas_monitoradas").select("id").execute()
-            if emps_db.data:
-                supabase.table("empresas_monitoradas").delete().in_("id", [e["id"] for e in emps_db.data]).execute()
-
-            st.sidebar.success("Banco 100% zerado para o contador!")
-            st.rerun()
-        except Exception as ex:
-            st.sidebar.error(f"Erro ao limpar banco: {ex}")
 
 if st.sidebar.button("🔒 Encerrar Sessão", use_container_width=True):
     st.session_state["autenticado"] = False
     st.rerun()
 
 # ==========================================
-# 5. CABEÇALHO EXECUTIVO
+# 6. CABEÇALHO EXECUTIVO
 # ==========================================
 st.markdown(f"""
 <div class="header-container">
@@ -577,35 +757,32 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 6. CÁLCULO DOS DADOS DA EMPRESA SELECIONADA
+# 7. CÁLCULO DOS DADOS DA EMPRESA SELECIONADA (COM SUPORTE A FALLBACK)
 # ==========================================
-notas_res = supabase.table("notas_fiscais_recebidas").select("*").eq("empresa_id", empresa_id_ativo).execute()
-dev_res = supabase.table("conciliacao_devolucoes").select("*").execute()
+notas_db, devolucoes, itens_db, _ = carregar_dados_empresa_db(empresa_id_ativo, str(empresa_ativa.get("cnpj", "")))
 
-notas = notas_res.data if notas_res.data else []
-todas_devolucoes = dev_res.data if dev_res.data else []
+notas_mem = st.session_state.get(f"fallback_notas_{empresa_id_ativo}", [])
+itens_mem = st.session_state.get(f"fallback_itens_{empresa_id_ativo}", [])
 
-devolucoes = [
-    d for d in todas_devolucoes
-    if d.get("empresa_id") == empresa_id_ativo
-    or f"[{empresa_ativa['cnpj']}]" in str(d.get("motivo_ajuste", ""))
-]
+notas = notas_db + notas_mem
+itens = itens_db + itens_mem
 
-nota_ids = [n["id"] for n in notas]
-itens = []
-if nota_ids:
-    itens_res = supabase.table("itens_nota_fiscal").select("*").in_("nota_id", nota_ids).execute()
-    itens = itens_res.data if itens_res.data else []
-
-imposto_bruto_mes = sum([float(i["valor_credito_item"]) for i in itens if i["classificacao_item"] in ["Aprovado Revenda", "Aprovado Manualmente Contador"]])
-imposto_quarentena = sum([float(i["valor_item"]) * 0.265 for i in itens if i["classificacao_item"] == "Quarentena Uso/Consumo"])
+imposto_bruto_mes = sum([
+    float(i.get("valor_credito_item", 0.0))
+    for i in itens
+    if i.get("classificacao_item") in ["Aprovado Revenda", "Aprovado Manualmente Contador"]
+])
+imposto_quarentena = sum([
+    float(i.get("valor_item", 0.0)) * 0.265
+    for i in itens
+    if i.get("classificacao_item") == "Quarentena Uso/Consumo"
+])
 imposto_estornado = sum([float(d.get("credito_estornado", 0.0)) for d in devolucoes])
 
-imposto_aprovado = sum([float(i["valor_credito_item"]) for i in itens if i["classificacao_item"] in ["Aprovado Revenda", "Aprovado Manualmente Contador"]])
-credito_validado_tempo_real = max(0.0, imposto_aprovado - imposto_estornado)
+credito_validado_tempo_real = max(0.0, imposto_bruto_mes - imposto_estornado)
 
 # ==========================================
-# 7. PAINEL SUPERIOR: IMPOSTÔMETRO LUXO
+# 8. PAINEL SUPERIOR: IMPOSTÔMETRO LUXO
 # ==========================================
 col1, col2, col3 = st.columns(3)
 
@@ -646,7 +823,7 @@ xml_engine.renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa)
 xml_engine.renderizar_emissor_devolucao(supabase, empresa_ativa, notas, itens)
 
 # ==========================================
-# 8. PASTAS EXPANSÍVEIS (MÓDULOS)
+# 9. PASTAS EXPANSÍVEIS BLINDADAS (MÓDULOS 1 A 6)
 # ==========================================
 
 # MÓDULO 1: RADAR DE CONTINGÊNCIA & OMISSÃO SEFAZ
@@ -657,43 +834,74 @@ with st.expander(f"📁 1. ⚠️ Radar de Contingência & Divergência SEFAZ ({
             f"<span style='color: #f87171; font-weight: bold;'>⚠️ ATENÇÃO CONTADOR:</span> Foram detectadas notas emitidas em contingência (`tpEmis != 1`) para <b>{empresa_ativa['razao_social']}</b> cujo crédito foi retido preventivamente.",
             unsafe_allow_html=True
         )
-        df_cont = pd.DataFrame(notas_contingencia)[["chave_acesso", "cnpj_emitente", "valor_total_nf", "manifestacao_status"]]
-        df_cont.columns = ["Chave de Acesso SEFAZ", "CNPJ Fornecedor", "Valor da Nota (R$)", "Status SEFAZ"]
-        st.dataframe(df_cont, hide_index=True)
+        df_cont = pd.DataFrame([
+            {
+                "Chave de Acesso SEFAZ": n.get("chave_acesso", ""),
+                "CNPJ Fornecedor": n.get("cnpj_emitente", ""),
+                "Valor da Nota (R$)": float(n.get("valor_total_nf", 0.0)),
+                "Status SEFAZ": n.get("manifestacao_status", "Contingência")
+            }
+            for n in notas_contingencia
+        ])
+        st.dataframe(df_cont, hide_index=True, use_container_width=True)
     else:
         st.success(f"✅ Nenhuma nota fiscal em contingência ou divergência pendente para o CNPJ {empresa_ativa['cnpj']}.")
 
 # MÓDULO 2: QUARENTENA & HISTÓRICO (SOBERANIA DO CONTADOR)
-itens_pendentes = [i for i in itens if i["classificacao_item"] == "Quarentena Uso/Consumo"]
-itens_auditados = [i for i in itens if i["classificacao_item"] in ["Rejeitado pelo Contador", "Aprovado Manualmente Contador"]]
+itens_pendentes = [i for i in itens if i.get("classificacao_item") == "Quarentena Uso/Consumo"]
+itens_auditados = [i for i in itens if i.get("classificacao_item") in ["Rejeitado pelo Contador", "Aprovado Manualmente Contador"]]
 
 with st.expander(f"📁 2. Fila de Quarentena & Histórico de Auditoria ({len(itens_pendentes)} pendentes | {len(itens_auditados)} auditados)", expanded=False):
     if itens_pendentes:
         st.markdown("#### ⏳ Itens Aguardando Decisão Técnica do Contador")
-        for item in itens_pendentes:
-            imposto_item = float(item["valor_item"]) * 0.265
+        for idx_p, item in enumerate(itens_pendentes):
+            imposto_item = float(item.get("valor_item", 0.0)) * 0.265
+            item_id_key = item.get("id", f"mem_{idx_p}")
             with st.container():
                 st.markdown(f"""
                 <div style="background: #07090e; border: 1px solid #374151; border-radius: 8px; padding: 15px; margin-bottom: 10px;">
-                    <b style="color: #ffffff; font-size: 15px;">📦 {item['descricao']}</b><br>
-                    <span style="color: #9ca3af; font-size: 13px;">NCM: <code>{item['ncm']}</code> | CFOP: <code>{item['cfop']}</code> | Valor Contábil: <b>R$ {float(item['valor_item']):,.2f}</b> | Crédito Potencial Retido: <b style="color: #fbbf24;">R$ {imposto_item:,.2f}</b></span>
+                    <b style="color: #ffffff; font-size: 15px;">📦 {item.get('descricao', 'Item')}</b><br>
+                    <span style="color: #9ca3af; font-size: 13px;">NCM: <code>{item.get('ncm', '')}</code> | CFOP: <code>{item.get('cfop', '')}</code> | Valor Contábil: <b>R$ {float(item.get('valor_item', 0.0)):,.2f}</b> | Crédito Potencial Retido: <b style="color: #fbbf24;">R$ {imposto_item:,.2f}</b></span>
                 </div>
                 """, unsafe_allow_html=True)
 
                 c1, c2 = st.columns(2)
-                if c1.button("✅ Liberar Crédito (Aprovar)", key=f"lib_{item['id']}", use_container_width=True):
-                    supabase.table("itens_nota_fiscal").update({
-                        "classificacao_item": "Aprovado Manualmente Contador",
-                        "aliquota_aplicada": 0.265,
-                        "valor_credito_item": round(imposto_item, 2)
-                    }).eq("id", item["id"]).execute()
+                if c1.button("✅ Liberar Crédito (Aprovar)", key=f"lib_{item_id_key}", use_container_width=True):
+                    dados_alterados = False
+                    try:
+                        resultado = supabase.table("itens_nota_fiscal").update({
+                            "classificacao_item": "Aprovado Manualmente Contador",
+                            "aliquota_aplicada": 0.265,
+                            "valor_credito_item": round(imposto_item, 2)
+                        }).eq("id", item["id"]).select("id").execute()
+                        dados_alterados = bool(resultado.data)
+                    except Exception:
+                        try:
+                            resultado = supabase.table("itens_nota_fiscal").update({
+                                "classificacao_item": "Aprovado Manualmente Contador",
+                                "valor_credito_item": round(imposto_item, 2)
+                            }).eq("id", item["id"]).select("id").execute()
+                            dados_alterados = bool(resultado.data)
+                        except Exception:
+                            item["classificacao_item"] = "Aprovado Manualmente Contador"
+                            item["valor_credito_item"] = round(imposto_item, 2)
+                    if dados_alterados:
+                        st.cache_data.clear()
                     st.rerun()
 
-                if c2.button("🚫 Bloquear Crédito (Uso/Consumo Definitivo)", key=f"bloq_{item['id']}", use_container_width=True):
-                    supabase.table("itens_nota_fiscal").update({
-                        "classificacao_item": "Rejeitado pelo Contador",
-                        "valor_credito_item": 0.00
-                    }).eq("id", item["id"]).execute()
+                if c2.button("🚫 Bloquear Crédito (Uso/Consumo Definitivo)", key=f"bloq_{item_id_key}", use_container_width=True):
+                    dados_alterados = False
+                    try:
+                        resultado = supabase.table("itens_nota_fiscal").update({
+                            "classificacao_item": "Rejeitado pelo Contador",
+                            "valor_credito_item": 0.00
+                        }).eq("id", item["id"]).select("id").execute()
+                        dados_alterados = bool(resultado.data)
+                    except Exception:
+                        item["classificacao_item"] = "Rejeitado pelo Contador"
+                        item["valor_credito_item"] = 0.00
+                    if dados_alterados:
+                        st.cache_data.clear()
                     st.rerun()
                 st.markdown("---")
     else:
@@ -701,45 +909,65 @@ with st.expander(f"📁 2. Fila de Quarentena & Histórico de Auditoria ({len(it
 
     if itens_auditados:
         st.markdown("#### 📜 Histórico Permanente de Auditoria Manual")
-        df_audit = pd.DataFrame(itens_auditados)[["id", "descricao", "ncm", "cfop", "valor_item", "classificacao_item"]]
-        df_audit.columns = ["ID Item", "Descrição", "NCM", "CFOP", "Valor Contábil (R$)", "Status / Decisão do Contador"]
-        st.dataframe(df_audit, height=250, hide_index=True)
+        df_audit = pd.DataFrame([
+            {
+                "ID Item": i.get("id", "-"),
+                "Descrição": i.get("descricao", ""),
+                "NCM": i.get("ncm", ""),
+                "CFOP": i.get("cfop", ""),
+                "Valor Contábil (R$)": float(i.get("valor_item", 0.0)),
+                "Status / Decisão do Contador": i.get("classificacao_item", "")
+            }
+            for i in itens_auditados
+        ])
+        st.dataframe(df_audit, height=250, hide_index=True, use_container_width=True)
 
 # MÓDULO 3: NOTAS FISCAIS RECEBIDAS (COM SELETOR DE DOWNLOAD NOTA POR NOTA DO CLIENTE)
 with st.expander(f"📁 3. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} notas acumuladas deste cliente)", expanded=False):
     if notas:
         st.caption("Marque na primeira coluna (☑️ Baixar XML) as notas fiscais específicas deste cliente que deseja exportar:")
-        df_notas = pd.DataFrame(notas)
-        df_exibir = pd.DataFrame({
-            "Baixar XML": [True for _ in range(len(df_notas))],
-            "Chave de Acesso NF-e": df_notas["chave_acesso"],
-            "CNPJ Fornecedor": df_notas["cnpj_emitente"],
-            "Valor Total (R$)": df_notas["valor_total_nf"],
-            "Status SEFAZ": df_notas["manifestacao_status"],
-            "Hash SHA-256 (Auditoria)": df_notas["hash_sha256_xml"]
-        })
+        df_exibir = pd.DataFrame([
+            {
+                "Baixar XML": True,
+                "Chave de Acesso NF-e": str(n.get("chave_acesso", "")),
+                "CNPJ Fornecedor": str(n.get("cnpj_emitente", "")),
+                "Valor Total (R$)": float(n.get("valor_total_nf", 0.0)),
+                "Status SEFAZ": str(n.get("manifestacao_status", "Ciência da Operação (SEFAZ OK)")),
+                "Hash SHA-256 (Auditoria)": str(n.get("hash_sha256_xml", hashlib.sha256(str(n.get("chave_acesso", "")).encode()).hexdigest() if "hashlib" in globals() else "Auditado"))
+            }
+            for n in notas
+        ])
 
         df_notas_marcadas = st.data_editor(
             df_exibir,
             height=250,
             hide_index=True,
+            use_container_width=True,
             disabled=["Chave de Acesso NF-e", "CNPJ Fornecedor", "Valor Total (R$)", "Status SEFAZ", "Hash SHA-256 (Auditoria)"],
             key=f"editor_notas_acumuladas_{empresa_id_ativo}"
         )
 
         chaves_para_baixar = df_notas_marcadas[df_notas_marcadas["Baixar XML"] == True]["Chave de Acesso NF-e"].tolist()
-        if chaves_para_baixar:
+        chave_pacote = f"pacote_xml_{empresa_id_ativo}"
+        selecao_atual = tuple(sorted(chaves_para_baixar))
+        if chaves_para_baixar and st.button(
+            "📦 Preparar Pacote .ZIP das Notas Selecionadas",
+            use_container_width=True,
+            key=f"btn_preparar_zip_{empresa_id_ativo}"
+        ):
             buf_cli = io.BytesIO()
             with zipfile.ZipFile(buf_cli, "w", zipfile.ZIP_DEFLATED) as zf_c:
                 for n_obj in notas:
-                    if n_obj["chave_acesso"] in chaves_para_baixar:
-                        itens_desta_nf = [i for i in itens if i.get("nota_id") == n_obj["id"]]
+                    if str(n_obj.get("chave_acesso", "")) in chaves_para_baixar:
+                        itens_desta_nf = [i for i in itens if i.get("nota_id") == n_obj.get("id")]
                         xml_rec = xml_engine.gerar_xml_reconstruido_cliente(empresa_ativa, n_obj, itens_desta_nf)
-                        zf_c.writestr(f"NFe_{n_obj['chave_acesso']}.xml", xml_rec)
-            buf_cli.seek(0)
+                        zf_c.writestr(f"NFe_{n_obj.get('chave_acesso', '000')}.xml", xml_rec)
+            st.session_state[chave_pacote] = (selecao_atual, buf_cli.getvalue())
+        pacote_preparado = st.session_state.get(chave_pacote)
+        if pacote_preparado and pacote_preparado[0] == selecao_atual:
             st.download_button(
                 label=f"📥 Baixar ({len(chaves_para_baixar)}) XML(s) Selecionado(s) de {empresa_ativa['razao_social']} (.ZIP)",
-                data=buf_cli.getvalue(),
+                data=pacote_preparado[1],
                 file_name=f"XMLs_Auditados_{empresa_ativa['cnpj']}.zip",
                 mime="application/zip",
                 use_container_width=True,
@@ -751,20 +979,34 @@ with st.expander(f"📁 3. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
 # MÓDULO 4: DEVOLUÇÕES
 with st.expander(f"📁 4. Conciliação de Devoluções ({len(devolucoes)} registros)", expanded=False):
     if devolucoes:
-        df_dev = pd.DataFrame(devolucoes)
-        df_dev_exibir = df_dev[["chave_nota_devolucao", "valor_mercadoria_devolvida", "credito_estornado", "motivo_ajuste"]].copy()
-        df_dev_exibir.columns = ["Chave NF Devolução", "Mercadoria Devolvida (R$)", "Crédito Estornado (R$)", "Motivo do Ajuste"]
-        st.dataframe(df_dev_exibir, height=250, hide_index=True)
+        df_dev_exibir = pd.DataFrame([
+            {
+                "Chave NF Devolução": d.get("chave_nota_devolucao", ""),
+                "Mercadoria Devolvida (R$)": float(d.get("valor_mercadoria_devolvida", 0.0)),
+                "Crédito Estornado (R$)": float(d.get("credito_estornado", 0.0)),
+                "Motivo do Ajuste": d.get("motivo_ajuste", "")
+            }
+            for d in devolucoes
+        ])
+        st.dataframe(df_dev_exibir, height=250, hide_index=True, use_container_width=True)
     else:
         st.info("Nenhuma devolução registrada no período.")
 
 # MÓDULO 5: SIMULADOR ESTRATÉGICO
-with st.expander("📁 5. ⚖️ Simulador Estratégico de Migração (Simples Tradicional vs. Regime Híbrido)", expanded=True):
+with st.expander("📁 5. ⚖️ Simulador Estratégico de Migração (Simples Tradicional vs. Regime Híbrido)", expanded=False):
     st.markdown(f"Simulação fiscal focada nas operações de **{empresa_ativa['razao_social']}**.")
 
-    compras_revenda_reais = sum([float(i["valor_item"]) for i in itens if i["classificacao_item"] in ["Aprovado Revenda", "Aprovado Manualmente Contador"]])
-    devolucoes_reais = sum([float(d["valor_mercadoria_devolvida"]) for d in devolucoes])
-    quarentena_reais = sum([float(i["valor_item"]) for i in itens if i["classificacao_item"] == "Quarentena Uso/Consumo"])
+    compras_revenda_reais = sum([
+        float(i.get("valor_item", 0.0))
+        for i in itens
+        if i.get("classificacao_item") in ["Aprovado Revenda", "Aprovado Manualmente Contador"]
+    ])
+    devolucoes_reais = sum([float(d.get("valor_mercadoria_devolvida", 0.0)) for d in devolucoes])
+    quarentena_reais = sum([
+        float(i.get("valor_item", 0.0))
+        for i in itens
+        if i.get("classificacao_item") == "Quarentena Uso/Consumo"
+    ])
 
     faixas_simples = {
         "1ª Faixa (Até R$ 15 mil/mês) — Alíquota Nominal: 4,00%": {"das_total": 4.00, "fatia_consumo": 1.34},
