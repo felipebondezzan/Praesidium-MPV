@@ -527,16 +527,22 @@ def carregar_logs_acesso_db():
 def extrair_tenant_empresa(emp: dict) -> str:
     status_a1 = str(emp.get("certificado_a1_status", ""))
     if "TENANT:" in status_a1:
-        return status_a1.split("TENANT:")[-1].strip()
+        return status_a1.split("TENANT:", 1)[1].split("|", 1)[0].strip()
     cnae_raw = str(emp.get("cnae_principal", ""))
     if "|TENANT:" in cnae_raw:
-        return cnae_raw.split("|TENANT:")[-1].strip()
+        return cnae_raw.split("|TENANT:", 1)[1].split("|", 1)[0].strip()
     return "admin"
 
 
 def extrair_cnae_limpo_empresa(emp: dict) -> str:
     cnae_raw = str(emp.get("cnae_principal", "4711302"))
-    return cnae_raw.split("|TENANT:")[0].strip() or "4711302"
+    cnaes = cnae_raw.split("|TENANT:", 1)[0].strip().split(",")
+    status_a1 = str(emp.get("certificado_a1_status", ""))
+    if "|CNAES:" in status_a1:
+        secundarios = status_a1.split("|CNAES:", 1)[1].split("|", 1)[0]
+        cnaes.extend(secundarios.split(","))
+    cnaes_unicos = list(dict.fromkeys(cnae.strip() for cnae in cnaes if cnae.strip()))
+    return ",".join(cnaes_unicos) or "4711302"
 
 
 # ==========================================
@@ -616,7 +622,7 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
             todos_cnaes = [cnae_prin_limpo] + cnaes_secundarios_coletados
             todos_cnaes_unicos = list(dict.fromkeys([c for c in todos_cnaes if c]))
 
-            cnaes_invalidos_cad = []
+            cnaes_invalidos_cad = [] if todos_cnaes_unicos else [cnae_principal_input]
             for c_teste in todos_cnaes_unicos:
                 ok_ibge, _ = xml_engine.validar_cnae_oficial_ibge(c_teste)
                 if not ok_ibge:
@@ -628,13 +634,16 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                     f"Digite um CNAE real de 7 dígitos (Ex: 4711302 p/ Supermercado, 9602501 p/ Salão, 4772500 p/ Cosméticos)."
                 )
             else:
-                cnaes_string_final = ",".join(todos_cnaes_unicos)
+                cnaes_secundarios = ",".join(todos_cnaes_unicos[1:])
+                status_certificado = f"Ativo|TENANT:{tenant_atual}"
+                if cnaes_secundarios:
+                    status_certificado += f"|CNAES:{cnaes_secundarios}"
                 payload_emp = {
                     "razao_social": novo_nome.strip().upper(),
                     "cnpj": cnpj_limpo,
                     "regime_tributario": novo_regime,
-                    "cnae_principal": f"{cnaes_string_final}|TENANT:{tenant_atual}",
-                    "certificado_a1_status": f"Ativo|TENANT:{tenant_atual}"
+                    "cnae_principal": todos_cnaes_unicos[0],
+                    "certificado_a1_status": status_certificado
                 }
                 ok_ins, msg_ins, _ = xml_engine.inserir_seguro_supabase(supabase, "empresas_monitoradas", payload_emp)
                 if ok_ins:
@@ -709,17 +718,30 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
     )
     if st.button("💾 Salvar Novo CNAE", use_container_width=True, key=f"btn_save_cnae_{empresa_id_ativo}"):
         owner_tag = extrair_tenant_empresa(empresa_ativa_bruta)
-        try:
-            resultado = supabase.table("empresas_monitoradas").update({
-                "cnae_principal": f"{novo_cnae_edit.strip()}|TENANT:{owner_tag}"
-            }).eq("id", empresa_id_ativo).select("id").execute()
-            if not resultado.data:
-                raise ValueError("Nenhum cliente foi atualizado.")
-            st.cache_data.clear()
-            st.sidebar.success("CNAE atualizado!")
-            st.rerun()
-        except Exception as ex:
-            st.sidebar.error(f"Erro ao atualizar CNAE: {ex}")
+        cnaes_editados = list(dict.fromkeys(
+            "".join(filter(str.isdigit, cnae.strip()))
+            for cnae in novo_cnae_edit.split(",")
+            if cnae.strip()
+        ))
+        if not cnaes_editados or any(len(cnae) != 7 for cnae in cnaes_editados):
+            st.sidebar.warning("Informe um ou mais CNAEs válidos com exatamente 7 dígitos, separados por vírgula.")
+        else:
+            cnaes_secundarios = ",".join(cnaes_editados[1:])
+            status_certificado = f"Ativo|TENANT:{owner_tag}"
+            if cnaes_secundarios:
+                status_certificado += f"|CNAES:{cnaes_secundarios}"
+            try:
+                resultado = supabase.table("empresas_monitoradas").update({
+                    "cnae_principal": cnaes_editados[0],
+                    "certificado_a1_status": status_certificado
+                }).eq("id", empresa_id_ativo).select("id").execute()
+                if not resultado.data:
+                    raise ValueError("Nenhum cliente foi atualizado.")
+                st.cache_data.clear()
+                st.sidebar.success("CNAEs atualizados!")
+                st.rerun()
+            except Exception as ex:
+                st.sidebar.error(f"Erro ao atualizar CNAE: {ex}")
 
     st.markdown("<hr style='border:0; border-top:1px solid #374151; margin:8px 0;'>", unsafe_allow_html=True)
     if st.button("🔄 Zerar Notas deste Cliente", use_container_width=True, key=f"btn_reset_nf_{empresa_id_ativo}"):
