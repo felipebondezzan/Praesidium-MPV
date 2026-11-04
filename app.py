@@ -8,6 +8,7 @@ import requests
 import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
+from urllib.parse import urlparse
 import xml_engine
 import relatorio_engine
 import hashlib
@@ -327,14 +328,16 @@ st.markdown(CSS_DARK_LUXURY.replace("\n\n", "\n"), unsafe_allow_html=True)
 # ==========================================
 # 2. CONEXÃO SUPABASE (EM CACHE DE ALTA VELOCIDADE)
 # ==========================================
-url: str = os.environ.get("SUPABASE_URL", "https://pzgkdktkccunmpckcgoh.supabase.co")
-key: str = os.environ.get("SUPABASE_KEY", "sb_secret_D01DzBbrY9B_VqN9LKZnvw_VW-IwYYU")
+url_secret = ""
+key_secret = ""
 try:
-    if "SUPABASE_URL" in st.secrets:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_KEY"]
+    url_secret = st.secrets.get("SUPABASE_URL", "")
+    key_secret = st.secrets.get("SUPABASE_KEY", "")
 except Exception:
     pass
+
+url: str = str(url_secret or "").strip() or os.environ.get("SUPABASE_URL", "").strip()
+key: str = str(key_secret or "").strip() or os.environ.get("SUPABASE_KEY", "").strip()
 
 
 @st.cache_resource
@@ -342,7 +345,32 @@ def iniciar_conexao_supabase(supabase_url: str, supabase_key: str) -> Client:
     return create_client(supabase_url, supabase_key)
 
 
-supabase: Client = iniciar_conexao_supabase(url, key)
+supabase: Client | None = None
+erro_conexao_supabase = None
+url_validada = urlparse(url)
+if not url or not key:
+    erro_conexao_supabase = (
+        "Credenciais do Supabase ausentes. Configure SUPABASE_URL e SUPABASE_KEY "
+        "em st.secrets ou como variáveis de ambiente."
+    )
+elif url_validada.scheme not in {"https", "http"} or not url_validada.netloc:
+    erro_conexao_supabase = "SUPABASE_URL inválida. Informe uma URL completa com http:// ou https://."
+elif not key.startswith(("sb_secret_", "sb_publishable_", "eyJ")):
+    erro_conexao_supabase = (
+        "SUPABASE_KEY tem formato não reconhecido. Use uma chave Supabase secret, "
+        "publishable ou JWT legado."
+    )
+else:
+    try:
+        supabase = iniciar_conexao_supabase(url, key)
+    except Exception:
+        erro_conexao_supabase = (
+            "Não foi possível inicializar a conexão Supabase. Confira SUPABASE_URL "
+            "e SUPABASE_KEY em st.secrets ou nas variáveis de ambiente."
+        )
+
+if erro_conexao_supabase:
+    st.warning(erro_conexao_supabase)
 
 
 def normalizar_tenant(identificacao: str) -> str:
@@ -588,7 +616,9 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
 
     st.write("")
     if st.button("Salvar Cliente Definitivo", use_container_width=True, key="btn_salvar_cli_def"):
-        if novo_nome and novo_cnpj and cnae_principal_input:
+        if supabase is None:
+            st.sidebar.warning(erro_conexao_supabase or "Conexão Supabase indisponível. Confira as credenciais configuradas.")
+        elif novo_nome and novo_cnpj and cnae_principal_input:
             cnpj_limpo = "".join(filter(str.isdigit, novo_cnpj))
             cnae_prin_limpo = "".join(filter(str.isdigit, cnae_principal_input))
             todos_cnaes = [cnae_prin_limpo] + cnaes_secundarios_coletados
@@ -621,7 +651,13 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                     st.sidebar.success("Cliente validado e cadastrado!")
                     st.rerun()
                 else:
-                    st.sidebar.error(f"Erro ao salvar no Supabase: {msg_ins}")
+                    if "api key" in msg_ins.lower() or "invalid jwt" in msg_ins.lower():
+                        st.sidebar.warning(
+                            "O Supabase recusou a chave configurada. Confira se SUPABASE_KEY está registrada "
+                            "e corresponde ao projeto definido em SUPABASE_URL."
+                        )
+                    else:
+                        st.sidebar.error(f"Erro ao salvar no Supabase: {msg_ins}")
         else:
             st.sidebar.warning("Preencha Razão Social, CNPJ e CNAE Principal.")
 
