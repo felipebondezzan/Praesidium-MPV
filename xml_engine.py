@@ -483,7 +483,7 @@ def processar_xml_bytes(
 # 4. INTERFACE: MÓDULO DE INGESTÃO XML & ROBÔ SEFAZ
 # ==========================================
 def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
-    with st.expander("⚡ Central de Ingestão XML & Sincronização Robô SEFAZ (A1 / Upload em Lote)", expanded=False):
+    with st.expander("📁 1. Central de Ingestão XML & Sincronização Robô SEFAZ (A1 / Upload em Lote)", expanded=False):
         c_rob, c_up = st.columns([1.1, 1.9])
 
         with c_rob:
@@ -594,7 +594,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
 # 5. INTERFACE: EMISSOR DE NF-e DE DEVOLUÇÃO EXPRESSA
 # ==========================================
 def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, itens: list):
-    with st.expander("↩️ Emissor Express de NF-e de Devolução (Avaria / Divergência Física & Estorno Split Payment)", expanded=False):
+    with st.expander("📁 2. Emissor Express de NF-e de Devolução (Avaria / Divergência Física & Estorno Split Payment)", expanded=False):
         if not notas:
             st.info("Importe ou sincronize ao menos uma NF-e acima para habilitar o emissor de devolução.")
             return

@@ -300,7 +300,7 @@ def renderizar_modulo_relatorio(
 ):
     injetar_css_blindado_relatorio()
 
-    with st.expander("📁 6. 📄 Central de Dossiês Analíticos, Filtros de Notas & Exportação ERP", expanded=False):
+    with st.expander("📁 8. Central de Dossiês Analíticos, Filtros de Notas & Exportação ERP", expanded=False):
         st.markdown(
             f"Configuração do escopo de auditoria para <b>{empresa_ativa['razao_social']}</b> com cruzamento relacional e filtros dinâmicos.",
             unsafe_allow_html=True

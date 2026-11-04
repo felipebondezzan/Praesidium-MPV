@@ -278,6 +278,8 @@ CSS_DARK_LUXURY = """
         background-color: #111827 !important;
         border: 1px solid #374151 !important;
         border-radius: 10px !important;
+        margin-top: 0 !important;
+        margin-bottom: 0.75rem !important;
     }
     [data-testid="stExpander"] summary {
         background-color: #111827 !important;
@@ -826,9 +828,9 @@ xml_engine.renderizar_emissor_devolucao(supabase, empresa_ativa, notas, itens)
 # 9. PASTAS EXPANSÍVEIS BLINDADAS (MÓDULOS 1 A 6)
 # ==========================================
 
-# MÓDULO 1: RADAR DE CONTINGÊNCIA & OMISSÃO SEFAZ
+# MÓDULO 3: RADAR DE CONTINGÊNCIA & OMISSÃO SEFAZ
 notas_contingencia = [n for n in notas if "Contingência" in str(n.get("manifestacao_status", ""))]
-with st.expander(f"📁 1. ⚠️ Radar de Contingência & Divergência SEFAZ ({len(notas_contingencia)} Alertas Ativos)", expanded=False):
+with st.expander(f"📁 3. ⚠️ Radar de Contingência & Divergência SEFAZ ({len(notas_contingencia)} Alertas Ativos)", expanded=False):
     if notas_contingencia:
         st.markdown(
             f"<span style='color: #f87171; font-weight: bold;'>⚠️ ATENÇÃO CONTADOR:</span> Foram detectadas notas emitidas em contingência (`tpEmis != 1`) para <b>{empresa_ativa['razao_social']}</b> cujo crédito foi retido preventivamente.",
@@ -847,11 +849,11 @@ with st.expander(f"📁 1. ⚠️ Radar de Contingência & Divergência SEFAZ ({
     else:
         st.success(f"✅ Nenhuma nota fiscal em contingência ou divergência pendente para o CNPJ {empresa_ativa['cnpj']}.")
 
-# MÓDULO 2: QUARENTENA & HISTÓRICO (SOBERANIA DO CONTADOR)
+# MÓDULO 4: QUARENTENA & HISTÓRICO (SOBERANIA DO CONTADOR)
 itens_pendentes = [i for i in itens if i.get("classificacao_item") == "Quarentena Uso/Consumo"]
 itens_auditados = [i for i in itens if i.get("classificacao_item") in ["Rejeitado pelo Contador", "Aprovado Manualmente Contador"]]
 
-with st.expander(f"📁 2. Fila de Quarentena & Histórico de Auditoria ({len(itens_pendentes)} pendentes | {len(itens_auditados)} auditados)", expanded=False):
+with st.expander(f"📁 4. Fila de Quarentena & Histórico de Auditoria ({len(itens_pendentes)} pendentes | {len(itens_auditados)} auditados)", expanded=False):
     if itens_pendentes:
         st.markdown("#### ⏳ Itens Aguardando Decisão Técnica do Contador")
         for idx_p, item in enumerate(itens_pendentes):
@@ -922,8 +924,8 @@ with st.expander(f"📁 2. Fila de Quarentena & Histórico de Auditoria ({len(it
         ])
         st.dataframe(df_audit, height=250, hide_index=True, use_container_width=True)
 
-# MÓDULO 3: NOTAS FISCAIS RECEBIDAS (COM SELETOR DE DOWNLOAD NOTA POR NOTA DO CLIENTE)
-with st.expander(f"📁 3. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} notas acumuladas deste cliente)", expanded=False):
+# MÓDULO 5: NOTAS FISCAIS RECEBIDAS (COM SELETOR DE DOWNLOAD NOTA POR NOTA DO CLIENTE)
+with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} notas acumuladas deste cliente)", expanded=False):
     if notas:
         st.caption("Marque na primeira coluna (☑️ Baixar XML) as notas fiscais específicas deste cliente que deseja exportar:")
         df_exibir = pd.DataFrame([
@@ -976,8 +978,8 @@ with st.expander(f"📁 3. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
     else:
         st.info("Nenhuma nota fiscal registrada para este cliente. Clique no botão de Sincronizar Lote de Teste SEFAZ acima para importar.")
 
-# MÓDULO 4: DEVOLUÇÕES
-with st.expander(f"📁 4. Conciliação de Devoluções ({len(devolucoes)} registros)", expanded=False):
+# MÓDULO 6: DEVOLUÇÕES
+with st.expander(f"📁 6. Conciliação de Devoluções ({len(devolucoes)} registros)", expanded=False):
     if devolucoes:
         df_dev_exibir = pd.DataFrame([
             {
@@ -992,8 +994,8 @@ with st.expander(f"📁 4. Conciliação de Devoluções ({len(devolucoes)} regi
     else:
         st.info("Nenhuma devolução registrada no período.")
 
-# MÓDULO 5: SIMULADOR ESTRATÉGICO
-with st.expander("📁 5. ⚖️ Simulador Estratégico de Migração (Simples Tradicional vs. Regime Híbrido)", expanded=False):
+# MÓDULO 7: SIMULADOR ESTRATÉGICO
+with st.expander("📁 7. ⚖️ Simulador Estratégico de Migração (Simples Tradicional vs. Regime Híbrido)", expanded=False):
     st.markdown(f"Simulação fiscal focada nas operações de **{empresa_ativa['razao_social']}**.")
 
     compras_revenda_reais = sum([
@@ -1026,7 +1028,7 @@ with st.expander("📁 5. ⚖️ Simulador Estratégico de Migração (Simples T
         col_comp1, col_comp2, col_comp3 = st.columns(3)
         compras_mercadorias = col_comp1.number_input("🛒 Compras p/ Revenda no Mês (R$)", value=float(compras_revenda_reais), step=500.0, format="%.2f")
         devolucoes_mes = col_comp2.number_input("🔄 Devoluções de Compras (R$)", value=float(devolucoes_reais), step=500.0, format="%.2f")
-        compras_quarentena_input = col_comp3.number_input("⚠️ Compras Travadas na Quarentena (R$)", value=float(quarentena_reais), step=100.0, disabled=True, format="%.2f")
+        compras_quarentena_input = col_comp3.number_input("⚠️ Compras Travadas na Quarentena (R$)", value=float(quarentena_reais), step=100.0, format="%.2f")
 
         st.write("")
         st.form_submit_button("⚡ Aplicar Parâmetros e Calcular Simulação", use_container_width=True)
@@ -1122,7 +1124,7 @@ with st.expander("📁 5. ⚖️ Simulador Estratégico de Migração (Simples T
             </div>
             """, unsafe_allow_html=True)
 
-# MÓDULO 6: DOSSIÊ EXECUTIVO DE FECHAMENTO
+# MÓDULO 8: DOSSIÊ EXECUTIVO DE FECHAMENTO
 relatorio_engine.renderizar_modulo_relatorio(
     empresa_ativa, imposto_bruto_mes, credito_validado_tempo_real, imposto_quarentena, imposto_estornado, notas, itens
 )
