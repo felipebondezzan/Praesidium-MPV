@@ -44,6 +44,10 @@ CNAES_VALIDOS_FALLBACK = {
 }
 
 
+def limpar_tag_tenant_empresa(nome_empresa: str) -> str:
+    return re.sub(r"\s*\[T:[^\]]+\]", "", str(nome_empresa), flags=re.IGNORECASE).strip()
+
+
 # ==========================================
 # FUNÇÃO DE INSERÇÃO BLINDADA CONTRA APIError DO SUPABASE
 # ==========================================
@@ -197,7 +201,9 @@ def gerar_xml_reconstruido_cliente(empresa_ativa: dict, nota: dict, itens_nota: 
     chave = str(nota.get("chave_acesso", "")).zfill(44)
     cnpj_emit = str(nota.get("cnpj_emitente", "00000000000191")).zfill(14)
     cnpj_dest = str(empresa_ativa.get("cnpj", "00000000000191")).zfill(14)
-    razao_dest = str(empresa_ativa.get("razao_social", "CLIENTE MONITORADO"))
+    razao_dest = limpar_tag_tenant_empresa(
+        str(empresa_ativa.get("razao_social", "CLIENTE MONITORADO"))
+    )
     vl_total = float(nota.get("valor_total_nf", 0.0))
 
     blocos_det = ""
@@ -272,7 +278,7 @@ def gerar_xml_devolucao_nfe(
 ) -> str:
     chave_orig = str(nota_orig.get("chave_acesso", "")).zfill(44)
     cnpj_emit_dev = str(empresa_ativa.get("cnpj", "")).zfill(14)
-    nome_emit_dev = str(empresa_ativa.get("razao_social", ""))
+    nome_emit_dev = limpar_tag_tenant_empresa(str(empresa_ativa.get("razao_social", "")))
     cnpj_dest_dev = str(nota_orig.get("cnpj_emitente", "")).zfill(14)
 
     det_xml = ""
@@ -488,7 +494,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
         with c_rob:
             st.markdown("##### 🤖 Robô de Captura SEFAZ (Simulação Homologação)")
             st.caption(
-                f"Simula a busca direta no WebService SEFAZ para **{empresa_ativa['razao_social']}** "
+                f"Simula a busca direta no WebService SEFAZ para **{limpar_tag_tenant_empresa(empresa_ativa['razao_social'])}** "
                 f"(CNAEs: `{empresa_ativa.get('cnae_principal', '4711302')}`)."
             )
             if st.button("🔄 Sincronizar Lote de Teste SEFAZ", use_container_width=True, key=f"btn_sync_sefaz_{empresa_id_ativo}"):

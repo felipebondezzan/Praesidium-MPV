@@ -3,6 +3,7 @@ import hmac
 import json
 import os
 import re
+import uuid
 import zipfile
 import logging
 import threading
@@ -10,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from supabase import create_client, Client
 from urllib.parse import urlparse
@@ -88,8 +90,9 @@ CSS_DARK_LUXURY = """
         background-color: #374151 !important;
         color: #fbbf24 !important;
     }
-    .block-container {
-        padding-top: 1.2rem !important;
+    .block-container,
+    [data-testid="stAppViewContainer"] > .main .block-container {
+        padding-top: 3.8rem !important;
         padding-bottom: 2rem !important;
     }
     header[data-testid="stHeader"] {
@@ -187,6 +190,7 @@ CSS_DARK_LUXURY = """
         border-left: 4px solid #d4af37;
         border-radius: 12px;
         padding: 20px 28px;
+        margin-top: 0.5rem !important;
         margin-bottom: 18px;
     }
     .header-title {
@@ -374,7 +378,178 @@ def hash_senha(senha: str) -> str:
     return hashlib.sha256(senha.encode("utf-8")).hexdigest()
 
 
-CAMINHO_REGISTRO_AUTH = Path(__file__).with_name("auth_state.json")
+CAMINHO_REGISTRO_AUTH = Path(__file__).with_name("usuarios_praesidium.json")
+CAMINHO_REGISTRO_AUTH_ANTIGO = Path(__file__).with_name("auth_state.json")
+PREFIXO_USUARIO_SISTEMA = "[SYS_USER]"
+PREFIXO_LOG_SISTEMA = "[SYS_LOG]"
+
+
+def chave_log_acesso(log: dict) -> tuple:
+    log_id = log.get("log_id")
+    if log_id:
+        return ("id", log_id)
+    return (
+        log.get("timestamp"),
+        log.get("datetime"),
+        log.get("username"),
+        log.get("name"),
+        log.get("event"),
+    )
+
+
+def usuario_from_row(row: dict) -> tuple[str, dict] | None:
+    cnpj = str(row.get("cnpj", ""))
+    razao_social = str(row.get("razao_social", ""))
+    if not cnpj.startswith("USR_") or not razao_social.startswith(PREFIXO_USUARIO_SISTEMA):
+        return None
+    username = cnpj[4:].strip().lower()
+    registro_usuario = razao_social[len(PREFIXO_USUARIO_SISTEMA):]
+    try:
+        dados = json.loads(registro_usuario)
+    except (TypeError, ValueError):
+        campos = registro_usuario.rsplit("|", 2)
+        if len(campos) not in {2, 3}:
+            logging.getLogger(__name__).error("Registro de usuário do Supabase malformado: %s", cnpj)
+            return None
+        dados = {
+            "name": campos[0],
+            "password_hash": campos[1],
+            "company_id": campos[2] if len(campos) == 3 else None,
+        }
+    if not username or not isinstance(dados, dict):
+        return None
+    password_hash = str(dados.get("password_hash", ""))
+    nome = str(dados.get("name", "")).strip()
+    if not password_hash or not nome:
+        return None
+    return username, {
+        "password_hash": password_hash,
+        "role": "contador",
+        "name": nome,
+        "company_id": dados.get("company_id"),
+        "company_id_synced": dados.get("company_id"),
+    }
+
+
+def ler_registros_sistema_supabase() -> tuple[dict, list]:
+    if supabase is None:
+        return {}, []
+    linhas = []
+    inicio = 0
+    tamanho_pagina = 1000
+    while True:
+        resposta = (
+            supabase.table("empresas_monitoradas")
+            .select("cnpj,razao_social,regime_tributario,cnae_principal")
+            .eq("regime_tributario", "SYS_AUTH")
+            .range(inicio, inicio + tamanho_pagina - 1)
+            .execute()
+        )
+        pagina = resposta.data or []
+        linhas.extend(pagina)
+        if len(pagina) < tamanho_pagina:
+            break
+        inicio += tamanho_pagina
+    usuarios = {}
+    logs = []
+    for row in linhas:
+        if str(row.get("razao_social", "")).startswith(PREFIXO_USUARIO_SISTEMA):
+            usuario = usuario_from_row(row)
+            if usuario:
+                usuarios[usuario[0]] = usuario[1]
+        elif str(row.get("razao_social", "")).startswith(PREFIXO_LOG_SISTEMA):
+            try:
+                log = json.loads(str(row["razao_social"])[len(PREFIXO_LOG_SISTEMA):])
+            except (KeyError, TypeError, ValueError):
+                logging.getLogger(__name__).exception("Registro de acesso do Supabase malformado.")
+                continue
+            if isinstance(log, dict):
+                logs.append(log)
+    return usuarios, logs
+
+
+def payload_usuario_supabase(usuario: str, dados_usuario: dict) -> dict:
+    return {
+        "cnpj": f"USR_{usuario}",
+        "razao_social": PREFIXO_USUARIO_SISTEMA + json.dumps(
+            {
+                "name": dados_usuario["name"],
+                "password_hash": dados_usuario["password_hash"],
+                "company_id": dados_usuario.get("company_id"),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "regime_tributario": "SYS_AUTH",
+        "cnae_principal": "0000000",
+    }
+
+
+def persistir_usuario_supabase(usuario: str, dados_usuario: dict) -> None:
+    if supabase is None:
+        raise RuntimeError("Supabase indisponível para persistir o usuário.")
+    registro = payload_usuario_supabase(usuario, dados_usuario)
+    existente = (
+        supabase.table("empresas_monitoradas")
+        .select("id")
+        .eq("cnpj", registro["cnpj"])
+        .eq("regime_tributario", "SYS_AUTH")
+        .execute()
+    )
+    if existente.data:
+        supabase.table("empresas_monitoradas").update(registro).eq(
+            "cnpj", registro["cnpj"]
+        ).eq("regime_tributario", "SYS_AUTH").execute()
+    else:
+        supabase.table("empresas_monitoradas").insert(registro).execute()
+
+
+def criar_usuario_supabase(usuario: str, dados_usuario: dict) -> None:
+    if supabase is None:
+        raise RuntimeError("Supabase indisponível para persistir o usuário.")
+    registro = payload_usuario_supabase(usuario, dados_usuario)
+    existente = (
+        supabase.table("empresas_monitoradas")
+        .select("cnpj")
+        .eq("cnpj", registro["cnpj"])
+        .eq("regime_tributario", "SYS_AUTH")
+        .execute()
+    )
+    if existente.data:
+        raise ValueError("Este usuário já está cadastrado.")
+    supabase.table("empresas_monitoradas").insert(registro).execute()
+
+
+def buscar_usuario_persistido(usuario: str) -> dict | None:
+    if supabase is None:
+        return None
+    resposta = (
+        supabase.table("empresas_monitoradas")
+        .select("cnpj,razao_social,regime_tributario,cnae_principal")
+        .eq("cnpj", f"USR_{usuario}")
+        .eq("regime_tributario", "SYS_AUTH")
+        .execute()
+    )
+    for row in resposta.data or []:
+        dados = usuario_from_row(row)
+        if dados and dados[0] == usuario:
+            return dados[1]
+    return None
+
+
+def persistir_log_supabase(log_acesso: dict) -> None:
+    if supabase is None:
+        raise RuntimeError("Supabase indisponível para persistir o log.")
+    supabase.table("empresas_monitoradas").insert({
+        "cnpj": f"LOG_{uuid.uuid4().hex}",
+        "razao_social": PREFIXO_LOG_SISTEMA + json.dumps(
+            log_acesso,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "regime_tributario": "SYS_AUTH",
+        "cnae_principal": "0000000",
+    }).execute()
 
 
 def salvar_registro_global(registro: dict) -> None:
@@ -392,36 +567,91 @@ def salvar_registro_global(registro: dict) -> None:
 @st.cache_resource
 def obter_registro_global() -> dict:
     usuarios_padrao = {
-        "admin": {
+        "felipebondezzan": {
             "password_hash": hash_senha("admin2026"),
             "role": "admin",
-            "name": "Felipe (Admin)",
-        },
-        "guilherme": {
-            "password_hash": hash_senha("guilherme2026"),
-            "role": "contador",
-            "name": "Guilherme",
+            "name": "Felipe Bondezzan (Admin)",
         },
     }
-    logs_acesso = []
-    usuarios = dict(usuarios_padrao)
+    dados_salvos = {}
     if CAMINHO_REGISTRO_AUTH.exists():
         dados_salvos = json.loads(CAMINHO_REGISTRO_AUTH.read_text(encoding="utf-8"))
-        usuarios_salvos = dados_salvos.get("users", {})
-        logs_salvos = dados_salvos.get("access_logs", [])
-        if not isinstance(usuarios_salvos, dict) or not isinstance(logs_salvos, list):
-            raise ValueError("O arquivo local de autenticação possui estrutura inválida.")
-        usuarios.update(usuarios_salvos)
-        logs_acesso = logs_salvos
+    elif CAMINHO_REGISTRO_AUTH_ANTIGO.exists():
+        dados_salvos = json.loads(CAMINHO_REGISTRO_AUTH_ANTIGO.read_text(encoding="utf-8"))
+
+    usuarios = dados_salvos.get("users", {})
+    logs_acesso = dados_salvos.get("access_logs", [])
+    if not isinstance(usuarios, dict) or not isinstance(logs_acesso, list):
+        raise ValueError("O arquivo local de autenticação possui estrutura inválida.")
+    usuarios = dict(usuarios)
+    conta_guilherme_padrao = usuarios.get("guilherme", {})
+    if (
+        isinstance(conta_guilherme_padrao, dict)
+        and conta_guilherme_padrao.get("password_hash") == hash_senha("guilherme2026")
+        and conta_guilherme_padrao.get("name") == "Guilherme"
+    ):
+        usuarios.pop("guilherme", None)
+    usuarios.pop("admin", None)
+    company_id_admin = usuarios.get("felipebondezzan", {}).get("company_id")
+    usuarios.update(usuarios_padrao)
+    if company_id_admin is not None:
+        usuarios["felipebondezzan"]["company_id"] = company_id_admin
+        usuarios["felipebondezzan"]["company_id_synced"] = company_id_admin
+    logs_acesso = [
+        {
+            "datetime": str(log.get("datetime", "")),
+            "timestamp": str(log.get("timestamp", "")),
+            "username": str(log.get("username", "")),
+            "name": str(log.get("name", "")),
+            "event": str(log.get("event", log.get("status", "Acesso"))),
+        }
+        for log in logs_acesso
+        if isinstance(log, dict)
+    ]
+    try:
+        usuarios_supabase, logs_supabase = ler_registros_sistema_supabase()
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao carregar usuários e logs do Supabase; usando o registro local."
+        )
+    else:
+        usuarios_supabase.pop("admin", None)
+        usuario_guilherme_padrao = usuarios_supabase.get("guilherme", {})
+        if (
+            isinstance(usuario_guilherme_padrao, dict)
+            and usuario_guilherme_padrao.get("password_hash") == hash_senha("guilherme2026")
+            and usuario_guilherme_padrao.get("name") == "Guilherme"
+        ):
+            usuarios_supabase.pop("guilherme", None)
+        company_id_admin = usuarios_supabase.get("felipebondezzan", {}).get("company_id")
+        if company_id_admin is None:
+            company_id_admin = usuarios.get("felipebondezzan", {}).get("company_id")
+        for username, usuario_remoto in usuarios_supabase.items():
+            usuario_local = usuarios.get(username, {})
+            if usuario_remoto.get("company_id") is None and usuario_local.get("company_id") is not None:
+                usuario_remoto["company_id"] = usuario_local["company_id"]
+            usuarios[username] = usuario_remoto
+        usuarios["felipebondezzan"] = {
+            **usuarios_padrao["felipebondezzan"],
+            "company_id": company_id_admin,
+            "company_id_synced": company_id_admin,
+        }
+        logs_por_chave = {chave_log_acesso(log): log for log in logs_acesso}
+        for log in logs_supabase:
+            logs_por_chave[chave_log_acesso(log)] = log
+        logs_acesso = sorted(
+            logs_por_chave.values(),
+            key=lambda log: log.get("timestamp") or log.get("datetime", ""),
+        )
 
     registro = {
         "users": usuarios,
         "access_logs": logs_acesso,
         "lock": threading.RLock(),
+        "sessions": {},
     }
-    if not CAMINHO_REGISTRO_AUTH.exists():
-        with registro["lock"]:
-            salvar_registro_global(registro)
+    with registro["lock"]:
+        salvar_registro_global(registro)
     return registro
 
 
@@ -436,19 +666,131 @@ def atualizar_espelho_sessao() -> None:
         }
 
 
-def horario_brasilia_str() -> str:
-    fuso_br = timezone(timedelta(hours=-3))
-    return datetime.now(fuso_br).strftime("%d/%m/%Y %H:%M:%S")
+def salvar_cache_local() -> None:
+    with registro_global["lock"]:
+        salvar_registro_global(registro_global)
+
+
+def atualizar_usuario_do_supabase(usuario: str) -> dict | None:
+    if usuario == "felipebondezzan":
+        return registro_global["users"][usuario]
+    dados = buscar_usuario_persistido(usuario)
+    if dados is not None:
+        with registro_global["lock"]:
+            usuario_local = registro_global["users"].get(usuario, {})
+            if dados.get("company_id") is None and usuario_local.get("company_id") is not None:
+                dados["company_id"] = usuario_local["company_id"]
+            registro_global["users"][usuario] = dados
+            salvar_registro_global(registro_global)
+    return dados
+
+
+def sincronizar_usuarios_supabase() -> None:
+    if supabase is None:
+        return
+    usuarios_remotos, _ = ler_registros_sistema_supabase()
+    usuarios_remotos.pop("admin", None)
+    usuario_guilherme_padrao = usuarios_remotos.get("guilherme", {})
+    if (
+        isinstance(usuario_guilherme_padrao, dict)
+        and usuario_guilherme_padrao.get("password_hash") == hash_senha("guilherme2026")
+        and usuario_guilherme_padrao.get("name") == "Guilherme"
+    ):
+        usuarios_remotos.pop("guilherme", None)
+    with registro_global["lock"]:
+        company_id_admin = usuarios_remotos.get("felipebondezzan", {}).get("company_id")
+        if company_id_admin is None:
+            company_id_admin = registro_global["users"].get(
+                "felipebondezzan", {}
+            ).get("company_id")
+        for username, usuario_remoto in usuarios_remotos.items():
+            usuario_local = registro_global["users"].get(username, {})
+            if usuario_remoto.get("company_id") is None and usuario_local.get("company_id") is not None:
+                usuario_remoto["company_id"] = usuario_local["company_id"]
+            registro_global["users"][username] = usuario_remoto
+        registro_global["users"]["felipebondezzan"] = {
+            "password_hash": hash_senha("admin2026"),
+            "role": "admin",
+            "name": "Felipe Bondezzan (Admin)",
+            "company_id": company_id_admin,
+            "company_id_synced": company_id_admin,
+        }
+        salvar_registro_global(registro_global)
+
+
+def atualizar_logs_do_supabase() -> None:
+    _, logs_supabase = ler_registros_sistema_supabase()
+    logs_por_chave = {
+        chave_log_acesso(log): log for log in registro_global["access_logs"]
+    }
+    for log in logs_supabase:
+        logs_por_chave[chave_log_acesso(log)] = log
+    with registro_global["lock"]:
+        registro_global["access_logs"] = sorted(
+            logs_por_chave.values(),
+            key=lambda log: log.get("timestamp") or log.get("datetime", ""),
+        )
+        salvar_registro_global(registro_global)
+    atualizar_espelho_sessao()
+
+
+def valor_estado_persistivel(valor):
+    if valor is None or isinstance(valor, (str, int, float, bool)):
+        return valor
+    if isinstance(valor, (list, tuple)):
+        itens = []
+        for item in valor:
+            item_seguro = valor_estado_persistivel(item)
+            if item_seguro is not None or item is None:
+                itens.append(item_seguro)
+        return itens
+    if isinstance(valor, dict) and all(isinstance(chave, str) for chave in valor):
+        resultado = {}
+        for chave, item in valor.items():
+            item_seguro = valor_estado_persistivel(item)
+            if item_seguro is not None or item is None:
+                resultado[chave] = item_seguro
+        return resultado
+    return None
+
+
+def persistir_estado_sessao() -> None:
+    token = st.session_state.get("session_token")
+    if not token:
+        return
+    chaves_privadas = {
+        "senha",
+        "password",
+        "session_token",
+        "auth_username",
+        "autenticado",
+        "acesso_notificado",
+        "registro_auth_espelho",
+        "empresa_sessao_key",
+        "token_usuario_validado",
+    }
+    estado = {}
+    for chave, valor in st.session_state.items():
+        chave_lower = str(chave).lower()
+        if any(termo in chave_lower for termo in chaves_privadas) or chave_lower.startswith(("btn_", "button_")):
+            continue
+        valor_seguro = valor_estado_persistivel(valor)
+        if valor_seguro is not None or valor is None:
+            estado[str(chave)] = valor_seguro
+    with registro_global["lock"]:
+        sessao = registro_global["sessions"].get(token)
+        if sessao is not None:
+            sessao["state"] = estado
 
 
 def enviar_alerta_acesso(log_acesso: dict) -> None:
-    dh_br = horario_brasilia_str()
     try:
         requests.post(
             "https://ntfy.sh/praesidium_felipe_alertas",
             data=(
-                f"Acesso Praesidium: {log_acesso['status']} | Usuário: "
-                f"{log_acesso['username']} ({log_acesso['name']}) em {dh_br}"
+                f"Acesso Praesidium: {log_acesso['event']} | Usuário: "
+                f"{log_acesso['username']} | Nome: {log_acesso['name']} | "
+                f"Data/Hora: {log_acesso['datetime']}"
             ).encode("utf-8"),
             headers={"Title": "Acesso Praesidium Detectado", "Priority": "high", "Tags": "shield,unlock"},
             timeout=2
@@ -457,22 +799,162 @@ def enviar_alerta_acesso(log_acesso: dict) -> None:
         logging.getLogger(__name__).exception("Falha ao enviar alerta de acesso ao ntfy.sh.")
 
 
-def registrar_acesso(username: str, nome: str, status: str) -> None:
+def persistir_acesso_em_background(log_acesso: dict) -> None:
+    try:
+        persistir_log_supabase(log_acesso)
+    except Exception:
+        logging.getLogger(__name__).exception("Falha ao persistir log de acesso no Supabase.")
+    enviar_alerta_acesso(log_acesso)
+
+
+def registrar_e_notificar_acesso(usuario: str, nome: str, evento: str) -> None:
+    agora = datetime.now(timezone(timedelta(hours=-3)))
     log_acesso = {
-        "datetime": horario_brasilia_str(),
-        "username": username,
+        "log_id": uuid.uuid4().hex,
+        "datetime": agora.strftime("%d/%m/%Y %H:%M:%S"),
+        "timestamp": agora.isoformat(timespec="seconds"),
+        "username": usuario,
         "name": nome,
-        "status": status,
+        "event": evento,
     }
     with registro_global["lock"]:
         registro_global["access_logs"].append(log_acesso)
         try:
             salvar_registro_global(registro_global)
         except Exception:
-            registro_global["access_logs"].pop()
-            raise
+            logging.getLogger(__name__).exception(
+                "Falha ao persistir o registro de acesso em usuarios_praesidium.json."
+            )
     atualizar_espelho_sessao()
-    threading.Thread(target=enviar_alerta_acesso, args=(log_acesso,), daemon=True).start()
+    try:
+        threading.Thread(
+                target=persistir_acesso_em_background,
+            args=(log_acesso,),
+            daemon=True,
+        ).start()
+    except Exception:
+        logging.getLogger(__name__).exception("Falha ao iniciar o envio assíncrono do alerta de acesso.")
+
+
+def criar_token_sessao(usuario: str, conectado: bool = True) -> str | None:
+    dados_usuario = registro_global["users"][usuario]
+    if not conectado:
+        st.session_state["session_token"] = None
+        st.query_params.clear()
+        return None
+
+    token = gerar_token_sessao(usuario, dados_usuario)
+    sessao = {
+        "username": usuario,
+        "role": dados_usuario["role"],
+        "name": dados_usuario["name"],
+        "tenant_id": usuario,
+        "company_id": dados_usuario.get("company_id"),
+        "state": {},
+    }
+    with registro_global["lock"]:
+        registro_global["sessions"][token] = sessao
+    st.session_state["session_token"] = token
+    st.query_params["session"] = token
+    return token
+
+
+def gerar_token_sessao(usuario: str, dados_usuario: dict) -> str:
+    try:
+        segredo_aplicacao = str(st.secrets["SESSION_SIGNING_SECRET"]).encode("utf-8")
+    except Exception:
+        segredo_aplicacao = str(dados_usuario["password_hash"]).encode("utf-8")
+    mensagem = (
+        f"praesidium-session-v1:{usuario}:"
+        f"{dados_usuario['password_hash']}"
+    ).encode("utf-8")
+    return hmac.new(segredo_aplicacao, mensagem, hashlib.sha256).hexdigest()
+
+
+def usuario_por_token(token: str) -> tuple[str, dict] | None:
+    if not st.session_state.get("token_usuario_validado", False):
+        try:
+            sincronizar_usuarios_supabase()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao validar token contra o cadastro do Supabase."
+            )
+        st.session_state["token_usuario_validado"] = True
+    for usuario, dados_usuario in registro_global["users"].items():
+        token_esperado = gerar_token_sessao(usuario, dados_usuario)
+        if hmac.compare_digest(token, token_esperado):
+            return usuario, dados_usuario
+    return None
+
+
+def iniciar_sessao_usuario(usuario: str, conectado: bool = True) -> None:
+    dados_usuario = registro_global["users"][usuario]
+    token = criar_token_sessao(usuario, conectado)
+    st.session_state["autenticado"] = True
+    st.session_state["auth_username"] = usuario
+    st.session_state["tenant_id"] = usuario
+    st.session_state["usuario_nome"] = dados_usuario["name"]
+    st.session_state["is_admin"] = dados_usuario["role"] == "admin"
+    st.session_state["acesso_notificado"] = True
+    if token:
+        st.session_state["empresa_sessao_key"] = f"empresa_ativa_{token}"
+    else:
+        st.session_state["limpar_token_navegador"] = True
+
+
+def encerrar_sessao() -> None:
+    token = st.session_state.get("session_token")
+    if token:
+        with registro_global["lock"]:
+            registro_global["sessions"].pop(token, None)
+    st.query_params.clear()
+    st.session_state.clear()
+    st.session_state["autenticado"] = False
+    st.session_state["limpar_token_navegador"] = True
+    st.rerun()
+
+
+def injetar_persistencia_navegador(
+    token: str | None = None,
+    limpar_token: bool = False,
+) -> None:
+    token_json = json.dumps(token)
+    limpar_json = json.dumps(limpar_token)
+    components.html(
+        f"""
+        <script>
+        (() => {{
+            const storageKey = "praesidium_session";
+            const activeToken = {token_json};
+            const clearToken = {limpar_json};
+            try {{
+                const parentWindow = window.parent;
+                const currentUrl = new URL(parentWindow.location.href);
+                if (clearToken) {{
+                    parentWindow.localStorage.removeItem(storageKey);
+                    parentWindow.history.replaceState(
+                        null,
+                        "",
+                        currentUrl.pathname + currentUrl.hash,
+                    );
+                }} else if (activeToken) {{
+                    parentWindow.localStorage.setItem(storageKey, activeToken);
+                }} else if (!currentUrl.searchParams.has("session")) {{
+                    const savedToken = parentWindow.localStorage.getItem(storageKey);
+                    if (savedToken) {{
+                        currentUrl.searchParams.set("session", savedToken);
+                        parentWindow.history.replaceState(null, "", currentUrl);
+                        parentWindow.location.reload();
+                    }}
+                }}
+            }} catch (error) {{
+                console.error("Não foi possível restaurar a sessão local do Praesidium.", error);
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
 
 
 # ==========================================
@@ -481,6 +963,49 @@ def registrar_acesso(username: str, nome: str, status: str) -> None:
 if "autenticado" not in st.session_state:
     st.session_state["autenticado"] = False
 atualizar_espelho_sessao()
+
+token_url = st.query_params.get("session")
+if isinstance(token_url, str) and token_url:
+    usuario_validado = usuario_por_token(token_url)
+    if usuario_validado:
+        username_restaurado, dados_usuario_restaurado = usuario_validado
+        with registro_global["lock"]:
+            sessao_existente = registro_global["sessions"].get(token_url, {})
+            sessao_url = {
+                "username": username_restaurado,
+                "role": dados_usuario_restaurado["role"],
+                "name": dados_usuario_restaurado["name"],
+                "tenant_id": username_restaurado,
+                "company_id": dados_usuario_restaurado.get("company_id"),
+                "state": sessao_existente.get("state", {}),
+            }
+            registro_global["sessions"][token_url] = sessao_url
+        dados_sessao = dict(sessao_url)
+        st.session_state["autenticado"] = True
+        st.session_state["auth_username"] = dados_sessao["username"]
+        st.session_state["tenant_id"] = dados_sessao["tenant_id"]
+        st.session_state["usuario_nome"] = dados_sessao["name"]
+        st.session_state["is_admin"] = dados_sessao["role"] == "admin"
+        st.session_state["session_token"] = token_url
+        st.session_state["empresa_sessao_key"] = f"empresa_ativa_{token_url}"
+        for chave, valor in dados_sessao.get("state", {}).items():
+            if chave not in st.session_state:
+                st.session_state[chave] = valor
+        if not st.session_state.get("acesso_notificado", False):
+            registrar_e_notificar_acesso(
+                dados_sessao["username"],
+                dados_sessao["name"],
+                "Sessão Restaurada",
+            )
+            st.session_state["acesso_notificado"] = True
+    else:
+        st.query_params.pop("session", None)
+        st.session_state["limpar_token_navegador"] = True
+
+injetar_persistencia_navegador(
+    st.session_state.get("session_token"),
+    st.session_state.pop("limpar_token_navegador", False),
+)
 
 usuario_autenticado = st.session_state.get("auth_username", "")
 dados_usuario = registro_global["users"].get(usuario_autenticado)
@@ -503,14 +1028,23 @@ if not st.session_state["autenticado"]:
 
     col_esq, col_centro, col_dir = st.columns([1, 1.3, 1])
     with col_centro:
-        aba_entrar, aba_cadastro = st.tabs(["Entrar", "Primeiro Acesso (Criar Conta)"])
+        aba_entrar, aba_cadastro = st.tabs(["Entrar", "Criar Conta"])
         with aba_entrar:
             with st.form("form_login_mvp", border=False):
                 identificacao_input = st.text_input("Usuário")
                 senha_input = st.text_input("Senha", type="password")
+                manter_conectado = st.checkbox("Manter conectado neste aparelho", value=True)
                 btn_entrar = st.form_submit_button("Entrar", use_container_width=True)
             if btn_entrar:
                 username = identificacao_input.strip().lower()
+                if username:
+                    try:
+                        atualizar_usuario_do_supabase(username)
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "Falha ao consultar o usuário %s no Supabase; usando o cache local.",
+                            username,
+                        )
                 usuario = registro_global["users"].get(username)
                 senha_correta = (
                     isinstance(usuario, dict)
@@ -521,12 +1055,8 @@ if not st.session_state["autenticado"]:
                 )
                 if senha_correta:
                     nome_usuario = str(usuario.get("name", username))
-                    registrar_acesso(username, nome_usuario, "Sucesso")
-                    st.session_state["autenticado"] = True
-                    st.session_state["auth_username"] = username
-                    st.session_state["tenant_id"] = username
-                    st.session_state["usuario_nome"] = nome_usuario
-                    st.session_state["is_admin"] = usuario.get("role") == "admin"
+                    registrar_e_notificar_acesso(username, nome_usuario, "Login")
+                    iniciar_sessao_usuario(username, manter_conectado)
                     st.rerun()
                 else:
                     nome_tentativa = (
@@ -534,20 +1064,17 @@ if not st.session_state["autenticado"]:
                         if isinstance(usuario, dict)
                         else "Não identificado"
                     )
-                    registrar_acesso(username, nome_tentativa, "Falha de Login")
+                    registrar_e_notificar_acesso(username, nome_tentativa, "Falha de Login")
                     st.error("Usuário ou senha incorretos. Verifique a grafia.")
         with aba_cadastro:
             with st.form("form_primeiro_acesso", border=False):
-                novo_usuario_input = st.text_input("Usuário")
                 novo_nome_usuario = st.text_input("Nome")
+                novo_usuario_input = st.text_input("Usuário")
                 nova_senha = st.text_input("Senha", type="password")
-                codigo_convite = st.text_input("Código de Convite", type="password")
                 btn_criar_conta = st.form_submit_button("Criar Conta", use_container_width=True)
             if btn_criar_conta:
                 novo_usuario = novo_usuario_input.strip().lower()
-                if codigo_convite.strip() != "PRAESIDIUM2026":
-                    st.error("Código de convite inválido.")
-                elif not re.fullmatch(r"[a-z0-9_.-]+", novo_usuario):
+                if not re.fullmatch(r"[a-z0-9_.-]+", novo_usuario):
                     st.error("O usuário deve conter apenas letras, números, ponto, hífen ou sublinhado.")
                 elif not novo_nome_usuario.strip() or not nova_senha:
                     st.error("Informe usuário, nome e senha.")
@@ -556,19 +1083,92 @@ if not st.session_state["autenticado"]:
                         if novo_usuario in registro_global["users"]:
                             st.error("Este usuário já está cadastrado.")
                         else:
-                            registro_global["users"][novo_usuario] = {
-                                "password_hash": hash_senha(nova_senha),
-                                "role": "contador",
-                                "name": novo_nome_usuario.strip(),
-                            }
-                            try:
+                            verificacao_remota_ok = False
+                            usuario_remoto = None
+                            if supabase is not None:
+                                try:
+                                    usuario_remoto = buscar_usuario_persistido(novo_usuario)
+                                    verificacao_remota_ok = True
+                                except Exception:
+                                    logging.getLogger(__name__).exception(
+                                        "Falha ao verificar duplicidade do usuário no Supabase."
+                                    )
+                            if usuario_remoto is not None:
+                                registro_global["users"][novo_usuario] = usuario_remoto
                                 salvar_registro_global(registro_global)
-                            except Exception:
-                                del registro_global["users"][novo_usuario]
-                                raise
-                            atualizar_espelho_sessao()
-                            st.success("Conta criada. Use seu usuário e senha na aba Entrar.")
+                                st.error("Este usuário já está cadastrado.")
+                            else:
+                                novo_registro_usuario = {
+                                    "password_hash": hash_senha(nova_senha),
+                                    "role": "contador",
+                                    "name": novo_nome_usuario.strip(),
+                                }
+                                persistencia_supabase_ok = False
+                                duplicado_remoto = False
+                                if verificacao_remota_ok:
+                                    try:
+                                        criar_usuario_supabase(novo_usuario, novo_registro_usuario)
+                                        persistencia_supabase_ok = True
+                                    except ValueError:
+                                        st.error("Este usuário já está cadastrado.")
+                                        duplicado_remoto = True
+                                    except Exception:
+                                        try:
+                                            usuario_remoto = buscar_usuario_persistido(novo_usuario)
+                                        except Exception:
+                                            usuario_remoto = None
+                                        if usuario_remoto is not None:
+                                            registro_global["users"][novo_usuario] = usuario_remoto
+                                            try:
+                                                salvar_registro_global(registro_global)
+                                            except Exception:
+                                                logging.getLogger(__name__).exception(
+                                                    "Falha ao salvar usuário remoto no cache local."
+                                                )
+                                            st.error("Este usuário já está cadastrado.")
+                                            duplicado_remoto = True
+                                        else:
+                                            logging.getLogger(__name__).exception(
+                                                "Não foi possível persistir a nova conta no Supabase."
+                                            )
+                                elif supabase is not None:
+                                    st.warning(
+                                        "Não foi possível verificar duplicidade no Supabase; "
+                                        "a conta será salva no fallback local."
+                                    )
+                                if not duplicado_remoto:
+                                    registro_global["users"][novo_usuario] = novo_registro_usuario
+                                    cache_local_ok = True
+                                    try:
+                                        salvar_registro_global(registro_global)
+                                    except Exception:
+                                        cache_local_ok = False
+                                        logging.getLogger(__name__).exception(
+                                            "Não foi possível salvar a conta no fallback local."
+                                        )
+                                    if not persistencia_supabase_ok:
+                                        st.session_state["aviso_persistencia_conta"] = (
+                                            "Conta salva no fallback local."
+                                            if cache_local_ok
+                                            else "Conta está apenas no cache do servidor; Supabase e arquivo local falharam."
+                                        )
+                                    elif not cache_local_ok:
+                                        st.session_state["aviso_persistencia_conta"] = (
+                                            "Conta salva no Supabase, mas o espelho local falhou."
+                                        )
+                                    atualizar_espelho_sessao()
+                                    registrar_e_notificar_acesso(
+                                        novo_usuario,
+                                        novo_nome_usuario.strip(),
+                                        "Novo Cadastro",
+                                    )
+                                    iniciar_sessao_usuario(novo_usuario)
+                                    st.rerun()
     st.stop()
+
+aviso_persistencia_conta = st.session_state.pop("aviso_persistencia_conta", None)
+if aviso_persistencia_conta:
+    st.warning(aviso_persistencia_conta)
 
 
 # ==========================================
@@ -578,8 +1178,15 @@ if not st.session_state["autenticado"]:
 def carregar_todas_empresas_db():
     try:
         res = supabase.table("empresas_monitoradas").select("*").execute()
-        return res.data if res.data else []
+        return [
+            empresa for empresa in (res.data or [])
+            if str(empresa.get("regime_tributario", "")) != "SYS_AUTH"
+            and not str(empresa.get("razao_social", "")).startswith(
+                (PREFIXO_USUARIO_SISTEMA, PREFIXO_LOG_SISTEMA)
+            )
+        ]
     except Exception:
+        logging.getLogger(__name__).exception("Falha ao carregar empresas do Supabase.")
         return []
 
 
@@ -623,7 +1230,7 @@ TAG_TENANT_RE = re.compile(r"\s*\[T:([^\]]+)\]", re.IGNORECASE)
 
 
 def limpar_tag_tenant(nome_empresa: str) -> str:
-    return TAG_TENANT_RE.sub("", str(nome_empresa)).strip()
+    return xml_engine.limpar_tag_tenant_empresa(nome_empresa)
 
 
 def extrair_tenant_empresa(emp: dict) -> str:
@@ -656,7 +1263,7 @@ def extrair_cnae_limpo_empresa(emp: dict) -> str:
 # 5. GESTÃO MULTI-EMPRESA E RADAR ADMIN (SIDEBAR)
 # ==========================================
 tenant_atual = usuario_autenticado
-is_admin = dados_usuario["role"] == "admin"
+is_admin = usuario_autenticado == "felipebondezzan" and dados_usuario["role"] == "admin"
 st.session_state["tenant_id"] = tenant_atual
 st.session_state["usuario_nome"] = str(dados_usuario.get("name", usuario_autenticado))
 st.session_state["is_admin"] = is_admin
@@ -674,11 +1281,26 @@ st.sidebar.markdown(f"""
 
 todas_empresas_brutas = carregar_todas_empresas_db()
 
-# SE FOR VOCÊ (ADMIN): Mostra o Radar de Acessos e permite espionar/filtrar qualquer contador
+# Administrador: radar global de acessos e visão multi-tenant.
 if is_admin:
     with st.sidebar.expander("🔔 Radar de Acessos (Admin)", expanded=False):
         if st.button("Atualizar Acessos", use_container_width=True, key="btn_atualizar_acessos"):
-            atualizar_espelho_sessao()
+            try:
+                atualizar_logs_do_supabase()
+            except Exception:
+                logging.getLogger(__name__).exception("Falha ao atualizar logs de acesso do Supabase.")
+                st.sidebar.error("Não foi possível atualizar o histórico pelo Supabase.")
+        if st.button(
+            "Testar Alerta no Celular",
+            use_container_width=True,
+            key="btn_testar_alerta_celular",
+        ):
+            registrar_e_notificar_acesso(
+                usuario_autenticado,
+                st.session_state["usuario_nome"],
+                "Teste de Alerta",
+            )
+            st.sidebar.success("Alerta enviado em segundo plano para o canal ntfy.")
 
         with registro_global["lock"]:
             logs_acesso = [dict(log) for log in registro_global["access_logs"]]
@@ -690,7 +1312,7 @@ if is_admin:
                         "Data/Hora": log["datetime"],
                         "Usuário": log["username"],
                         "Nome": log["name"],
-                        "Status": log["status"],
+                        "Evento": log["event"],
                     }
                     for log in reversed(logs_acesso)
                 ]),
@@ -721,7 +1343,6 @@ else:
     lista_empresas = [
         e for e in todas_empresas_brutas
         if extrair_tenant_empresa(e) == tenant_atual
-        or (tenant_atual == "guilherme" and not extrair_tenant_empresa(e))
     ]
 
 with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
@@ -803,26 +1424,76 @@ if not lista_empresas:
     </div>
     """, unsafe_allow_html=True)
     if st.sidebar.button("🔒 Encerrar Sessão", use_container_width=True):
-        st.session_state["autenticado"] = False
-        st.rerun()
+        encerrar_sessao()
     st.stop()
 
 opcoes_empresas = {}
 for empresa in lista_empresas:
     nome_limpo = limpar_tag_tenant(empresa.get("razao_social", ""))
     dono = extrair_tenant_empresa(empresa)
-    nome_dono = registro_global["users"].get(dono, {}).get("name", dono) if dono else "Guilherme (sem tag)"
+    nome_dono = registro_global["users"].get(dono, {}).get("name", dono) if dono else "Sem tag (legado)"
     dono_exibicao = f"{dono} — {nome_dono}" if dono else nome_dono
     sufixo_dono = f" • Dono: {dono_exibicao}" if is_admin else ""
     opcoes_empresas[f"{nome_limpo} ({empresa['cnpj']}){sufixo_dono}"] = empresa["id"]
-empresa_selecionada_nome = st.sidebar.selectbox("📂 Cliente Ativo Monitorado", list(opcoes_empresas.keys()))
+chave_empresa_selecao = st.session_state.get(
+    "empresa_sessao_key",
+    f"empresa_ativa_{usuario_autenticado}",
+)
+token_sessao_ativa = st.session_state.get("session_token")
+if token_sessao_ativa:
+    with registro_global["lock"]:
+        sessao_ativa = registro_global["sessions"].get(token_sessao_ativa)
+        empresa_salva = sessao_ativa.get("company_id") if sessao_ativa else None
+else:
+    sessao_ativa = None
+    empresa_salva = None
+
+if st.session_state.get(chave_empresa_selecao) not in opcoes_empresas:
+    st.session_state.pop(chave_empresa_selecao, None)
+if chave_empresa_selecao not in st.session_state and empresa_salva is not None:
+    if any(str(empresa["id"]) == str(empresa_salva) for empresa in lista_empresas):
+        st.session_state[chave_empresa_selecao] = next(
+            nome for nome, empresa_id in opcoes_empresas.items()
+            if str(empresa_id) == str(empresa_salva)
+        )
+empresa_selecionada_nome = st.sidebar.selectbox(
+    "📂 Cliente Ativo Monitorado",
+    list(opcoes_empresas.keys()),
+    key=chave_empresa_selecao,
+)
 empresa_id_ativo = opcoes_empresas[empresa_selecionada_nome]
+if sessao_ativa is not None:
+    with registro_global["lock"]:
+        sessao_salva = registro_global["sessions"].get(token_sessao_ativa)
+        if sessao_salva is not None:
+            sessao_salva["company_id"] = empresa_id_ativo
+            sessao_salva["role"] = dados_usuario["role"]
+            sessao_salva["name"] = dados_usuario["name"]
+            sessao_salva["tenant_id"] = usuario_autenticado
+if (
+    str(dados_usuario.get("company_id")) != str(empresa_id_ativo)
+    or str(dados_usuario.get("company_id_synced")) != str(empresa_id_ativo)
+):
+    dados_usuario["company_id"] = empresa_id_ativo
+    if supabase is not None:
+        try:
+            persistir_usuario_supabase(usuario_autenticado, dados_usuario)
+            dados_usuario["company_id_synced"] = empresa_id_ativo
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao persistir a última empresa ativa do usuário %s.",
+                usuario_autenticado,
+            )
+    try:
+        salvar_cache_local()
+    except Exception:
+        logging.getLogger(__name__).exception("Falha ao salvar a última empresa ativa localmente.")
 empresa_ativa_bruta = next((e for e in lista_empresas if e["id"] == empresa_id_ativo), lista_empresas[0])
 tenant_empresa_ativa = extrair_tenant_empresa(empresa_ativa_bruta)
 nome_dono_ativo = (
     registro_global["users"].get(tenant_empresa_ativa, {}).get("name", tenant_empresa_ativa)
     if tenant_empresa_ativa
-    else "Guilherme (sem tag)"
+    else "Sem tag (legado)"
 )
 dono_exibicao_ativo = (
     f"{tenant_empresa_ativa} — {nome_dono_ativo}"
@@ -870,7 +1541,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
         key=f"edit_cnae_{empresa_id_ativo}"
     )
     if st.button("💾 Salvar Novo CNAE", use_container_width=True, key=f"btn_save_cnae_{empresa_id_ativo}"):
-        owner_tag = extrair_tenant_empresa(empresa_ativa_bruta) or "guilherme"
+        owner_tag = extrair_tenant_empresa(empresa_ativa_bruta) or tenant_atual
         cnaes_editados = list(dict.fromkeys(
             "".join(filter(str.isdigit, cnae.strip()))
             for cnae in novo_cnae_edit.split(",")
@@ -949,8 +1620,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
             st.sidebar.error(f"Erro ao excluir: {ex}")
 
 if st.sidebar.button("🔒 Encerrar Sessão", use_container_width=True):
-    st.session_state["autenticado"] = False
-    st.rerun()
+    encerrar_sessao()
 
 # ==========================================
 # 6. CABEÇALHO EXECUTIVO
@@ -1332,3 +2002,4 @@ with st.expander("📁 7. ⚖️ Simulador Estratégico de Migração (Simples T
 relatorio_engine.renderizar_modulo_relatorio(
     empresa_ativa, imposto_bruto_mes, credito_validado_tempo_real, imposto_quarentena, imposto_estornado, notas, itens
 )
+persistir_estado_sessao()
