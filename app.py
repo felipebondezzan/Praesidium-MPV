@@ -1,4 +1,5 @@
 import io
+import hashlib
 import hmac
 import json
 import os
@@ -17,7 +18,6 @@ from supabase import create_client, Client
 from urllib.parse import urlparse
 import xml_engine
 import relatorio_engine
-import hashlib
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 
 st.set_page_config(
@@ -92,7 +92,7 @@ CSS_DARK_LUXURY = """
     }
     .block-container,
     [data-testid="stAppViewContainer"] > .main .block-container {
-        padding-top: 3.8rem !important;
+        padding-top: 4.2rem !important;
         padding-bottom: 2rem !important;
     }
     header[data-testid="stHeader"] {
@@ -734,53 +734,20 @@ def atualizar_logs_do_supabase() -> None:
     atualizar_espelho_sessao()
 
 
-def valor_estado_persistivel(valor):
-    if valor is None or isinstance(valor, (str, int, float, bool)):
-        return valor
-    if isinstance(valor, (list, tuple)):
-        itens = []
-        for item in valor:
-            item_seguro = valor_estado_persistivel(item)
-            if item_seguro is not None or item is None:
-                itens.append(item_seguro)
-        return itens
-    if isinstance(valor, dict) and all(isinstance(chave, str) for chave in valor):
-        resultado = {}
-        for chave, item in valor.items():
-            item_seguro = valor_estado_persistivel(item)
-            if item_seguro is not None or item is None:
-                resultado[chave] = item_seguro
-        return resultado
-    return None
-
-
 def persistir_estado_sessao() -> None:
     token = st.session_state.get("session_token")
     if not token:
         return
-    chaves_privadas = {
-        "senha",
-        "password",
-        "session_token",
-        "auth_username",
-        "autenticado",
-        "acesso_notificado",
-        "registro_auth_espelho",
-        "empresa_sessao_key",
-        "token_usuario_validado",
-    }
-    estado = {}
-    for chave, valor in st.session_state.items():
-        chave_lower = str(chave).lower()
-        if any(termo in chave_lower for termo in chaves_privadas) or chave_lower.startswith(("btn_", "button_")):
-            continue
-        valor_seguro = valor_estado_persistivel(valor)
-        if valor_seguro is not None or valor is None:
-            estado[str(chave)] = valor_seguro
+    empresa_id_ativa = st.session_state.get("empresa_id_ativa")
     with registro_global["lock"]:
         sessao = registro_global["sessions"].get(token)
         if sessao is not None:
-            sessao["state"] = estado
+            sessao["company_id"] = empresa_id_ativa
+            sessao["state"] = (
+                {"empresa_id_ativa": empresa_id_ativa}
+                if empresa_id_ativa is not None
+                else {}
+            )
 
 
 def enviar_alerta_acesso(log_acesso: dict) -> None:
@@ -850,7 +817,11 @@ def criar_token_sessao(usuario: str, conectado: bool = True) -> str | None:
         "name": dados_usuario["name"],
         "tenant_id": usuario,
         "company_id": dados_usuario.get("company_id"),
-        "state": {},
+        "state": (
+            {"empresa_id_ativa": dados_usuario["company_id"]}
+            if dados_usuario.get("company_id") is not None
+            else {}
+        ),
     }
     with registro_global["lock"]:
         registro_global["sessions"][token] = sessao
@@ -896,9 +867,11 @@ def iniciar_sessao_usuario(usuario: str, conectado: bool = True) -> None:
     st.session_state["usuario_nome"] = dados_usuario["name"]
     st.session_state["is_admin"] = dados_usuario["role"] == "admin"
     st.session_state["acesso_notificado"] = True
-    if token:
-        st.session_state["empresa_sessao_key"] = f"empresa_ativa_{token}"
+    if dados_usuario.get("company_id") is not None:
+        st.session_state["empresa_id_ativa"] = dados_usuario["company_id"]
     else:
+        st.session_state.pop("empresa_id_ativa", None)
+    if not token:
         st.session_state["limpar_token_navegador"] = True
 
 
@@ -971,13 +944,21 @@ if isinstance(token_url, str) and token_url:
         username_restaurado, dados_usuario_restaurado = usuario_validado
         with registro_global["lock"]:
             sessao_existente = registro_global["sessions"].get(token_url, {})
+            empresa_id_restaurada = sessao_existente.get(
+                "company_id",
+                dados_usuario_restaurado.get("company_id"),
+            )
             sessao_url = {
                 "username": username_restaurado,
                 "role": dados_usuario_restaurado["role"],
                 "name": dados_usuario_restaurado["name"],
                 "tenant_id": username_restaurado,
-                "company_id": dados_usuario_restaurado.get("company_id"),
-                "state": sessao_existente.get("state", {}),
+                "company_id": empresa_id_restaurada,
+                "state": (
+                    {"empresa_id_ativa": empresa_id_restaurada}
+                    if empresa_id_restaurada is not None
+                    else {}
+                ),
             }
             registro_global["sessions"][token_url] = sessao_url
         dados_sessao = dict(sessao_url)
@@ -987,10 +968,11 @@ if isinstance(token_url, str) and token_url:
         st.session_state["usuario_nome"] = dados_sessao["name"]
         st.session_state["is_admin"] = dados_sessao["role"] == "admin"
         st.session_state["session_token"] = token_url
-        st.session_state["empresa_sessao_key"] = f"empresa_ativa_{token_url}"
-        for chave, valor in dados_sessao.get("state", {}).items():
-            if chave not in st.session_state:
-                st.session_state[chave] = valor
+        empresa_id_restaurada = dados_sessao.get("company_id")
+        if empresa_id_restaurada is not None:
+            st.session_state["empresa_id_ativa"] = empresa_id_restaurada
+        else:
+            st.session_state.pop("empresa_id_ativa", None)
         if not st.session_state.get("acesso_notificado", False):
             registrar_e_notificar_acesso(
                 dados_sessao["username"],
@@ -1176,10 +1158,26 @@ if aviso_persistencia_conta:
 # ==========================================
 @st.cache_data(ttl=60, show_spinner=False)
 def carregar_todas_empresas_db():
+    if supabase is None:
+        return []
     try:
-        res = supabase.table("empresas_monitoradas").select("*").execute()
+        empresas = []
+        inicio = 0
+        tamanho_pagina = 1000
+        while True:
+            res = (
+                supabase.table("empresas_monitoradas")
+                .select("id,cnpj,razao_social,regime_tributario,cnae_principal,certificado_a1_status")
+                .range(inicio, inicio + tamanho_pagina - 1)
+                .execute()
+            )
+            pagina = res.data or []
+            empresas.extend(pagina)
+            if len(pagina) < tamanho_pagina:
+                break
+            inicio += tamanho_pagina
         return [
-            empresa for empresa in (res.data or [])
+            empresa for empresa in empresas
             if str(empresa.get("regime_tributario", "")) != "SYS_AUTH"
             and not str(empresa.get("razao_social", "")).startswith(
                 (PREFIXO_USUARIO_SISTEMA, PREFIXO_LOG_SISTEMA)
@@ -1192,28 +1190,54 @@ def carregar_todas_empresas_db():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def carregar_dados_empresa_db(emp_id: int, emp_cnpj: str):
+    if supabase is None:
+        return [], [], [], []
+
     notas_lista = []
     devs_lista = []
     itens_lista = []
-    logs_lista = []
 
     try:
         n_res = supabase.table("notas_fiscais_recebidas").select("*").eq("empresa_id", emp_id).execute()
         notas_lista = n_res.data if n_res.data else []
     except Exception:
-        notas_lista = []
+        logging.getLogger(__name__).exception(
+            "Falha ao carregar notas fiscais da empresa %s.",
+            emp_id,
+        )
 
+    devolucoes_por_id = {}
     try:
-        d_res = supabase.table("conciliacao_devolucoes").select("*").execute()
-        todas_d = d_res.data if d_res.data else []
-        for d in todas_d:
-            motivo_str = str(d.get("motivo_ajuste", ""))
-            if motivo_str.startswith("[LOG_ACESSO]"):
-                logs_lista.append(d)
-            elif d.get("empresa_id") == emp_id or f"[{emp_cnpj}]" in motivo_str:
-                devs_lista.append(d)
+        d_res = (
+            supabase.table("conciliacao_devolucoes")
+            .select("*")
+            .eq("empresa_id", emp_id)
+            .execute()
+        )
+        for devolucao in d_res.data or []:
+            devolucoes_por_id[str(devolucao.get("id"))] = devolucao
     except Exception:
-        pass
+        logging.getLogger(__name__).exception(
+            "Falha ao carregar devoluções por empresa para %s.",
+            emp_id,
+        )
+
+    if emp_cnpj:
+        try:
+            d_res_legadas = (
+                supabase.table("conciliacao_devolucoes")
+                .select("*")
+                .like("motivo_ajuste", f"%[{emp_cnpj}]%")
+                .execute()
+            )
+            for devolucao in d_res_legadas.data or []:
+                devolucoes_por_id[str(devolucao.get("id"))] = devolucao
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao carregar devoluções legadas por CNPJ para %s.",
+                emp_cnpj,
+            )
+    devs_lista = list(devolucoes_por_id.values())
 
     n_ids = [n["id"] for n in notas_lista if "id" in n]
     if n_ids:
@@ -1221,9 +1245,12 @@ def carregar_dados_empresa_db(emp_id: int, emp_cnpj: str):
             i_res = supabase.table("itens_nota_fiscal").select("*").in_("nota_id", n_ids).execute()
             itens_lista = i_res.data if i_res.data else []
         except Exception:
-            itens_lista = []
+            logging.getLogger(__name__).exception(
+                "Falha ao carregar itens das notas da empresa %s.",
+                emp_id,
+            )
 
-    return notas_lista, devs_lista, itens_lista, logs_lista
+    return notas_lista, devs_lista, itens_lista, []
 
 
 TAG_TENANT_RE = re.compile(r"\s*\[T:([^\]]+)\]", re.IGNORECASE)
@@ -1435,10 +1462,7 @@ for empresa in lista_empresas:
     dono_exibicao = f"{dono} — {nome_dono}" if dono else nome_dono
     sufixo_dono = f" • Dono: {dono_exibicao}" if is_admin else ""
     opcoes_empresas[f"{nome_limpo} ({empresa['cnpj']}){sufixo_dono}"] = empresa["id"]
-chave_empresa_selecao = st.session_state.get(
-    "empresa_sessao_key",
-    f"empresa_ativa_{usuario_autenticado}",
-)
+chave_empresa_selecao = f"empresa_ativa_select_{usuario_autenticado}"
 token_sessao_ativa = st.session_state.get("session_token")
 if token_sessao_ativa:
     with registro_global["lock"]:
@@ -1448,20 +1472,23 @@ else:
     sessao_ativa = None
     empresa_salva = None
 
-if st.session_state.get(chave_empresa_selecao) not in opcoes_empresas:
-    st.session_state.pop(chave_empresa_selecao, None)
-if chave_empresa_selecao not in st.session_state and empresa_salva is not None:
-    if any(str(empresa["id"]) == str(empresa_salva) for empresa in lista_empresas):
-        st.session_state[chave_empresa_selecao] = next(
-            nome for nome, empresa_id in opcoes_empresas.items()
-            if str(empresa_id) == str(empresa_salva)
-        )
+empresa_preferida = st.session_state.get("empresa_id_ativa", empresa_salva)
+empresa_preferida_index = next(
+    (
+        indice
+        for indice, empresa_id in enumerate(opcoes_empresas.values())
+        if str(empresa_id) == str(empresa_preferida)
+    ),
+    0,
+)
 empresa_selecionada_nome = st.sidebar.selectbox(
     "📂 Cliente Ativo Monitorado",
     list(opcoes_empresas.keys()),
+    index=empresa_preferida_index,
     key=chave_empresa_selecao,
 )
 empresa_id_ativo = opcoes_empresas[empresa_selecionada_nome]
+st.session_state["empresa_id_ativa"] = empresa_id_ativo
 if sessao_ativa is not None:
     with registro_global["lock"]:
         sessao_salva = registro_global["sessions"].get(token_sessao_ativa)
@@ -1643,19 +1670,33 @@ itens_mem = st.session_state.get(f"fallback_itens_{empresa_id_ativo}", [])
 notas = notas_db + notas_mem
 itens = itens_db + itens_mem
 
-imposto_bruto_mes = sum([
-    float(i.get("valor_credito_item", 0.0))
-    for i in itens
-    if i.get("classificacao_item") in ["Aprovado Revenda", "Aprovado Manualmente Contador"]
-])
-imposto_quarentena = sum([
-    float(i.get("valor_item", 0.0)) * 0.265
-    for i in itens
-    if i.get("classificacao_item") == "Quarentena Uso/Consumo"
-])
-imposto_estornado = sum([float(d.get("credito_estornado", 0.0)) for d in devolucoes])
-
-credito_validado_tempo_real = max(0.0, imposto_bruto_mes - imposto_estornado)
+competencia_atual = pd.Period(datetime.now(), freq="M")
+periodo_por_nota = {
+    str(n.get("id")): xml_engine.obter_data_referencia_nota(n).to_period("M")
+    for n in notas
+    if n.get("id") is not None and xml_engine.obter_data_referencia_nota(n) is not None
+}
+itens_mes = [
+    i for i in itens
+    if periodo_por_nota.get(str(i.get("nota_id"))) == competencia_atual
+]
+resumo_creditos_mes = xml_engine.calcular_resumo_creditos(itens_mes)
+imposto_validado_mes = resumo_creditos_mes["validado"]
+imposto_quarentena = resumo_creditos_mes["quarentena"]
+imposto_bruto_mes = resumo_creditos_mes["bruto"]
+ids_notas_mes = {
+    str(n.get("id"))
+    for n in notas
+    if str(n.get("id")) in periodo_por_nota
+    and periodo_por_nota[str(n.get("id"))] == competencia_atual
+}
+devolucoes_mes = [
+    d for d in devolucoes
+    if str(d.get("nota_original_id", "")) in ids_notas_mes
+]
+imposto_estornado = sum(float(d.get("credito_estornado", 0.0)) for d in devolucoes_mes)
+credito_validado_tempo_real = imposto_validado_mes
+saldo_credito_disponivel = max(0.0, credito_validado_tempo_real - imposto_estornado)
 
 # ==========================================
 # 8. PAINEL SUPERIOR: IMPOSTÔMETRO LUXO
@@ -1676,7 +1717,7 @@ with col2:
     <div class="exec-card card-validado">
         <div class="card-label">✅ Crédito Validado (Tempo Real)</div>
         <div class="card-value-validado">R$ {credito_validado_tempo_real:,.2f}</div>
-        <div class="card-desc">Líquido de devoluções operacionais (-R$ {imposto_estornado:,.2f})</div>
+        <div class="card-desc">Crédito aprovado no mês; disponível após estornos: R$ {saldo_credito_disponivel:,.2f}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1691,6 +1732,55 @@ with col3:
 
 st.write("")
 st.markdown("### 📂 Módulos de Auditoria, Devolução Expressa e Inteligência Estratégica")
+
+with st.expander("📊 Histórico Anual da Empresa (Últimos 12 Meses)", expanded=False):
+    st.caption(
+        f"Dados isolados para {empresa_ativa['razao_social']} "
+        f"(CNPJ {empresa_ativa.get('cnpj', '')}); competências pelo mês de emissão "
+        "ou, quando indisponível, pela data de registro. Créditos históricos não são recalculados."
+    )
+    periodos_anuais = [competencia_atual - deslocamento for deslocamento in range(11, -1, -1)]
+    itens_por_periodo = {periodo: [] for periodo in periodos_anuais}
+    notas_por_periodo = {periodo: [] for periodo in periodos_anuais}
+    for nota in notas:
+        periodo = periodo_por_nota.get(str(nota.get("id")))
+        if periodo in notas_por_periodo:
+            notas_por_periodo[periodo].append(nota)
+    for item in itens:
+        periodo = periodo_por_nota.get(str(item.get("nota_id")))
+        if periodo in itens_por_periodo:
+            itens_por_periodo[periodo].append(item)
+
+    linhas_historico = []
+    for periodo in reversed(periodos_anuais):
+        itens_periodo = itens_por_periodo[periodo]
+        resumo_creditos = xml_engine.calcular_resumo_creditos(itens_periodo)
+        notas_periodo = notas_por_periodo[periodo]
+        versoes = sorted({
+            xml_engine.obter_versao_regra_nota(n)
+            for n in notas_periodo
+        })
+        linhas_historico.append({
+            "Mês/Competência": periodo.strftime("%m/%Y"),
+            "Total Recebido / Bruto Processado (R$)": sum(
+                float(n.get("valor_total_nf", 0.0) or 0.0) for n in notas_periodo
+            ),
+            "Total Aceito / Validado (R$)": resumo_creditos["validado"],
+            "Total em Quarentena Pendente (R$)": resumo_creditos["quarentena"],
+            "Total Rejeitado / Glosado Art. 57 (R$)": resumo_creditos["rejeitado"],
+            "Versão da Regra Aplicada": ", ".join(versoes) if versoes else "—",
+        })
+
+    total_aceito_anual = sum(row["Total Aceito / Validado (R$)"] for row in linhas_historico)
+    total_pendente_anual = sum(row["Total em Quarentena Pendente (R$)"] for row in linhas_historico)
+    total_rejeitado_anual = sum(row["Total Rejeitado / Glosado Art. 57 (R$)"] for row in linhas_historico)
+    total_processado_anual = sum(row["Total Recebido / Bruto Processado (R$)"] for row in linhas_historico)
+    resumo_anual = st.columns(4)
+    resumo_anual[0].metric("Bruto processado", f"R$ {total_processado_anual:,.2f}")
+    resumo_anual[1].metric("Aceito / validado", f"R$ {total_aceito_anual:,.2f}")
+    resumo_anual[2].metric("Em quarentena", f"R$ {total_pendente_anual:,.2f}")
+    resumo_anual[3].metric("Rejeitado / glosado", f"R$ {total_rejeitado_anual:,.2f}")
+    st.dataframe(pd.DataFrame(linhas_historico), hide_index=True, use_container_width=True)
 
 # ==========================================
 # CHAMADA DO MOTOR DE INGESTÃO E EMISSOR DE DEVOLUÇÃO
@@ -1725,13 +1815,13 @@ with st.expander(f"📁 3. ⚠️ Radar de Contingência & Divergência SEFAZ ({
 
 # MÓDULO 4: QUARENTENA & HISTÓRICO (SOBERANIA DO CONTADOR)
 itens_pendentes = [i for i in itens if i.get("classificacao_item") == "Quarentena Uso/Consumo"]
-itens_auditados = [i for i in itens if i.get("classificacao_item") in ["Rejeitado pelo Contador", "Aprovado Manualmente Contador"]]
+itens_auditados = [i for i in itens if i.get("classificacao_item") in ["Rejeitado", "Rejeitado pelo Contador", "Aprovado Manualmente Contador"]]
 
 with st.expander(f"📁 4. Fila de Quarentena & Histórico de Auditoria ({len(itens_pendentes)} pendentes | {len(itens_auditados)} auditados)", expanded=False):
     if itens_pendentes:
         st.markdown("#### ⏳ Itens Aguardando Decisão Técnica do Contador")
         for idx_p, item in enumerate(itens_pendentes):
-            imposto_item = float(item.get("valor_item", 0.0)) * 0.265
+            imposto_item = xml_engine.obter_credito_quarentena(item)
             item_id_key = item.get("id", f"mem_{idx_p}")
             with st.container():
                 st.markdown(f"""
@@ -1747,16 +1837,16 @@ with st.expander(f"📁 4. Fila de Quarentena & Histórico de Auditoria ({len(it
                     try:
                         resultado = supabase.table("itens_nota_fiscal").update({
                             "classificacao_item": "Aprovado Manualmente Contador",
-                            "aliquota_aplicada": 0.265,
+                            "aliquota_aplicada": xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
                             "valor_credito_item": round(imposto_item, 2)
-                        }).eq("id", item["id"]).select("id").execute()
+                        }).eq("id", item["id"]).eq("nota_id", item["nota_id"]).select("id").execute()
                         dados_alterados = bool(resultado.data)
                     except Exception:
                         try:
                             resultado = supabase.table("itens_nota_fiscal").update({
                                 "classificacao_item": "Aprovado Manualmente Contador",
                                 "valor_credito_item": round(imposto_item, 2)
-                            }).eq("id", item["id"]).select("id").execute()
+                            }).eq("id", item["id"]).eq("nota_id", item["nota_id"]).select("id").execute()
                             dados_alterados = bool(resultado.data)
                         except Exception:
                             item["classificacao_item"] = "Aprovado Manualmente Contador"
@@ -1769,13 +1859,19 @@ with st.expander(f"📁 4. Fila de Quarentena & Histórico de Auditoria ({len(it
                     dados_alterados = False
                     try:
                         resultado = supabase.table("itens_nota_fiscal").update({
-                            "classificacao_item": "Rejeitado pelo Contador",
-                            "valor_credito_item": 0.00
-                        }).eq("id", item["id"]).select("id").execute()
+                            "classificacao_item": "Rejeitado",
+                            "aliquota_aplicada": xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
+                        }).eq("id", item["id"]).eq("nota_id", item["nota_id"]).select("id").execute()
                         dados_alterados = bool(resultado.data)
                     except Exception:
-                        item["classificacao_item"] = "Rejeitado pelo Contador"
-                        item["valor_credito_item"] = 0.00
+                        try:
+                            resultado = supabase.table("itens_nota_fiscal").update({
+                                "classificacao_item": "Rejeitado"
+                            }).eq("id", item["id"]).eq("nota_id", item["nota_id"]).select("id").execute()
+                            dados_alterados = bool(resultado.data)
+                        except Exception:
+                            item["classificacao_item"] = "Rejeitado"
+                        item["aliquota_aplicada"] = xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
                     if dados_alterados:
                         st.cache_data.clear()
                     st.rerun()
@@ -1874,13 +1970,13 @@ with st.expander("📁 7. ⚖️ Simulador Estratégico de Migração (Simples T
 
     compras_revenda_reais = sum([
         float(i.get("valor_item", 0.0))
-        for i in itens
+        for i in itens_mes
         if i.get("classificacao_item") in ["Aprovado Revenda", "Aprovado Manualmente Contador"]
     ])
-    devolucoes_reais = sum([float(d.get("valor_mercadoria_devolvida", 0.0)) for d in devolucoes])
+    devolucoes_reais = sum([float(d.get("valor_mercadoria_devolvida", 0.0)) for d in devolucoes_mes])
     quarentena_reais = sum([
         float(i.get("valor_item", 0.0))
-        for i in itens
+        for i in itens_mes
         if i.get("classificacao_item") == "Quarentena Uso/Consumo"
     ])
 
@@ -1925,6 +2021,18 @@ with st.expander("📁 7. ⚖️ Simulador Estratégico de Migração (Simples T
 
     st.markdown("---")
     st.markdown("#### 🧮 Memória de Cálculo Contábil (Transparência)")
+
+    credito_aplicado_simulacao = min(saldo_credito_disponivel, debito_ibs_cbs_vendas)
+    saldo_liquido_pos_abatimento = max(0.0, debito_ibs_cbs_vendas - credito_aplicado_simulacao)
+    st.metric(
+        "Saldo Líquido / Disponível pós-Abatimento (Crédito Validado)",
+        f"R$ {saldo_liquido_pos_abatimento:,.2f}",
+        help=(
+            f"Débito estimado de R$ {debito_ibs_cbs_vendas:,.2f} menos "
+            f"R$ {credito_aplicado_simulacao:,.2f} de crédito validado disponível. "
+            "Este abatimento não altera o crédito bruto nem o total histórico gerado."
+        ),
+    )
 
     mc1, mc2, mc3, mc4 = st.columns(4)
     with mc1:

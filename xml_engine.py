@@ -7,6 +7,69 @@ import xmltodict
 import streamlit as st
 import pandas as pd
 
+VERSAO_REGRA_TRIBUTARIA = "LC 214/2025 - Art. 47/57 v1.0"
+ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA = 0.265
+
+
+def obter_data_referencia_nota(nota: dict):
+    """Retorna a data de emissão ou, em dados legados, a data de registro."""
+    for campo in ("data_emissao", "created_at"):
+        valor = nota.get(campo)
+        if valor:
+            data = pd.to_datetime(valor, errors="coerce", utc=True)
+            if not pd.isna(data):
+                return data.tz_convert(None)
+    return None
+
+
+def obter_credito_quarentena(item: dict) -> float:
+    """Calcula o crédito potencial com a alíquota persistida, compatível com dados legados."""
+    credito = float(item.get("valor_credito_item", 0.0) or 0.0)
+    if credito > 0:
+        return credito
+    aliquota = float(item.get("aliquota_aplicada", 0.0) or 0.0)
+    if aliquota > 0:
+        return round(float(item.get("valor_item", 0.0) or 0.0) * aliquota, 2)
+    return round(
+        float(item.get("valor_item", 0.0) or 0.0)
+        * ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
+        2,
+    )
+
+
+def obter_credito_rejeitado(item: dict) -> float:
+    credito = float(item.get("valor_credito_item", 0.0) or 0.0)
+    if credito > 0:
+        return credito
+    aliquota = float(item.get("aliquota_aplicada", 0.0) or 0.0)
+    return round(float(item.get("valor_item", 0.0) or 0.0) * aliquota, 2)
+
+
+def obter_versao_regra_nota(nota: dict) -> str:
+    return str(nota.get("regra_tributaria_version") or "Legado — versão não registrada")
+
+
+def calcular_resumo_creditos(itens: list) -> dict[str, float]:
+    validados = 0.0
+    quarentena = 0.0
+    rejeitados = 0.0
+    for item in itens:
+        status = item.get("classificacao_item")
+        valor_credito = float(item.get("valor_credito_item", 0.0) or 0.0)
+        if status in {"Aprovado Revenda", "Aprovado Manualmente Contador"}:
+            validados += valor_credito
+        elif status == "Quarentena Uso/Consumo":
+            quarentena += obter_credito_quarentena(item)
+        elif status in {"Rejeitado", "Rejeitado pelo Contador"}:
+            rejeitados += obter_credito_rejeitado(item)
+    return {
+        "validado": validados,
+        "quarentena": quarentena,
+        "rejeitado": rejeitados,
+        "bruto": validados + quarentena,
+    }
+
+
 # ==========================================
 # 1. TABELAS DE REGRAS LC 214/2025 & CNAE
 # ==========================================
@@ -63,13 +126,28 @@ def inserir_seguro_supabase(supabase, tabela: str, payload) -> tuple[bool, str, 
         "manifestacao_status",
         "aliquota_aplicada",
         "certificado_a1_status",
-        "empresa_id"
+        "empresa_id",
+        "regra_tributaria_version",
+        "data_emissao"
     ]
+    colunas_removidas = set()
 
     for _ in range(len(colunas_opcionais_ordem) + 2):
         try:
             res = supabase.table(tabela).insert(dados_atuais).execute()
-            return True, "OK", (res.data if res.data else [])
+            mensagem = "OK"
+            colunas_rastreabilidade_ausentes = colunas_removidas.intersection({
+                "regra_tributaria_version",
+                "data_emissao",
+            })
+            if tabela == "notas_fiscais_recebidas" and colunas_rastreabilidade_ausentes:
+                mensagem = (
+                    "A rastreabilidade não está completa: as colunas "
+                    f"{', '.join(sorted(colunas_rastreabilidade_ausentes))} não existem em "
+                    "notas_fiscais_recebidas. Adicione-as para persistir versão da regra e "
+                    "data de emissão."
+                )
+            return True, mensagem, (res.data if res.data else [])
         except Exception as err:
             err_str = str(err)
             msg_erro = err_str.lower()
@@ -93,6 +171,7 @@ def inserir_seguro_supabase(supabase, tabela: str, payload) -> tuple[bool, str, 
             ), None)
 
             if col_remover:
+                colunas_removidas.add(col_remover)
                 if isinstance(dados_atuais, list):
                     dados_atuais = [{k: v for k, v in item.items() if k != col_remover} for item in dados_atuais]
                 else:
@@ -407,6 +486,7 @@ def processar_xml_bytes(
         if em_contingencia
         else "Ciência da Operação (SEFAZ OK)"
     )
+    data_emissao = ide.get("dhEmi", ide.get("dEmi"))
 
     crt_emitente = str(emit.get("CRT", "3")).strip()
     valor_total_nf = float(total.get("vNF", total.get("vProd", 0.0)))
@@ -417,10 +497,12 @@ def processar_xml_bytes(
         "cnpj_emitente": cnpj_emit,
         "valor_total_nf": round(valor_total_nf, 2),
         "manifestacao_status": status_manifestacao,
-        "hash_sha256_xml": hash_sha256
+        "hash_sha256_xml": hash_sha256,
+        "regra_tributaria_version": VERSAO_REGRA_TRIBUTARIA,
+        "data_emissao": str(data_emissao) if data_emissao else None,
     }
 
-    ok_nf, _, data_nf = inserir_seguro_supabase(supabase, "notas_fiscais_recebidas", payload_nf)
+    ok_nf, msg_nf, data_nf = inserir_seguro_supabase(supabase, "notas_fiscais_recebidas", payload_nf)
     if ok_nf and data_nf:
         nota_id = data_nf[0]["id"]
     else:
@@ -458,6 +540,8 @@ def processar_xml_bytes(
             cnaes_cliente_str=cnaes_cliente,
             em_contingencia=em_contingencia
         )
+        if classificacao == "Quarentena Uso/Consumo":
+            aliq = ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
 
         itens_para_inserir.append({
             "nota_id": nota_id,
@@ -481,13 +565,29 @@ def processar_xml_bytes(
 
     if dados_persistidos:
         st.cache_data.clear()
-    return True, f"NF-e {chave_raw[:10]}... auditada com sucesso ({len(itens_para_inserir)} itens processados)."
+    mensagem_final = (
+        f"NF-e {chave_raw[:10]}... auditada com sucesso "
+        f"({len(itens_para_inserir)} itens processados)."
+    )
+    if msg_nf != "OK":
+        mensagem_final += f" ⚠️ {msg_nf}"
+    return True, mensagem_final
 
 
 # ==========================================
 # 4. INTERFACE: MÓDULO DE INGESTÃO XML & ROBÔ SEFAZ
 # ==========================================
 def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
+    upload_feedback_key = f"upload_feedback_{empresa_id_ativo}"
+    feedback_upload = st.session_state.pop(upload_feedback_key, None)
+    if feedback_upload:
+        for nivel, mensagem in feedback_upload:
+            getattr(st, nivel)(mensagem)
+
+    aviso_regra = st.session_state.pop(f"aviso_regra_{empresa_id_ativo}", None)
+    if aviso_regra:
+        st.warning(aviso_regra)
+
     with st.expander("📁 1. Central de Ingestão XML & Sincronização Robô SEFAZ (A1 / Upload em Lote)", expanded=False):
         c_rob, c_up = st.columns([1.1, 1.9])
 
@@ -528,10 +628,12 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                     "cnpj_emitente": "60746948000112",
                     "valor_total_nf": round(vl_tot_sim, 2),
                     "manifestacao_status": "Ciência da Operação (SEFAZ OK)",
-                    "hash_sha256_xml": hash_sim
+                    "hash_sha256_xml": hash_sim,
+                    "regra_tributaria_version": VERSAO_REGRA_TRIBUTARIA,
+                    "data_emissao": datetime.now().isoformat(),
                 }
 
-                ok_nf, _, data_nf = inserir_seguro_supabase(supabase, "notas_fiscais_recebidas", payload_nf_sim)
+                ok_nf, msg_nf, data_nf = inserir_seguro_supabase(supabase, "notas_fiscais_recebidas", payload_nf_sim)
                 if ok_nf and data_nf:
                     n_id = data_nf[0]["id"]
                 else:
@@ -544,6 +646,8 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                     status_it, aliq, cred = classificar_item_inteligente(
                         ncm, cfop, qcom, vprod, "3", cnaes_str, False
                     )
+                    if status_it == "Quarentena Uso/Consumo":
+                        aliq = ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
                     novos_itens.append({
                         "nota_id": n_id,
                         "descricao": desc,
@@ -564,6 +668,8 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 if ok_nf or ok_it:
                     st.cache_data.clear()
                 st.success("✅ Lote SEFAZ sincronizado e classificado com sucesso!")
+                if msg_nf != "OK":
+                    st.session_state[f"aviso_regra_{empresa_id_ativo}"] = msg_nf
                 st.rerun()
 
         with c_up:
@@ -573,26 +679,34 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 value=True,
                 key=f"chk_ignorar_cnpj_{empresa_id_ativo}"
             )
+            uploader_reset_key = f"uploader_reset_id_{empresa_id_ativo}"
+            uploader_reset_id = int(st.session_state.get(uploader_reset_key, 0) or 0)
             arquivos_xml = st.file_uploader(
                 "Selecione um ou mais arquivos .XML de NF-e",
                 type=["xml"],
                 accept_multiple_files=True,
-                key=f"uploader_xml_{empresa_id_ativo}"
+                key=f"uploader_xml_{empresa_id_ativo}_{uploader_reset_id}"
             )
             if arquivos_xml:
                 if st.button("⚡ Auditar e Importar XMLs Selecionados", use_container_width=True, key=f"btn_proc_xml_{empresa_id_ativo}"):
                     sucessos = 0
+                    feedback_processamento = []
                     for arq in arquivos_xml:
                         ok, msg = processar_xml_bytes(
                             arq.read(), supabase, empresa_id_ativo, empresa_ativa, ignorar_trava_cnpj=ignorar_cnpj
                         )
                         if ok:
                             sucessos += 1
-                            st.toast(f"✅ {arq.name}: {msg}")
+                            feedback_processamento.append(("success", f"✅ {arq.name}: {msg}"))
+                            if "A rastreabilidade não está completa" in msg:
+                                st.session_state[f"aviso_regra_{empresa_id_ativo}"] = msg
                         else:
-                            st.warning(f"⚠️ {arq.name}: {msg}")
-                    if sucessos > 0:
-                        st.rerun()
+                            feedback_processamento.append(("warning", f"⚠️ {arq.name}: {msg}"))
+                    st.session_state[uploader_reset_key] = uploader_reset_id + 1
+                    st.session_state[upload_feedback_key] = feedback_processamento
+                    if sucessos:
+                        st.cache_data.clear()
+                    st.rerun()
 
 
 # ==========================================

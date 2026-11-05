@@ -1,6 +1,9 @@
-import streamlit as st
-import pandas as pd
 from datetime import datetime, date
+
+import pandas as pd
+import streamlit as st
+
+import xml_engine
 
 
 def injetar_css_blindado_relatorio():
@@ -76,7 +79,10 @@ def montar_dataframe_relacional(notas: list, itens: list) -> pd.DataFrame:
             "valor_total_nf": float(n.get("valor_total_nf", 0.0)),
             "manifestacao_status": str(n.get("manifestacao_status", "")),
             "hash_sha256_xml": str(n.get("hash_sha256_xml", "")),
-            "created_at": n.get("created_at", str(date.today()))
+            "data_referencia": n.get("data_emissao") or n.get(
+                "created_at",
+                str(date.today()),
+            )
         }
         for idx, n in enumerate(notas)
     }
@@ -91,9 +97,13 @@ def montar_dataframe_relacional(notas: list, itens: list) -> pd.DataFrame:
         valor_contabil = float(item.get("valor_item", 0.0))
         classificacao = str(item.get("classificacao_item", "Não Classificado"))
         credito_aprovado = float(item.get("valor_credito_item", 0.0))
-        credito_quarentena = round(valor_contabil * 0.265, 2) if classificacao == "Quarentena Uso/Consumo" else 0.0
+        credito_quarentena = (
+            xml_engine.obter_credito_quarentena(item)
+            if classificacao == "Quarentena Uso/Consumo"
+            else 0.0
+        )
 
-        raw_date = nota_info.get("created_at", str(date.today()))
+        raw_date = nota_info.get("data_referencia", str(date.today()))
         try:
             data_parsed = pd.to_datetime(raw_date).date()
         except Exception:
@@ -118,7 +128,7 @@ def montar_dataframe_relacional(notas: list, itens: list) -> pd.DataFrame:
     for n_id, n_info in mapa_notas.items():
         if n_id not in notas_com_itens:
             vl_nf = n_info["valor_total_nf"]
-            raw_date = n_info.get("created_at", str(date.today()))
+            raw_date = n_info.get("data_referencia", str(date.today()))
             try:
                 data_parsed = pd.to_datetime(raw_date).date()
             except Exception:
@@ -308,7 +318,13 @@ def renderizar_modulo_relatorio(
 
         df_completo = montar_dataframe_relacional(notas, itens)
 
-        status_padrao = ["Aprovado Revenda", "Quarentena Uso/Consumo", "Aprovado Manualmente Contador", "Rejeitado pelo Contador"]
+        status_padrao = [
+            "Aprovado Revenda",
+            "Quarentena Uso/Consumo",
+            "Aprovado Manualmente Contador",
+            "Rejeitado",
+            "Rejeitado pelo Contador",
+        ]
         if not df_completo.empty:
             status_presentes = sorted(df_completo["Status Auditoria"].dropna().unique().tolist())
             status_disponiveis = list(dict.fromkeys(status_padrao + status_presentes))
