@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import random
 import re
 from datetime import datetime
@@ -121,12 +122,29 @@ def inserir_seguro_supabase(supabase, tabela: str, payload) -> tuple[bool, str, 
     """
     dados_atuais = [dict(x) for x in payload] if isinstance(payload, list) else dict(payload)
 
+    registros = dados_atuais if isinstance(dados_atuais, list) else [dados_atuais]
+    if tabela == "notas_fiscais_recebidas" and any(
+        registro.get("empresa_id") is None
+        or str(registro.get("empresa_id")).strip() == ""
+        for registro in registros
+    ):
+        return False, "Inserção cancelada: toda nota deve conter empresa_id.", []
+    if tabela == "itens_nota_fiscal" and any(
+        registro.get("empresa_id") is None
+        or str(registro.get("empresa_id")).strip() == ""
+        or registro.get("nota_id") is None
+        or str(registro.get("nota_id")).strip() == ""
+        for registro in registros
+    ):
+        return False, (
+            "Inserção cancelada: todo item deve conter empresa_id e nota_id."
+        ), []
+
     colunas_opcionais_ordem = [
         "hash_sha256_xml",
         "manifestacao_status",
         "aliquota_aplicada",
         "certificado_a1_status",
-        "empresa_id",
         "regra_tributaria_version",
         "data_emissao"
     ]
@@ -134,7 +152,7 @@ def inserir_seguro_supabase(supabase, tabela: str, payload) -> tuple[bool, str, 
 
     for _ in range(len(colunas_opcionais_ordem) + 2):
         try:
-            res = supabase.table(tabela).insert(dados_atuais).execute()
+            res = supabase.table(tabela).insert(dados_atuais).select("*").execute()
             mensagem = "OK"
             colunas_rastreabilidade_ausentes = colunas_removidas.intersection({
                 "regra_tributaria_version",
@@ -176,6 +194,14 @@ def inserir_seguro_supabase(supabase, tabela: str, payload) -> tuple[bool, str, 
                     dados_atuais = [{k: v for k, v in item.items() if k != col_remover} for item in dados_atuais]
                 else:
                     dados_atuais = {k: v for k, v in dados_atuais.items() if k != col_remover}
+            elif erro_coluna_ausente and "empresa_id" in msg_erro and tabela in {
+                "notas_fiscais_recebidas",
+                "itens_nota_fiscal",
+            }:
+                return False, (
+                    f"A tabela {tabela} precisa da coluna obrigatória empresa_id "
+                    "para persistir dados isolados por cliente. Atualize o schema do Supabase."
+                ), []
             else:
                 return False, err_str, []
 
@@ -421,6 +447,15 @@ def processar_xml_bytes(
     empresa_ativa: dict,
     ignorar_trava_cnpj: bool = False
 ) -> tuple[bool, str]:
+    if empresa_id_ativo is None or str(empresa_id_ativo).strip() == "":
+        return False, "Importação cancelada: a empresa ativa não possui um ID válido."
+    if str(empresa_ativa.get("id")) != str(empresa_id_ativo):
+        return False, "Importação cancelada: o ID da empresa ativa não corresponde ao cadastro selecionado."
+
+    cnpj_empresa_ativa = "".join(filter(str.isdigit, str(empresa_ativa.get("cnpj", ""))))
+    if not cnpj_empresa_ativa:
+        return False, "Importação cancelada: a empresa ativa não possui CNPJ cadastrado."
+
     hash_sha256 = hashlib.sha256(xml_bytes).hexdigest()
 
     try:
@@ -471,7 +506,7 @@ def processar_xml_bytes(
 
     cnpj_emit = "".join(filter(str.isdigit, str(emit.get("CNPJ", emit.get("CPF", "00000000000191")))))
     cnpj_dest = "".join(filter(str.isdigit, str(dest.get("CNPJ", dest.get("CPF", "")))))
-    cnpj_cliente_ativo = "".join(filter(str.isdigit, str(empresa_ativa.get("cnpj", ""))))
+    cnpj_cliente_ativo = cnpj_empresa_ativa
 
     if not ignorar_trava_cnpj and cnpj_dest and cnpj_cliente_ativo and cnpj_dest != cnpj_cliente_ativo:
         return (
@@ -503,12 +538,14 @@ def processar_xml_bytes(
     }
 
     ok_nf, msg_nf, data_nf = inserir_seguro_supabase(supabase, "notas_fiscais_recebidas", payload_nf)
-    if ok_nf and data_nf:
-        nota_id = data_nf[0]["id"]
-    else:
-        nota_id = random.randint(100000, 999999)
-        payload_nf["id"] = nota_id
-        st.session_state.setdefault(f"fallback_notas_{empresa_id_ativo}", []).append(payload_nf)
+    if not ok_nf:
+        return False, f"Falha ao persistir a NF-e no Supabase: {msg_nf}"
+    if not data_nf or data_nf[0].get("id") is None:
+        return False, (
+            "NF-e não confirmada: o Supabase não retornou o ID da nota inserida. "
+            "Verifique permissões de leitura da tabela."
+        )
+    nota_id = data_nf[0]["id"]
 
     dets = inf_nfe.get("det", [])
     if isinstance(dets, dict):
@@ -544,6 +581,7 @@ def processar_xml_bytes(
             aliq = ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
 
         itens_para_inserir.append({
+            "empresa_id": empresa_id_ativo,
             "nota_id": nota_id,
             "descricao": xprod,
             "ncm": ncm,
@@ -554,17 +592,24 @@ def processar_xml_bytes(
             "classificacao_item": classificacao
         })
 
-    dados_persistidos = ok_nf
     if itens_para_inserir:
-        ok_it, _, _ = inserir_seguro_supabase(supabase, "itens_nota_fiscal", itens_para_inserir)
-        dados_persistidos = dados_persistidos or ok_it
+        ok_it, msg_it, _ = inserir_seguro_supabase(supabase, "itens_nota_fiscal", itens_para_inserir)
         if not ok_it:
-            for idx_it, it_mem in enumerate(itens_para_inserir):
-                it_mem["id"] = random.randint(100000, 999999) + idx_it
-            st.session_state.setdefault(f"fallback_itens_{empresa_id_ativo}", []).extend(itens_para_inserir)
+            try:
+                supabase.table("notas_fiscais_recebidas").delete().eq(
+                    "id", nota_id
+                ).eq("empresa_id", empresa_id_ativo).execute()
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Falha ao remover NF-e %s após falha ao persistir seus itens.",
+                    nota_id,
+                )
+            return False, (
+                f"Falha ao persistir os itens da NF-e no Supabase: {msg_it}. "
+                "A nota foi removida para evitar um registro parcial."
+            )
 
-    if dados_persistidos:
-        st.cache_data.clear()
+    st.cache_data.clear()
     mensagem_final = (
         f"NF-e {chave_raw[:10]}... auditada com sucesso "
         f"({len(itens_para_inserir)} itens processados)."
@@ -598,6 +643,14 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 f"(CNAEs: `{empresa_ativa.get('cnae_principal', '4711302')}`)."
             )
             if st.button("🔄 Sincronizar Lote de Teste SEFAZ", use_container_width=True, key=f"btn_sync_sefaz_{empresa_id_ativo}"):
+                if (
+                    empresa_id_ativo is None
+                    or str(empresa_ativa.get("id")) != str(empresa_id_ativo)
+                    or not "".join(filter(str.isdigit, str(empresa_ativa.get("cnpj", ""))))
+                ):
+                    st.error("Sincronização cancelada: vínculo da empresa ativa inválido ou sem CNPJ.")
+                    st.stop()
+
                 cnaes_str = str(empresa_ativa.get("cnae_principal", "4711302"))
                 is_beleza = any(c.strip().startswith(("9602", "4772")) for c in cnaes_str.split(","))
 
@@ -634,12 +687,15 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 }
 
                 ok_nf, msg_nf, data_nf = inserir_seguro_supabase(supabase, "notas_fiscais_recebidas", payload_nf_sim)
-                if ok_nf and data_nf:
-                    n_id = data_nf[0]["id"]
-                else:
-                    n_id = random.randint(100000, 999999)
-                    payload_nf_sim["id"] = n_id
-                    st.session_state.setdefault(f"fallback_notas_{empresa_id_ativo}", []).append(payload_nf_sim)
+                if not ok_nf:
+                    st.error(f"Falha ao persistir a NF-e simulada no Supabase: {msg_nf}")
+                    st.stop()
+                if not data_nf or data_nf[0].get("id") is None:
+                    st.error(
+                        "NF-e simulada não confirmada: o Supabase não retornou o ID da nota."
+                    )
+                    st.stop()
+                n_id = data_nf[0]["id"]
 
                 novos_itens = []
                 for desc, ncm, cfop, qcom, vprod in itens_sim:
@@ -649,6 +705,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                     if status_it == "Quarentena Uso/Consumo":
                         aliq = ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
                     novos_itens.append({
+                        "empresa_id": empresa_id_ativo,
                         "nota_id": n_id,
                         "descricao": desc,
                         "ncm": ncm,
@@ -659,14 +716,24 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                         "classificacao_item": status_it
                     })
 
-                ok_it, _, _ = inserir_seguro_supabase(supabase, "itens_nota_fiscal", novos_itens)
+                ok_it, msg_it, _ = inserir_seguro_supabase(supabase, "itens_nota_fiscal", novos_itens)
                 if not ok_it:
-                    for idx_i, it_m in enumerate(novos_itens):
-                        it_m["id"] = random.randint(100000, 999999) + idx_i
-                    st.session_state.setdefault(f"fallback_itens_{empresa_id_ativo}", []).extend(novos_itens)
+                    try:
+                        supabase.table("notas_fiscais_recebidas").delete().eq(
+                            "id", n_id
+                        ).eq("empresa_id", empresa_id_ativo).execute()
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "Falha ao remover nota simulada %s após falha ao persistir os itens.",
+                            n_id,
+                        )
+                    st.error(
+                        f"Falha ao persistir itens simulados no Supabase: {msg_it}. "
+                        "A nota foi removida para evitar um registro parcial."
+                    )
+                    st.stop()
 
-                if ok_nf or ok_it:
-                    st.cache_data.clear()
+                st.cache_data.clear()
                 st.success("✅ Lote SEFAZ sincronizado e classificado com sucesso!")
                 if msg_nf != "OK":
                     st.session_state[f"aviso_regra_{empresa_id_ativo}"] = msg_nf

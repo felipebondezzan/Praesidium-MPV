@@ -1156,6 +1156,22 @@ if aviso_persistencia_conta:
 # ==========================================
 # 4. FUNÇÕES DE LEITURA EM CACHE (VELOCIDADE NA NUVEM)
 # ==========================================
+def consultar_todas_paginas(criar_consulta, tamanho_pagina: int = 1000) -> list:
+    registros = []
+    inicio = 0
+    while True:
+        resposta = (
+            criar_consulta()
+            .range(inicio, inicio + tamanho_pagina - 1)
+            .execute()
+        )
+        pagina = resposta.data or []
+        registros.extend(pagina)
+        if len(pagina) < tamanho_pagina:
+            return registros
+        inicio += tamanho_pagina
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def carregar_todas_empresas_db():
     if supabase is None:
@@ -1189,66 +1205,90 @@ def carregar_todas_empresas_db():
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def carregar_dados_empresa_db(emp_id: int, emp_cnpj: str):
+def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
     if supabase is None:
         return [], [], [], []
 
-    notas_lista = []
-    devs_lista = []
-    itens_lista = []
-
     try:
-        n_res = supabase.table("notas_fiscais_recebidas").select("*").eq("empresa_id", emp_id).execute()
-        notas_lista = n_res.data if n_res.data else []
+        notas_lista = consultar_todas_paginas(
+            lambda: (
+                supabase.table("notas_fiscais_recebidas")
+                .select("*")
+                .eq("empresa_id", emp_id)
+            )
+        )
     except Exception:
         logging.getLogger(__name__).exception(
             "Falha ao carregar notas fiscais da empresa %s.",
             emp_id,
         )
+        raise RuntimeError(
+            f"Não foi possível carregar as notas fiscais da empresa {emp_id}."
+        ) from None
 
     devolucoes_por_id = {}
     try:
-        d_res = (
-            supabase.table("conciliacao_devolucoes")
-            .select("*")
-            .eq("empresa_id", emp_id)
-            .execute()
+        devolucoes_empresa = consultar_todas_paginas(
+            lambda: (
+                supabase.table("conciliacao_devolucoes")
+                .select("*")
+                .eq("empresa_id", emp_id)
+            )
         )
-        for devolucao in d_res.data or []:
+        for devolucao in devolucoes_empresa:
             devolucoes_por_id[str(devolucao.get("id"))] = devolucao
     except Exception:
         logging.getLogger(__name__).exception(
             "Falha ao carregar devoluções por empresa para %s.",
             emp_id,
         )
+        raise RuntimeError(
+            f"Não foi possível carregar as devoluções da empresa {emp_id}."
+        ) from None
 
     if emp_cnpj:
         try:
-            d_res_legadas = (
-                supabase.table("conciliacao_devolucoes")
-                .select("*")
-                .like("motivo_ajuste", f"%[{emp_cnpj}]%")
-                .execute()
+            devolucoes_legadas = consultar_todas_paginas(
+                lambda: (
+                    supabase.table("conciliacao_devolucoes")
+                    .select("*")
+                    .like("motivo_ajuste", f"%[{emp_cnpj}]%")
+                )
             )
-            for devolucao in d_res_legadas.data or []:
+            for devolucao in devolucoes_legadas:
                 devolucoes_por_id[str(devolucao.get("id"))] = devolucao
         except Exception:
             logging.getLogger(__name__).exception(
                 "Falha ao carregar devoluções legadas por CNPJ para %s.",
                 emp_cnpj,
             )
+            raise RuntimeError(
+                f"Não foi possível carregar devoluções legadas do CNPJ {emp_cnpj}."
+            ) from None
     devs_lista = list(devolucoes_por_id.values())
 
     n_ids = [n["id"] for n in notas_lista if "id" in n]
-    if n_ids:
-        try:
-            i_res = supabase.table("itens_nota_fiscal").select("*").in_("nota_id", n_ids).execute()
-            itens_lista = i_res.data if i_res.data else []
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "Falha ao carregar itens das notas da empresa %s.",
-                emp_id,
+    itens_lista = []
+    try:
+        for inicio in range(0, len(n_ids), 100):
+            ids_lote = n_ids[inicio:inicio + 100]
+            itens_lista.extend(
+                consultar_todas_paginas(
+                    lambda ids_lote=ids_lote: (
+                        supabase.table("itens_nota_fiscal")
+                        .select("*")
+                        .in_("nota_id", ids_lote)
+                    )
+                )
             )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao carregar itens das notas da empresa %s.",
+            emp_id,
+        )
+        raise RuntimeError(
+            f"Não foi possível carregar os itens das notas da empresa {emp_id}."
+        ) from None
 
     return notas_lista, devs_lista, itens_lista, []
 
