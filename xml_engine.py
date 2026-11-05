@@ -155,10 +155,9 @@ def classificar_item_inteligente(
     if cfop_limpo in {"1556", "2556", "5556", "6556", "1551", "2551", "5551", "6551"}:
         return "Quarentena Uso/Consumo", 0.0, 0.0
 
-    cnaes_sem_tag = str(cnaes_cliente_str).split("|TENANT:")[0]
     lista_cnaes = [
         "".join(filter(str.isdigit, c))
-        for c in cnaes_sem_tag.split(",")
+        for c in str(cnaes_cliente_str).split(",")
         if "".join(filter(str.isdigit, c))
     ]
     if not lista_cnaes:
@@ -493,7 +492,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 f"(CNAEs: `{empresa_ativa.get('cnae_principal', '4711302')}`)."
             )
             if st.button("🔄 Sincronizar Lote de Teste SEFAZ", use_container_width=True, key=f"btn_sync_sefaz_{empresa_id_ativo}"):
-                cnaes_str = str(empresa_ativa.get("cnae_principal", "4711302")).split("|TENANT:")[0]
+                cnaes_str = str(empresa_ativa.get("cnae_principal", "4711302"))
                 is_beleza = any(c.strip().startswith(("9602", "4772")) for c in cnaes_str.split(","))
 
                 if is_beleza:

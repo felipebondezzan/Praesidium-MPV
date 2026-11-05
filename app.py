@@ -1,8 +1,13 @@
 import io
+import hmac
+import json
+import os
+import re
 import zipfile
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 import requests
 import streamlit as st
 import pandas as pd
@@ -365,9 +370,70 @@ if erro_conexao_supabase:
     st.warning(erro_conexao_supabase)
 
 
-def normalizar_tenant(identificacao: str) -> str:
-    limpo = "".join(c for c in str(identificacao).strip().lower() if c.isalnum() or c in ("_", "-"))
-    return limpo if limpo else "visitante_padrao"
+def hash_senha(senha: str) -> str:
+    return hashlib.sha256(senha.encode("utf-8")).hexdigest()
+
+
+CAMINHO_REGISTRO_AUTH = Path(__file__).with_name("auth_state.json")
+
+
+def salvar_registro_global(registro: dict) -> None:
+    dados = {
+        "users": registro["users"],
+        "access_logs": registro["access_logs"],
+    }
+    temporario = CAMINHO_REGISTRO_AUTH.with_name(
+        f"{CAMINHO_REGISTRO_AUTH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    temporario.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporario, CAMINHO_REGISTRO_AUTH)
+
+
+@st.cache_resource
+def obter_registro_global() -> dict:
+    usuarios_padrao = {
+        "admin": {
+            "password_hash": hash_senha("admin2026"),
+            "role": "admin",
+            "name": "Felipe (Admin)",
+        },
+        "guilherme": {
+            "password_hash": hash_senha("guilherme2026"),
+            "role": "contador",
+            "name": "Guilherme",
+        },
+    }
+    logs_acesso = []
+    usuarios = dict(usuarios_padrao)
+    if CAMINHO_REGISTRO_AUTH.exists():
+        dados_salvos = json.loads(CAMINHO_REGISTRO_AUTH.read_text(encoding="utf-8"))
+        usuarios_salvos = dados_salvos.get("users", {})
+        logs_salvos = dados_salvos.get("access_logs", [])
+        if not isinstance(usuarios_salvos, dict) or not isinstance(logs_salvos, list):
+            raise ValueError("O arquivo local de autenticação possui estrutura inválida.")
+        usuarios.update(usuarios_salvos)
+        logs_acesso = logs_salvos
+
+    registro = {
+        "users": usuarios,
+        "access_logs": logs_acesso,
+        "lock": threading.RLock(),
+    }
+    if not CAMINHO_REGISTRO_AUTH.exists():
+        with registro["lock"]:
+            salvar_registro_global(registro)
+    return registro
+
+
+registro_global = obter_registro_global()
+
+
+def atualizar_espelho_sessao() -> None:
+    with registro_global["lock"]:
+        st.session_state["registro_auth_espelho"] = {
+            "users": {usuario: dict(dados) for usuario, dados in registro_global["users"].items()},
+            "access_logs": [dict(log) for log in registro_global["access_logs"]],
+        }
 
 
 def horario_brasilia_str() -> str:
@@ -375,46 +441,55 @@ def horario_brasilia_str() -> str:
     return datetime.now(fuso_br).strftime("%d/%m/%Y %H:%M:%S")
 
 
-def registrar_aviso_login(usuario_nome: str, tenant_id: str, is_admin: bool):
+def enviar_alerta_acesso(log_acesso: dict) -> None:
     dh_br = horario_brasilia_str()
-    tipo_str = "ADMIN" if is_admin else "CONTADOR"
-    # 1. Grava o log de forma persistente no Supabase (usando registro oculto compatível com a estrutura existente)
-    try:
-        xml_engine.inserir_seguro_supabase(supabase, "conciliacao_devolucoes", {
-            "chave_nota_devolucao": f"LOG_{datetime.now().strftime('%Y%m%d%H%M%S')}",
-            "valor_mercadoria_devolvida": 0.0,
-            "credito_estornado": 0.0,
-            "motivo_ajuste": f"[LOG_ACESSO] {dh_br} | Usuário: {usuario_nome.upper()} | Ambiente: {tenant_id} ({tipo_str})"
-        })
-    except Exception:
-        pass
-
-    # 2. Dispara notificação instantânea gratuita (ntfy.sh/praesidium_felipe_alertas)
     try:
         requests.post(
             "https://ntfy.sh/praesidium_felipe_alertas",
-            data=f"Novo acesso no Praesidium: {usuario_nome} ({tipo_str}) em {dh_br}".encode("utf-8"),
+            data=(
+                f"Acesso Praesidium: {log_acesso['status']} | Usuário: "
+                f"{log_acesso['username']} ({log_acesso['name']}) em {dh_br}"
+            ).encode("utf-8"),
             headers={"Title": "Acesso Praesidium Detectado", "Priority": "high", "Tags": "shield,unlock"},
             timeout=2
-        )
+        ).raise_for_status()
     except Exception:
-        pass
+        logging.getLogger(__name__).exception("Falha ao enviar alerta de acesso ao ntfy.sh.")
+
+
+def registrar_acesso(username: str, nome: str, status: str) -> None:
+    log_acesso = {
+        "datetime": horario_brasilia_str(),
+        "username": username,
+        "name": nome,
+        "status": status,
+    }
+    with registro_global["lock"]:
+        registro_global["access_logs"].append(log_acesso)
+        try:
+            salvar_registro_global(registro_global)
+        except Exception:
+            registro_global["access_logs"].pop()
+            raise
+    atualizar_espelho_sessao()
+    threading.Thread(target=enviar_alerta_acesso, args=(log_acesso,), daemon=True).start()
 
 
 # ==========================================
 # 3. TRAVA DE SEGURANÇA MULTI-TENANT (AMBIENTE ISOLADO POR CONTADOR)
 # ==========================================
-SENHA_MESTRE = "praesidium2026"
-SENHA_ADMIN = "admin2026"
-
 if "autenticado" not in st.session_state:
     st.session_state["autenticado"] = False
-if "tenant_id" not in st.session_state:
-    st.session_state["tenant_id"] = ""
-if "usuario_nome" not in st.session_state:
-    st.session_state["usuario_nome"] = ""
-if "is_admin" not in st.session_state:
-    st.session_state["is_admin"] = False
+atualizar_espelho_sessao()
+
+usuario_autenticado = st.session_state.get("auth_username", "")
+dados_usuario = registro_global["users"].get(usuario_autenticado)
+if (
+    not st.session_state["autenticado"]
+    or not isinstance(dados_usuario, dict)
+    or dados_usuario.get("role") not in {"admin", "contador"}
+):
+    st.session_state["autenticado"] = False
 
 if not st.session_state["autenticado"]:
     st.markdown("""
@@ -428,38 +503,71 @@ if not st.session_state["autenticado"]:
 
     col_esq, col_centro, col_dir = st.columns([1, 1.3, 1])
     with col_centro:
-        with st.form("form_login_mvp", border=False):
-            identificacao_input = st.text_input(
-                "Seu Nome ou Escritório Contábil:",
-                placeholder="Ex: João Contabilidade (Cria seu painel isolado)"
-            )
-            senha_input = st.text_input(
-                "Credencial de Acesso:",
-                type="password",
-                placeholder="Digite a senha autorizada..."
-            )
-            btn_entrar = st.form_submit_button("🔓 Desbloquear Painel Exclusivo", use_container_width=True)
+        aba_entrar, aba_cadastro = st.tabs(["Entrar", "Primeiro Acesso (Criar Conta)"])
+        with aba_entrar:
+            with st.form("form_login_mvp", border=False):
+                identificacao_input = st.text_input("Usuário")
+                senha_input = st.text_input("Senha", type="password")
+                btn_entrar = st.form_submit_button("Entrar", use_container_width=True)
             if btn_entrar:
-                nome_limpo = identificacao_input.strip() if identificacao_input.strip() else "Contador Visitante"
-                senha_limpa = senha_input.strip()
-
-                if senha_limpa in [SENHA_MESTRE, SENHA_ADMIN]:
-                    eh_admin = senha_limpa == SENHA_ADMIN
-                    t_id = "admin" if eh_admin else normalizar_tenant(nome_limpo)
-
+                username = identificacao_input.strip().lower()
+                usuario = registro_global["users"].get(username)
+                senha_correta = (
+                    isinstance(usuario, dict)
+                    and hmac.compare_digest(
+                        str(usuario.get("password_hash", "")),
+                        hash_senha(senha_input),
+                    )
+                )
+                if senha_correta:
+                    nome_usuario = str(usuario.get("name", username))
+                    registrar_acesso(username, nome_usuario, "Sucesso")
                     st.session_state["autenticado"] = True
-                    st.session_state["usuario_nome"] = nome_limpo
-                    st.session_state["tenant_id"] = t_id
-                    st.session_state["is_admin"] = eh_admin
-
-                    threading.Thread(
-                        target=registrar_aviso_login,
-                        args=(nome_limpo, t_id, eh_admin),
-                        daemon=True
-                    ).start()
+                    st.session_state["auth_username"] = username
+                    st.session_state["tenant_id"] = username
+                    st.session_state["usuario_nome"] = nome_usuario
+                    st.session_state["is_admin"] = usuario.get("role") == "admin"
                     st.rerun()
                 else:
-                    st.error("❌ Senha incorreta. Solicite a credencial atualizada.")
+                    nome_tentativa = (
+                        str(usuario.get("name", "Não identificado"))
+                        if isinstance(usuario, dict)
+                        else "Não identificado"
+                    )
+                    registrar_acesso(username, nome_tentativa, "Falha de Login")
+                    st.error("Usuário ou senha incorretos. Verifique a grafia.")
+        with aba_cadastro:
+            with st.form("form_primeiro_acesso", border=False):
+                novo_usuario_input = st.text_input("Usuário")
+                novo_nome_usuario = st.text_input("Nome")
+                nova_senha = st.text_input("Senha", type="password")
+                codigo_convite = st.text_input("Código de Convite", type="password")
+                btn_criar_conta = st.form_submit_button("Criar Conta", use_container_width=True)
+            if btn_criar_conta:
+                novo_usuario = novo_usuario_input.strip().lower()
+                if codigo_convite.strip() != "PRAESIDIUM2026":
+                    st.error("Código de convite inválido.")
+                elif not re.fullmatch(r"[a-z0-9_.-]+", novo_usuario):
+                    st.error("O usuário deve conter apenas letras, números, ponto, hífen ou sublinhado.")
+                elif not novo_nome_usuario.strip() or not nova_senha:
+                    st.error("Informe usuário, nome e senha.")
+                else:
+                    with registro_global["lock"]:
+                        if novo_usuario in registro_global["users"]:
+                            st.error("Este usuário já está cadastrado.")
+                        else:
+                            registro_global["users"][novo_usuario] = {
+                                "password_hash": hash_senha(nova_senha),
+                                "role": "contador",
+                                "name": novo_nome_usuario.strip(),
+                            }
+                            try:
+                                salvar_registro_global(registro_global)
+                            except Exception:
+                                del registro_global["users"][novo_usuario]
+                                raise
+                            atualizar_espelho_sessao()
+                            st.success("Conta criada. Use seu usuário e senha na aba Entrar.")
     st.stop()
 
 
@@ -511,27 +619,26 @@ def carregar_dados_empresa_db(emp_id: int, emp_cnpj: str):
     return notas_lista, devs_lista, itens_lista, logs_lista
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def carregar_logs_acesso_db():
-    try:
-        res_logs = supabase.table("conciliacao_devolucoes").select("motivo_ajuste").execute()
-        return [
-            str(r.get("motivo_ajuste", "")).replace("[LOG_ACESSO] ", "")
-            for r in (res_logs.data or [])
-            if str(r.get("motivo_ajuste", "")).startswith("[LOG_ACESSO]")
-        ]
-    except Exception:
-        return []
+TAG_TENANT_RE = re.compile(r"\s*\[T:([^\]]+)\]", re.IGNORECASE)
+
+
+def limpar_tag_tenant(nome_empresa: str) -> str:
+    return TAG_TENANT_RE.sub("", str(nome_empresa)).strip()
 
 
 def extrair_tenant_empresa(emp: dict) -> str:
+    razao_social = str(emp.get("razao_social", ""))
+    tag_nome = TAG_TENANT_RE.search(razao_social)
+    if tag_nome:
+        return tag_nome.group(1).strip().lower()
+
     status_a1 = str(emp.get("certificado_a1_status", ""))
     if "TENANT:" in status_a1:
-        return status_a1.split("TENANT:", 1)[1].split("|", 1)[0].strip()
+        return status_a1.split("TENANT:", 1)[1].split("|", 1)[0].strip().lower()
     cnae_raw = str(emp.get("cnae_principal", ""))
     if "|TENANT:" in cnae_raw:
-        return cnae_raw.split("|TENANT:", 1)[1].split("|", 1)[0].strip()
-    return "admin"
+        return cnae_raw.split("|TENANT:", 1)[1].split("|", 1)[0].strip().lower()
+    return ""
 
 
 def extrair_cnae_limpo_empresa(emp: dict) -> str:
@@ -548,8 +655,11 @@ def extrair_cnae_limpo_empresa(emp: dict) -> str:
 # ==========================================
 # 5. GESTÃO MULTI-EMPRESA E RADAR ADMIN (SIDEBAR)
 # ==========================================
-tenant_atual = st.session_state["tenant_id"]
-is_admin = st.session_state["is_admin"]
+tenant_atual = usuario_autenticado
+is_admin = dados_usuario["role"] == "admin"
+st.session_state["tenant_id"] = tenant_atual
+st.session_state["usuario_nome"] = str(dados_usuario.get("name", usuario_autenticado))
+st.session_state["is_admin"] = is_admin
 
 st.sidebar.markdown(f"""
 <div style="display:flex; align-items:center; gap:10px; margin-bottom:4px;">
@@ -567,29 +677,52 @@ todas_empresas_brutas = carregar_todas_empresas_db()
 # SE FOR VOCÊ (ADMIN): Mostra o Radar de Acessos e permite espionar/filtrar qualquer contador
 if is_admin:
     with st.sidebar.expander("🔔 Radar de Acessos (Admin)", expanded=False):
-        logs_acesso = carregar_logs_acesso_db()
+        if st.button("Atualizar Acessos", use_container_width=True, key="btn_atualizar_acessos"):
+            atualizar_espelho_sessao()
 
+        with registro_global["lock"]:
+            logs_acesso = [dict(log) for log in registro_global["access_logs"]]
         if logs_acesso:
-            st.caption(f"Últimos acessos registrados ({len(logs_acesso)}):")
-            for lg in reversed(logs_acesso[-10:]):
-                st.markdown(f"<div style='font-size:11px; padding:4px 0; border-bottom:1px solid #374151;'>🟢 {lg}</div>", unsafe_allow_html=True)
+            st.caption(f"Lista global de acessos ({len(logs_acesso)}):")
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Data/Hora": log["datetime"],
+                        "Usuário": log["username"],
+                        "Nome": log["name"],
+                        "Status": log["status"],
+                    }
+                    for log in reversed(logs_acesso)
+                ]),
+                hide_index=True,
+                use_container_width=True,
+            )
         else:
-            st.caption("Nenhum acesso de contador registrado ainda.")
+            st.caption("Nenhum acesso registrado ainda.")
 
         st.caption("📱 Alerta no celular ativo no canal ntfy.sh: `praesidium_felipe_alertas`")
 
-    tenants_disponiveis = sorted(list({extrair_tenant_empresa(e) for e in todas_empresas_brutas} | {"admin"}))
+    tenants_disponiveis = sorted({
+        extrair_tenant_empresa(e)
+        for e in todas_empresas_brutas
+        if extrair_tenant_empresa(e)
+    })
     filtro_tenant_admin = st.sidebar.selectbox(
         "👁️ Visão do Administrador (Ambiente):",
-        ["TODOS OS AMBIENTES"] + tenants_disponiveis
+        ["TODOS OS AMBIENTES"] + tenants_disponiveis + ["SEM TAG (LEGADO)"]
     )
     if filtro_tenant_admin == "TODOS OS AMBIENTES":
         lista_empresas = todas_empresas_brutas
+    elif filtro_tenant_admin == "SEM TAG (LEGADO)":
+        lista_empresas = [e for e in todas_empresas_brutas if not extrair_tenant_empresa(e)]
     else:
         lista_empresas = [e for e in todas_empresas_brutas if extrair_tenant_empresa(e) == filtro_tenant_admin]
 else:
-    # ISOLAMENTO TOTAL DO CONTADOR: Ele só enxerga as empresas que pertencem ao tenant_id dele!
-    lista_empresas = [e for e in todas_empresas_brutas if extrair_tenant_empresa(e) == tenant_atual]
+    lista_empresas = [
+        e for e in todas_empresas_brutas
+        if extrair_tenant_empresa(e) == tenant_atual
+        or (tenant_atual == "guilherme" and not extrair_tenant_empresa(e))
+    ]
 
 with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
     novo_nome = st.text_input("Razão Social", key="cad_nome")
@@ -635,11 +768,11 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                 )
             else:
                 cnaes_secundarios = ",".join(todos_cnaes_unicos[1:])
-                status_certificado = f"Ativo|TENANT:{tenant_atual}"
+                status_certificado = "Ativo"
                 if cnaes_secundarios:
                     status_certificado += f"|CNAES:{cnaes_secundarios}"
                 payload_emp = {
-                    "razao_social": novo_nome.strip().upper(),
+                    "razao_social": f"{limpar_tag_tenant(novo_nome).upper()} [T:{tenant_atual}]",
                     "cnpj": cnpj_limpo,
                     "regime_tributario": novo_regime,
                     "cnae_principal": todos_cnaes_unicos[0],
@@ -674,13 +807,32 @@ if not lista_empresas:
         st.rerun()
     st.stop()
 
-opcoes_empresas = {f"{e['razao_social']} ({e['cnpj']})": e["id"] for e in lista_empresas}
+opcoes_empresas = {}
+for empresa in lista_empresas:
+    nome_limpo = limpar_tag_tenant(empresa.get("razao_social", ""))
+    dono = extrair_tenant_empresa(empresa)
+    nome_dono = registro_global["users"].get(dono, {}).get("name", dono) if dono else "Guilherme (sem tag)"
+    dono_exibicao = f"{dono} — {nome_dono}" if dono else nome_dono
+    sufixo_dono = f" • Dono: {dono_exibicao}" if is_admin else ""
+    opcoes_empresas[f"{nome_limpo} ({empresa['cnpj']}){sufixo_dono}"] = empresa["id"]
 empresa_selecionada_nome = st.sidebar.selectbox("📂 Cliente Ativo Monitorado", list(opcoes_empresas.keys()))
 empresa_id_ativo = opcoes_empresas[empresa_selecionada_nome]
 empresa_ativa_bruta = next((e for e in lista_empresas if e["id"] == empresa_id_ativo), lista_empresas[0])
+tenant_empresa_ativa = extrair_tenant_empresa(empresa_ativa_bruta)
+nome_dono_ativo = (
+    registro_global["users"].get(tenant_empresa_ativa, {}).get("name", tenant_empresa_ativa)
+    if tenant_empresa_ativa
+    else "Guilherme (sem tag)"
+)
+dono_exibicao_ativo = (
+    f"{tenant_empresa_ativa} — {nome_dono_ativo}"
+    if tenant_empresa_ativa
+    else nome_dono_ativo
+)
 
-# Cria cópia limpa do cliente ativo sem a tag interna de tenant no CNAE
+# Mantém as tags internas fora dos nomes exibidos e das rotinas fiscais.
 empresa_ativa = dict(empresa_ativa_bruta)
+empresa_ativa["razao_social"] = limpar_tag_tenant(empresa_ativa_bruta.get("razao_social", ""))
 empresa_ativa["cnae_principal"] = extrair_cnae_limpo_empresa(empresa_ativa_bruta)
 
 st.sidebar.markdown(f"""
@@ -690,6 +842,7 @@ st.sidebar.markdown(f"""
         <span class="sidebar-exec-label">Regime</span>
         <span class="badge-gold">{empresa_ativa.get('regime_tributario', 'Simples Nacional')}</span>
     </div>
+    {f"<div class='sidebar-exec-row'><span class='sidebar-exec-label'>Contador responsável</span><span class='badge-gold'>{dono_exibicao_ativo}</span></div>" if is_admin else ""}
     <div class="sidebar-exec-row">
         <span class="sidebar-exec-label">CNPJ</span>
         <span style="color:#f3f4f6; font-family:'Courier New', monospace; font-weight:700;">{empresa_ativa.get('cnpj', '')}</span>
@@ -717,7 +870,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
         key=f"edit_cnae_{empresa_id_ativo}"
     )
     if st.button("💾 Salvar Novo CNAE", use_container_width=True, key=f"btn_save_cnae_{empresa_id_ativo}"):
-        owner_tag = extrair_tenant_empresa(empresa_ativa_bruta)
+        owner_tag = extrair_tenant_empresa(empresa_ativa_bruta) or "guilherme"
         cnaes_editados = list(dict.fromkeys(
             "".join(filter(str.isdigit, cnae.strip()))
             for cnae in novo_cnae_edit.split(",")
@@ -727,11 +880,12 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
             st.sidebar.warning("Informe um ou mais CNAEs válidos com exatamente 7 dígitos, separados por vírgula.")
         else:
             cnaes_secundarios = ",".join(cnaes_editados[1:])
-            status_certificado = f"Ativo|TENANT:{owner_tag}"
+            status_certificado = "Ativo"
             if cnaes_secundarios:
                 status_certificado += f"|CNAES:{cnaes_secundarios}"
             try:
                 resultado = supabase.table("empresas_monitoradas").update({
+                    "razao_social": f"{limpar_tag_tenant(empresa_ativa_bruta.get('razao_social', '')).upper()} [T:{owner_tag}]",
                     "cnae_principal": cnaes_editados[0],
                     "certificado_a1_status": status_certificado
                 }).eq("id", empresa_id_ativo).select("id").execute()
