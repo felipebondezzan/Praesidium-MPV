@@ -215,6 +215,13 @@ CSS_DARK_LUXURY = """
         position: relative;
         overflow: hidden;
         margin-bottom: 10px;
+        transition: all 0.2s ease;
+        font-variant-numeric: tabular-nums;
+    }
+    .exec-card:hover {
+        transform: translateY(-2px);
+        border-color: rgba(212, 175, 55, 0.65);
+        box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22);
     }
     .exec-card::before {
         content: '';
@@ -264,6 +271,12 @@ CSS_DARK_LUXURY = """
         text-align: left;
         min-height: 130px;
         margin-bottom: 10px;
+        transition: all 0.2s ease;
+        font-variant-numeric: tabular-nums;
+    }
+    .sub-calc-card:hover {
+        transform: translateY(-2px);
+        border-color: rgba(212, 175, 55, 0.65);
     }
     .sub-calc-title {
         color: #9ca3af !important;
@@ -319,6 +332,10 @@ CSS_DARK_LUXURY = """
         border: 1px solid #374151 !important;
         border-radius: 8px !important;
         background-color: #111827 !important;
+        font-variant-numeric: tabular-nums !important;
+    }
+    [data-testid="stDataFrame"], [data-testid="stTable"] {
+        font-variant-numeric: tabular-nums !important;
     }
     h3, h4, span, label, p {
         color: #f3f4f6 !important;
@@ -334,50 +351,64 @@ CSS_DARK_LUXURY = """
 """
 st.markdown(CSS_DARK_LUXURY.replace("\n\n", "\n"), unsafe_allow_html=True)
 
+
+def renderizar_onboarding_vazio() -> None:
+    st.markdown(
+        """
+        <div style="background:linear-gradient(135deg,#111827,#0f172a);
+        border:1px solid #374151;border-left:4px solid #d4af37;border-radius:12px;
+        padding:20px 24px;margin:12px 0 20px;">
+          <div style="color:#f6c443;font-weight:800;font-size:16px;">
+            🚀 Passo a Passo Rápido
+          </div>
+          <div style="color:#e5e7eb;line-height:1.8;margin-top:8px;">
+            <b>1.</b> Cadastre o CNPJ na barra lateral →
+            <b>2.</b> Arraste os XMLs para a Central de Ingestão →
+            <b>3.</b> Audite os itens na Quarentena.
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # ==========================================
 # 2. CONEXÃO SUPABASE (EM CACHE DE ALTA VELOCIDADE)
 # ==========================================
-url = ""
-key = ""
-
-
-def obter_configuracao_supabase(nome: str) -> str:
-    try:
-        valor = st.secrets[nome]
-    except (KeyError, StreamlitSecretNotFoundError):
-        valor = None
-    if not valor:
-        valor = os.environ.get(nome)
-    return str(valor or "").strip()
-
-
-url = obter_configuracao_supabase("SUPABASE_URL")
-key = obter_configuracao_supabase("SUPABASE_KEY")
-
-
 @st.cache_resource
-def iniciar_conexao_supabase(supabase_url: str, supabase_key: str) -> Client:
+def iniciar_conexao_supabase() -> Client:
+    try:
+        supabase_url = str(st.secrets["SUPABASE_URL"]).strip()
+    except (KeyError, StreamlitSecretNotFoundError):
+        supabase_url = ""
+    if not supabase_url:
+        supabase_url = (os.environ.get("SUPABASE_URL") or "").strip()
+    try:
+        supabase_key = str(st.secrets["SUPABASE_KEY"]).strip()
+    except (KeyError, StreamlitSecretNotFoundError):
+        supabase_key = ""
+    if not supabase_key:
+        supabase_key = (os.environ.get("SUPABASE_KEY") or "").strip()
+    url_validada = urlparse(supabase_url)
+    if not supabase_url or not supabase_key:
+        raise ValueError("Credenciais do Supabase ausentes.")
+    if url_validada.scheme != "https" or not url_validada.netloc:
+        raise ValueError("SUPABASE_URL inválida; HTTPS é obrigatório.")
     return create_client(supabase_url, supabase_key)
 
 
 supabase: Client | None = None
 erro_conexao_supabase = None
-url_validada = urlparse(url)
-if not url or not key:
+try:
+    supabase = iniciar_conexao_supabase()
+except ValueError as ex:
+    erro_conexao_supabase = str(ex)
+except Exception:
+    logging.getLogger(__name__).exception("Falha ao inicializar a conexão Supabase.")
     erro_conexao_supabase = (
-        "Credenciais do Supabase ausentes. Configure SUPABASE_URL e SUPABASE_KEY "
+        "Não foi possível inicializar a conexão Supabase. Confira as credenciais "
         "em st.secrets ou nas variáveis de ambiente."
     )
-elif url_validada.scheme != "https" or not url_validada.netloc:
-    erro_conexao_supabase = "SUPABASE_URL inválida. Informe uma URL completa com https://."
-else:
-    try:
-        supabase = iniciar_conexao_supabase(url, key)
-    except Exception:
-        erro_conexao_supabase = (
-            "Não foi possível inicializar a conexão Supabase. Confira SUPABASE_URL "
-            "e SUPABASE_KEY em st.secrets ou nas variáveis de ambiente."
-        )
 
 if erro_conexao_supabase:
     st.warning(erro_conexao_supabase)
@@ -387,6 +418,22 @@ def hash_senha(senha: str) -> str:
     return hashlib.sha256(senha.encode("utf-8")).hexdigest()
 
 
+def consultar_todas_paginas(criar_consulta, tamanho_pagina: int = 1000) -> list:
+    registros = []
+    inicio = 0
+    while True:
+        resposta = (
+            criar_consulta()
+            .range(inicio, inicio + tamanho_pagina - 1)
+            .execute()
+        )
+        pagina = resposta.data or []
+        registros.extend(pagina)
+        if len(pagina) < tamanho_pagina:
+            return registros
+        inicio += tamanho_pagina
+
+
 CAMINHO_REGISTRO_AUTH = Path(__file__).with_name("usuarios_praesidium.json")
 CAMINHO_REGISTRO_AUTH_ANTIGO = Path(__file__).with_name("auth_state.json")
 PREFIXO_USUARIO_SISTEMA = "[SYS_USER]"
@@ -394,9 +441,6 @@ PREFIXO_LOG_SISTEMA = "[SYS_LOG]"
 
 
 def chave_log_acesso(log: dict) -> tuple:
-    log_id = log.get("log_id")
-    if log_id:
-        return ("id", log_id)
     return (
         log.get("timestamp"),
         log.get("datetime"),
@@ -443,38 +487,98 @@ def usuario_from_row(row: dict) -> tuple[str, dict] | None:
 def ler_registros_sistema_supabase() -> tuple[dict, list]:
     if supabase is None:
         return {}, []
-    linhas = []
-    inicio = 0
-    tamanho_pagina = 1000
-    while True:
-        resposta = (
+
+    def consultar_sistema(criar_consulta) -> list:
+        registros = []
+        inicio = 0
+        while True:
+            resposta = criar_consulta().range(inicio, inicio + 999).execute()
+            pagina = resposta.data or []
+            registros.extend(pagina)
+            if len(pagina) < 1000:
+                return registros
+            inicio += 1000
+
+    linhas_auth = consultar_sistema(
+        lambda: (
             supabase.table("empresas_monitoradas")
             .select("cnpj,razao_social,regime_tributario,cnae_principal")
             .eq("regime_tributario", "SYS_AUTH")
-            .range(inicio, inicio + tamanho_pagina - 1)
-            .execute()
         )
-        pagina = resposta.data or []
-        linhas.extend(pagina)
-        if len(pagina) < tamanho_pagina:
-            break
-        inicio += tamanho_pagina
+    )
+    linhas_logs = consultar_sistema(
+        lambda: (
+            supabase.table("empresas_monitoradas")
+            .select("cnpj,razao_social,regime_tributario,cnae_principal")
+            .eq("regime_tributario", "SYS_LOG")
+        )
+    )
     usuarios = {}
     logs = []
-    for row in linhas:
+    for row in linhas_auth:
         if str(row.get("razao_social", "")).startswith(PREFIXO_USUARIO_SISTEMA):
             usuario = usuario_from_row(row)
             if usuario:
                 usuarios[usuario[0]] = usuario[1]
         elif str(row.get("razao_social", "")).startswith(PREFIXO_LOG_SISTEMA):
-            try:
-                log = json.loads(str(row["razao_social"])[len(PREFIXO_LOG_SISTEMA):])
-            except (KeyError, TypeError, ValueError):
-                logging.getLogger(__name__).exception("Registro de acesso do Supabase malformado.")
-                continue
-            if isinstance(log, dict):
+            log = decodificar_log_acesso(row)
+            if log:
                 logs.append(log)
+    logs.extend(log for row in linhas_logs if (log := decodificar_log_acesso(row)))
     return usuarios, logs
+
+
+def decodificar_log_acesso(row: dict) -> dict | None:
+    razao_social = str(row.get("razao_social", ""))
+    if not razao_social.startswith(PREFIXO_LOG_SISTEMA):
+        return None
+    conteudo = razao_social[len(PREFIXO_LOG_SISTEMA):]
+    try:
+        log = json.loads(conteudo)
+    except (TypeError, ValueError):
+        campos = conteudo.split("|", 3)
+        if len(campos) != 4:
+            logging.getLogger(__name__).error("Registro de acesso do Supabase malformado.")
+            return None
+        data_hora, username, nome, evento = campos
+        try:
+            timestamp_id = str(row.get("cnpj", ""))[4:]
+            data_log = datetime.strptime(data_hora, "%d/%m/%Y %H:%M:%S")
+            if re.fullmatch(r"\d{20}", timestamp_id):
+                data_log = datetime.strptime(timestamp_id, "%Y%m%d%H%M%S%f")
+            timestamp = data_log.replace(
+                tzinfo=timezone(timedelta(hours=-3))
+            ).isoformat(timespec="microseconds")
+        except ValueError:
+            timestamp = ""
+        log = {
+            "datetime": data_hora,
+            "timestamp": timestamp,
+            "username": username,
+            "name": nome,
+            "event": evento,
+        }
+    return log if isinstance(log, dict) else None
+
+
+def filtrar_logs_ultimos_sete_dias(logs: list[dict]) -> list[dict]:
+    limite = datetime.now(timezone(timedelta(hours=-3))) - timedelta(days=7)
+    recentes = []
+    for log in logs:
+        try:
+            data_log = datetime.fromisoformat(str(log.get("timestamp", "")))
+            if data_log.tzinfo is None:
+                data_log = data_log.replace(tzinfo=timezone(timedelta(hours=-3)))
+        except ValueError:
+            try:
+                data_log = datetime.strptime(
+                    str(log.get("datetime", "")), "%d/%m/%Y %H:%M:%S"
+                ).replace(tzinfo=timezone(timedelta(hours=-3)))
+            except ValueError:
+                continue
+        if data_log >= limite:
+            recentes.append(log)
+    return recentes
 
 
 def payload_usuario_supabase(usuario: str, dados_usuario: dict) -> dict:
@@ -550,15 +654,53 @@ def persistir_log_supabase(log_acesso: dict) -> None:
     if supabase is None:
         raise RuntimeError("Supabase indisponível para persistir o log.")
     supabase.table("empresas_monitoradas").insert({
-        "cnpj": f"LOG_{uuid.uuid4().hex}",
-        "razao_social": PREFIXO_LOG_SISTEMA + json.dumps(
-            log_acesso,
-            ensure_ascii=False,
-            separators=(",", ":"),
+        "cnpj": f"LOG_{log_acesso['timestamp_id']}",
+        "razao_social": (
+            f"{PREFIXO_LOG_SISTEMA}{log_acesso['datetime']}|"
+            f"{log_acesso['username']}|{log_acesso['name']}|{log_acesso['event']}"
         ),
-        "regime_tributario": "SYS_AUTH",
+        "regime_tributario": "SYS_LOG",
         "cnae_principal": "0000000",
     }).execute()
+    limpar_logs_antigos_supabase()
+
+
+def limpar_logs_antigos_supabase() -> None:
+    if supabase is None:
+        return
+    cutoff = datetime.now(timezone(timedelta(hours=-3))) - timedelta(days=7)
+    registros = []
+    for regime in ("SYS_LOG", "SYS_AUTH"):
+        registros.extend(consultar_todas_paginas(
+            lambda regime=regime: (
+                supabase.table("empresas_monitoradas")
+                .select("cnpj,razao_social,regime_tributario")
+                .eq("regime_tributario", regime)
+            )
+        ))
+    ids_antigos = []
+    for row in registros:
+        log = decodificar_log_acesso(row)
+        if not log:
+            continue
+        timestamp = str(log.get("timestamp") or "")
+        try:
+            data_log = datetime.fromisoformat(timestamp)
+            if data_log.tzinfo is None:
+                data_log = data_log.replace(tzinfo=timezone(timedelta(hours=-3)))
+        except ValueError:
+            try:
+                data_log = datetime.strptime(
+                    str(log.get("datetime", "")), "%d/%m/%Y %H:%M:%S"
+                ).replace(tzinfo=timezone(timedelta(hours=-3)))
+            except ValueError:
+                continue
+        if data_log < cutoff and row.get("cnpj"):
+            ids_antigos.append(row["cnpj"])
+    if ids_antigos:
+        supabase.table("empresas_monitoradas").delete().in_(
+            "cnpj", ids_antigos
+        ).in_("regime_tributario", ["SYS_LOG", "SYS_AUTH"]).execute()
 
 
 def salvar_registro_global(registro: dict) -> None:
@@ -655,7 +797,7 @@ def obter_registro_global() -> dict:
 
     registro = {
         "users": usuarios,
-        "access_logs": logs_acesso,
+        "access_logs": filtrar_logs_ultimos_sete_dias(logs_acesso),
         "lock": threading.RLock(),
         "sessions": {},
     }
@@ -736,7 +878,7 @@ def atualizar_logs_do_supabase() -> None:
         logs_por_chave[chave_log_acesso(log)] = log
     with registro_global["lock"]:
         registro_global["access_logs"] = sorted(
-            logs_por_chave.values(),
+            filtrar_logs_ultimos_sete_dias(list(logs_por_chave.values())),
             key=lambda log: log.get("timestamp") or log.get("datetime", ""),
         )
         salvar_registro_global(registro_global)
@@ -744,7 +886,7 @@ def atualizar_logs_do_supabase() -> None:
 
 
 def persistir_estado_sessao() -> None:
-    token = st.session_state.get("session_token")
+    token = st.query_params.get("session")
     if not token:
         return
     empresa_id_ativa = st.session_state.get("empresa_id_ativa")
@@ -788,13 +930,17 @@ def registrar_e_notificar_acesso(usuario: str, nome: str, evento: str) -> None:
     log_acesso = {
         "log_id": uuid.uuid4().hex,
         "datetime": agora.strftime("%d/%m/%Y %H:%M:%S"),
-        "timestamp": agora.isoformat(timespec="seconds"),
+        "timestamp": agora.isoformat(timespec="microseconds"),
+        "timestamp_id": agora.strftime("%Y%m%d%H%M%S%f"),
         "username": usuario,
         "name": nome,
         "event": evento,
     }
     with registro_global["lock"]:
         registro_global["access_logs"].append(log_acesso)
+        registro_global["access_logs"] = filtrar_logs_ultimos_sete_dias(
+            registro_global["access_logs"]
+        )
         try:
             salvar_registro_global(registro_global)
         except Exception:
@@ -815,7 +961,6 @@ def registrar_e_notificar_acesso(usuario: str, nome: str, evento: str) -> None:
 def criar_token_sessao(usuario: str, conectado: bool = True) -> str | None:
     dados_usuario = registro_global["users"][usuario]
     if not conectado:
-        st.session_state["session_token"] = None
         st.query_params.clear()
         return None
 
@@ -834,7 +979,6 @@ def criar_token_sessao(usuario: str, conectado: bool = True) -> str | None:
     }
     with registro_global["lock"]:
         registro_global["sessions"][token] = sessao
-    st.session_state["session_token"] = token
     st.query_params["session"] = token
     return token
 
@@ -885,7 +1029,7 @@ def iniciar_sessao_usuario(usuario: str, conectado: bool = True) -> None:
 
 
 def encerrar_sessao() -> None:
-    token = st.session_state.get("session_token")
+    token = st.query_params.get("session")
     if token:
         with registro_global["lock"]:
             registro_global["sessions"].pop(token, None)
@@ -975,8 +1119,6 @@ if isinstance(token_url, str) and token_url:
         st.session_state["auth_username"] = dados_sessao["username"]
         st.session_state["tenant_id"] = dados_sessao["tenant_id"]
         st.session_state["usuario_nome"] = dados_sessao["name"]
-        st.session_state["is_admin"] = dados_sessao["role"] == "admin"
-        st.session_state["session_token"] = token_url
         empresa_id_restaurada = dados_sessao.get("company_id")
         if empresa_id_restaurada is not None:
             st.session_state["empresa_id_ativa"] = empresa_id_restaurada
@@ -994,7 +1136,7 @@ if isinstance(token_url, str) and token_url:
         st.session_state["limpar_token_navegador"] = True
 
 injetar_persistencia_navegador(
-    st.session_state.get("session_token"),
+    st.query_params.get("session"),
     st.session_state.pop("limpar_token_navegador", False),
 )
 
@@ -1069,6 +1211,8 @@ if not st.session_state["autenticado"]:
                     st.error("O usuário deve conter apenas letras, números, ponto, hífen ou sublinhado.")
                 elif not novo_nome_usuario.strip() or not nova_senha:
                     st.error("Informe usuário, nome e senha.")
+                elif supabase is None:
+                    st.error("Cadastro indisponível: configure a conexão Supabase para persistir a conta.")
                 else:
                     with registro_global["lock"]:
                         if novo_usuario in registro_global["users"]:
@@ -1084,7 +1228,9 @@ if not st.session_state["autenticado"]:
                                     logging.getLogger(__name__).exception(
                                         "Falha ao verificar duplicidade do usuário no Supabase."
                                     )
-                            if usuario_remoto is not None:
+                            if not verificacao_remota_ok:
+                                st.error("Não foi possível verificar o cadastro no Supabase. Tente novamente.")
+                            elif usuario_remoto is not None:
                                 registro_global["users"][novo_usuario] = usuario_remoto
                                 salvar_registro_global(registro_global)
                                 st.error("Este usuário já está cadastrado.")
@@ -1122,12 +1268,7 @@ if not st.session_state["autenticado"]:
                                             logging.getLogger(__name__).exception(
                                                 "Não foi possível persistir a nova conta no Supabase."
                                             )
-                                elif supabase is not None:
-                                    st.warning(
-                                        "Não foi possível verificar duplicidade no Supabase; "
-                                        "a conta será salva no fallback local."
-                                    )
-                                if not duplicado_remoto:
+                                if not duplicado_remoto and persistencia_supabase_ok:
                                     registro_global["users"][novo_usuario] = novo_registro_usuario
                                     cache_local_ok = True
                                     try:
@@ -1137,13 +1278,7 @@ if not st.session_state["autenticado"]:
                                         logging.getLogger(__name__).exception(
                                             "Não foi possível salvar a conta no fallback local."
                                         )
-                                    if not persistencia_supabase_ok:
-                                        st.session_state["aviso_persistencia_conta"] = (
-                                            "Conta salva no fallback local."
-                                            if cache_local_ok
-                                            else "Conta está apenas no cache do servidor; Supabase e arquivo local falharam."
-                                        )
-                                    elif not cache_local_ok:
+                                    if not cache_local_ok:
                                         st.session_state["aviso_persistencia_conta"] = (
                                             "Conta salva no Supabase, mas o espelho local falhou."
                                         )
@@ -1155,6 +1290,11 @@ if not st.session_state["autenticado"]:
                                     )
                                     iniciar_sessao_usuario(novo_usuario)
                                     st.rerun()
+                                elif not duplicado_remoto:
+                                    st.error(
+                                        "Não foi possível gravar a conta no Supabase; "
+                                        "nenhuma sessão foi criada."
+                                    )
     st.stop()
 
 aviso_persistencia_conta = st.session_state.pop("aviso_persistencia_conta", None)
@@ -1165,23 +1305,7 @@ if aviso_persistencia_conta:
 # ==========================================
 # 4. FUNÇÕES DE LEITURA EM CACHE (VELOCIDADE NA NUVEM)
 # ==========================================
-def consultar_todas_paginas(criar_consulta, tamanho_pagina: int = 1000) -> list:
-    registros = []
-    inicio = 0
-    while True:
-        resposta = (
-            criar_consulta()
-            .range(inicio, inicio + tamanho_pagina - 1)
-            .execute()
-        )
-        pagina = resposta.data or []
-        registros.extend(pagina)
-        if len(pagina) < tamanho_pagina:
-            return registros
-        inicio += tamanho_pagina
-
-
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def carregar_todas_empresas_db():
     if supabase is None:
         return []
@@ -1203,17 +1327,17 @@ def carregar_todas_empresas_db():
             inicio += tamanho_pagina
         return [
             empresa for empresa in empresas
-            if str(empresa.get("regime_tributario", "")) != "SYS_AUTH"
+            if str(empresa.get("regime_tributario", "")) not in {"SYS_AUTH", "SYS_LOG"}
             and not str(empresa.get("razao_social", "")).startswith(
                 (PREFIXO_USUARIO_SISTEMA, PREFIXO_LOG_SISTEMA)
             )
         ]
-    except Exception:
+    except Exception as ex:
         logging.getLogger(__name__).exception("Falha ao carregar empresas do Supabase.")
-        return []
+        raise RuntimeError("Não foi possível carregar os clientes do Supabase.") from ex
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=180, show_spinner=False)
 def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
     if supabase is None:
         return [], [], [], []
@@ -1287,6 +1411,7 @@ def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
                         supabase.table("itens_nota_fiscal")
                         .select("*")
                         .in_("nota_id", ids_lote)
+                        .eq("empresa_id", emp_id)
                     )
                 )
             )
@@ -1300,6 +1425,11 @@ def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
         ) from None
 
     return notas_lista, devs_lista, itens_lista, []
+
+
+def limpar_caches_dados() -> None:
+    carregar_todas_empresas_db.clear()
+    carregar_dados_empresa_db.clear()
 
 
 TAG_TENANT_RE = re.compile(r"\s*\[T:([^\]]+)\]", re.IGNORECASE)
@@ -1335,6 +1465,65 @@ def extrair_cnae_limpo_empresa(emp: dict) -> str:
     return ",".join(cnaes_unicos) or "4711302"
 
 
+fragment_decorator = getattr(st, "fragment", None)
+if not callable(fragment_decorator):
+    def fragment_decorator(func):
+        return func
+
+
+@fragment_decorator
+def renderizar_radar_admin() -> None:
+    if st.session_state.get("auth_username") != "felipebondezzan":
+        return
+    with st.expander(
+        "🔔 Radar de Acessos (Admin)",
+        expanded=st.session_state.get("modulo_ativo") == "admin",
+    ):
+        if st.button("Atualizar Acessos", use_container_width=True, key="btn_atualizar_acessos"):
+            try:
+                atualizar_logs_do_supabase()
+                st.session_state["modulo_ativo"] = "admin"
+                st.rerun(scope="fragment") if callable(getattr(st, "fragment", None)) else st.rerun()
+            except Exception:
+                logging.getLogger(__name__).exception("Falha ao atualizar logs de acesso do Supabase.")
+                st.error("Não foi possível atualizar o histórico pelo Supabase.")
+        if st.button(
+            "Testar Alerta no Celular",
+            use_container_width=True,
+            key="btn_testar_alerta_celular",
+        ):
+            registrar_e_notificar_acesso(
+                "felipebondezzan",
+                st.session_state["usuario_nome"],
+                "Teste de Alerta",
+            )
+            st.success("Alerta enviado em segundo plano para o canal ntfy.")
+
+        with registro_global["lock"]:
+            logs_acesso = filtrar_logs_ultimos_sete_dias(
+                [dict(log) for log in registro_global["access_logs"]]
+            )
+        if logs_acesso:
+            st.caption(f"Histórico persistente dos últimos 7 dias ({len(logs_acesso)}):")
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Data/Hora": log["datetime"],
+                        "Usuário": log["username"],
+                        "Nome": log["name"],
+                        "Evento": log["event"],
+                    }
+                    for log in reversed(logs_acesso)
+                ]),
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.caption("Nenhum acesso registrado nos últimos 7 dias.")
+
+        st.caption("📱 Alerta no celular ativo no canal ntfy.sh: `praesidium_felipe_alertas`")
+
+
 # ==========================================
 # 5. GESTÃO MULTI-EMPRESA E RADAR ADMIN (SIDEBAR)
 # ==========================================
@@ -1355,50 +1544,16 @@ st.sidebar.markdown(f"""
 <hr style="border:0; border-top:1px solid rgba(212,175,55,0.25); margin:10px 0 14px 0;">
 """, unsafe_allow_html=True)
 
-todas_empresas_brutas = carregar_todas_empresas_db()
+try:
+    todas_empresas_brutas = carregar_todas_empresas_db()
+except RuntimeError as ex:
+    st.error(str(ex))
+    st.stop()
 
 # Administrador: radar global de acessos e visão multi-tenant.
 if is_admin:
-    with st.sidebar.expander("🔔 Radar de Acessos (Admin)", expanded=False):
-        if st.button("Atualizar Acessos", use_container_width=True, key="btn_atualizar_acessos"):
-            try:
-                atualizar_logs_do_supabase()
-            except Exception:
-                logging.getLogger(__name__).exception("Falha ao atualizar logs de acesso do Supabase.")
-                st.sidebar.error("Não foi possível atualizar o histórico pelo Supabase.")
-        if st.button(
-            "Testar Alerta no Celular",
-            use_container_width=True,
-            key="btn_testar_alerta_celular",
-        ):
-            registrar_e_notificar_acesso(
-                usuario_autenticado,
-                st.session_state["usuario_nome"],
-                "Teste de Alerta",
-            )
-            st.sidebar.success("Alerta enviado em segundo plano para o canal ntfy.")
-
-        with registro_global["lock"]:
-            logs_acesso = [dict(log) for log in registro_global["access_logs"]]
-        if logs_acesso:
-            st.caption(f"Lista global de acessos ({len(logs_acesso)}):")
-            st.dataframe(
-                pd.DataFrame([
-                    {
-                        "Data/Hora": log["datetime"],
-                        "Usuário": log["username"],
-                        "Nome": log["name"],
-                        "Evento": log["event"],
-                    }
-                    for log in reversed(logs_acesso)
-                ]),
-                hide_index=True,
-                use_container_width=True,
-            )
-        else:
-            st.caption("Nenhum acesso registrado ainda.")
-
-        st.caption("📱 Alerta no celular ativo no canal ntfy.sh: `praesidium_felipe_alertas`")
+    with st.sidebar:
+        renderizar_radar_admin()
 
     tenants_disponiveis = sorted({
         extrair_tenant_empresa(e)
@@ -1478,7 +1633,7 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                 ok_ins, msg_ins, _ = xml_engine.inserir_seguro_supabase(supabase, "empresas_monitoradas", payload_emp)
                 if ok_ins:
                     st.session_state["cnae_secundarios_extras"] = []
-                    st.cache_data.clear()
+                    limpar_caches_dados()
                     st.sidebar.success("Cliente validado e cadastrado!")
                     st.rerun()
                 else:
@@ -1499,6 +1654,7 @@ if not lista_empresas:
         <div class="header-subtitle">Ambiente Exclusivo de <b>{st.session_state['usuario_nome']}</b> • Painel 100% Limpo. Cadastre seu primeiro cliente na barra lateral à esquerda (➕ Cadastrar Novo Cliente) para iniciar a auditoria.</div>
     </div>
     """, unsafe_allow_html=True)
+    renderizar_onboarding_vazio()
     if st.sidebar.button("🔒 Encerrar Sessão", use_container_width=True):
         encerrar_sessao()
     st.stop()
@@ -1512,7 +1668,7 @@ for empresa in lista_empresas:
     sufixo_dono = f" • Dono: {dono_exibicao}" if is_admin else ""
     opcoes_empresas[f"{nome_limpo} ({empresa['cnpj']}){sufixo_dono}"] = empresa["id"]
 chave_empresa_selecao = f"empresa_ativa_select_{usuario_autenticado}"
-token_sessao_ativa = st.session_state.get("session_token")
+token_sessao_ativa = st.query_params.get("session")
 if token_sessao_ativa:
     with registro_global["lock"]:
         sessao_ativa = registro_global["sessions"].get(token_sessao_ativa)
@@ -1638,7 +1794,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
                 }).eq("id", empresa_id_ativo).select("id").execute()
                 if not resultado.data:
                     raise ValueError("Nenhum cliente foi atualizado.")
-                st.cache_data.clear()
+                limpar_caches_dados()
                 st.sidebar.success("CNAEs atualizados!")
                 st.rerun()
             except Exception as ex:
@@ -1670,7 +1826,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
         st.session_state.pop(f"fallback_notas_{empresa_id_ativo}", None)
         st.session_state.pop(f"fallback_itens_{empresa_id_ativo}", None)
         if dados_alterados:
-            st.cache_data.clear()
+            limpar_caches_dados()
         st.sidebar.success("Notas zeradas!")
         st.rerun()
 
@@ -1689,7 +1845,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
             resultado = supabase.table("empresas_monitoradas").delete().eq("id", empresa_id_ativo).select("id").execute()
             if not resultado.data:
                 raise ValueError("Nenhum cliente foi excluído.")
-            st.cache_data.clear()
+            limpar_caches_dados()
             st.sidebar.success("Cliente excluído!")
             st.rerun()
         except Exception as ex:
@@ -1711,13 +1867,23 @@ st.markdown(f"""
 # ==========================================
 # 7. CÁLCULO DOS DADOS DA EMPRESA SELECIONADA (COM SUPORTE A FALLBACK)
 # ==========================================
-notas_db, devolucoes, itens_db, _ = carregar_dados_empresa_db(empresa_id_ativo, str(empresa_ativa.get("cnpj", "")))
+try:
+    notas_db, devolucoes, itens_db, _ = carregar_dados_empresa_db(
+        empresa_id_ativo,
+        str(empresa_ativa.get("cnpj", "")),
+    )
+except RuntimeError as ex:
+    st.error(str(ex))
+    st.stop()
 
 notas_mem = st.session_state.get(f"fallback_notas_{empresa_id_ativo}", [])
 itens_mem = st.session_state.get(f"fallback_itens_{empresa_id_ativo}", [])
 
 notas = notas_db + notas_mem
 itens = itens_db + itens_mem
+
+if not notas:
+    renderizar_onboarding_vazio()
 
 competencia_atual = pd.Period(datetime.now(), freq="M")
 periodo_por_nota = {
@@ -1811,9 +1977,7 @@ with st.expander("📊 Histórico Anual da Empresa (Últimos 12 Meses)", expande
         })
         linhas_historico.append({
             "Mês/Competência": periodo.strftime("%m/%Y"),
-            "Total Recebido / Bruto Processado (R$)": sum(
-                float(n.get("valor_total_nf", 0.0) or 0.0) for n in notas_periodo
-            ),
+            "Crédito Digital Bruto (R$)": resumo_creditos["bruto"],
             "Total Aceito / Validado (R$)": resumo_creditos["validado"],
             "Total em Quarentena Pendente (R$)": resumo_creditos["quarentena"],
             "Total Rejeitado / Glosado Art. 57 (R$)": resumo_creditos["rejeitado"],
@@ -1823,13 +1987,28 @@ with st.expander("📊 Histórico Anual da Empresa (Últimos 12 Meses)", expande
     total_aceito_anual = sum(row["Total Aceito / Validado (R$)"] for row in linhas_historico)
     total_pendente_anual = sum(row["Total em Quarentena Pendente (R$)"] for row in linhas_historico)
     total_rejeitado_anual = sum(row["Total Rejeitado / Glosado Art. 57 (R$)"] for row in linhas_historico)
-    total_processado_anual = sum(row["Total Recebido / Bruto Processado (R$)"] for row in linhas_historico)
-    resumo_anual = st.columns(4)
-    resumo_anual[0].metric("Bruto processado", f"R$ {total_processado_anual:,.2f}")
-    resumo_anual[1].metric("Aceito / validado", f"R$ {total_aceito_anual:,.2f}")
-    resumo_anual[2].metric("Em quarentena", f"R$ {total_pendente_anual:,.2f}")
-    resumo_anual[3].metric("Rejeitado / glosado", f"R$ {total_rejeitado_anual:,.2f}")
-    st.dataframe(pd.DataFrame(linhas_historico), hide_index=True, use_container_width=True)
+    total_processado_anual = sum(row["Crédito Digital Bruto (R$)"] for row in linhas_historico)
+    if notas:
+        resumo_anual = st.columns(4)
+        resumo_anual[0].metric("Crédito bruto", f"R$ {total_processado_anual:,.2f}")
+        resumo_anual[1].metric("Aceito / validado", f"R$ {total_aceito_anual:,.2f}")
+        resumo_anual[2].metric("Em quarentena", f"R$ {total_pendente_anual:,.2f}")
+        resumo_anual[3].metric("Rejeitado / glosado", f"R$ {total_rejeitado_anual:,.2f}")
+        st.dataframe(pd.DataFrame(linhas_historico), hide_index=True, use_container_width=True)
+    else:
+        st.info("O histórico será consolidado automaticamente após a primeira importação de XML.")
+
+creditos_auditados = resumo_creditos_mes["validado"] + resumo_creditos_mes["rejeitado"]
+creditos_total_auditavel = creditos_auditados + resumo_creditos_mes["quarentena"]
+indice_governanca = (
+    creditos_auditados / creditos_total_auditavel
+    if creditos_total_auditavel > 0
+    else 0.0
+)
+st.progress(
+    indice_governanca,
+    text=f"Índice de Eficiência e Governança da Carteira: {indice_governanca:.1%}",
+)
 
 # ==========================================
 # CHAMADA DO MOTOR DE INGESTÃO E EMISSOR DE DEVOLUÇÃO
@@ -1866,82 +2045,126 @@ with st.expander(f"📁 3. ⚠️ Radar de Contingência & Divergência SEFAZ ({
 itens_pendentes = [i for i in itens if i.get("classificacao_item") == "Quarentena Uso/Consumo"]
 itens_auditados = [i for i in itens if i.get("classificacao_item") in ["Rejeitado", "Rejeitado pelo Contador", "Aprovado Manualmente Contador"]]
 
-with st.expander(f"📁 4. Fila de Quarentena & Histórico de Auditoria ({len(itens_pendentes)} pendentes | {len(itens_auditados)} auditados)", expanded=False):
-    if itens_pendentes:
-        st.markdown("#### ⏳ Itens Aguardando Decisão Técnica do Contador")
-        for idx_p, item in enumerate(itens_pendentes):
-            imposto_item = xml_engine.obter_credito_quarentena(item)
-            item_id_key = item.get("id", f"mem_{idx_p}")
-            with st.container():
-                st.markdown(f"""
-                <div style="background: #07090e; border: 1px solid #374151; border-radius: 8px; padding: 15px; margin-bottom: 10px;">
-                    <b style="color: #ffffff; font-size: 15px;">📦 {item.get('descricao', 'Item')}</b><br>
-                    <span style="color: #9ca3af; font-size: 13px;">NCM: <code>{item.get('ncm', '')}</code> | CFOP: <code>{item.get('cfop', '')}</code> | Valor Contábil: <b>R$ {float(item.get('valor_item', 0.0)):,.2f}</b> | Crédito Potencial Retido: <b style="color: #fbbf24;">R$ {imposto_item:,.2f}</b></span>
-                </div>
-                """, unsafe_allow_html=True)
+@fragment_decorator
+def renderizar_fila_quarentena(
+    pendentes: list[dict],
+    auditados: list[dict],
+    empresa_id: int | str,
+) -> None:
+    def persistir_decisao(item: dict, status: str, credito: float) -> None:
+        if supabase is None or item.get("id") is None or item.get("nota_id") is None:
+            raise RuntimeError("Conexão ou vínculo do item indisponível.")
+        atualizacao = {
+            "classificacao_item": status,
+            "aliquota_aplicada": xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
+            "valor_credito_item": round(credito, 2),
+        }
+        try:
+            resultado = supabase.table("itens_nota_fiscal").update(atualizacao).eq(
+                "id", item["id"]
+            ).eq("nota_id", item["nota_id"]).eq("empresa_id", empresa_id).select(
+                "id"
+            ).execute()
+        except Exception as ex:
+            if "aliquota_aplicada" not in str(ex).lower():
+                raise
+            atualizacao.pop("aliquota_aplicada")
+            resultado = supabase.table("itens_nota_fiscal").update(atualizacao).eq(
+                "id", item["id"]
+            ).eq("nota_id", item["nota_id"]).eq("empresa_id", empresa_id).select(
+                "id"
+            ).execute()
+        if not resultado.data:
+            raise RuntimeError("O item não foi atualizado para a empresa ativa.")
 
-                c1, c2 = st.columns(2)
-                if c1.button("✅ Liberar Crédito (Aprovar)", key=f"lib_{item_id_key}", use_container_width=True):
-                    dados_alterados = False
+    with st.expander(
+        f"📁 4. Fila de Quarentena & Histórico de Auditoria "
+        f"({len(pendentes)} pendentes | {len(auditados)} auditados)",
+        expanded=st.session_state.get("modulo_ativo") == "quarentena",
+    ):
+        if pendentes:
+            st.markdown("#### ⏳ Itens Aguardando Decisão Técnica do Contador")
+            for idx, item in enumerate(pendentes):
+                credito = xml_engine.obter_credito_quarentena(item)
+                item_id = item.get("id", f"mem_{idx}")
+                st.markdown(
+                    f"<div style='background:#07090e;border:1px solid #374151;"
+                    f"border-radius:8px;padding:15px;margin-bottom:10px;'>"
+                    f"<b style='color:#fff;font-size:15px;'>📦 {item.get('descricao', 'Item')}</b><br>"
+                    f"<span style='color:#9ca3af;font-size:13px;'>NCM: <code>{item.get('ncm', '')}</code> "
+                    f"| CFOP: <code>{item.get('cfop', '')}</code> | Valor Contábil: "
+                    f"<b>R$ {float(item.get('valor_item', 0.0)):,.2f}</b> | Crédito Potencial Retido: "
+                    f"<b style='color:#fbbf24;'>R$ {credito:,.2f}</b></span></div>",
+                    unsafe_allow_html=True,
+                )
+                aprovar, rejeitar = st.columns(2)
+                if aprovar.button(
+                    "✅ Liberar Crédito (Aprovar)",
+                    key=f"lib_{item_id}",
+                    use_container_width=True,
+                ):
                     try:
-                        resultado = supabase.table("itens_nota_fiscal").update({
-                            "classificacao_item": "Aprovado Manualmente Contador",
-                            "aliquota_aplicada": xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
-                            "valor_credito_item": round(imposto_item, 2)
-                        }).eq("id", item["id"]).eq("nota_id", item["nota_id"]).select("id").execute()
-                        dados_alterados = bool(resultado.data)
-                    except Exception:
-                        try:
-                            resultado = supabase.table("itens_nota_fiscal").update({
-                                "classificacao_item": "Aprovado Manualmente Contador",
-                                "valor_credito_item": round(imposto_item, 2)
-                            }).eq("id", item["id"]).eq("nota_id", item["nota_id"]).select("id").execute()
-                            dados_alterados = bool(resultado.data)
-                        except Exception:
-                            item["classificacao_item"] = "Aprovado Manualmente Contador"
-                            item["valor_credito_item"] = round(imposto_item, 2)
-                    if dados_alterados:
-                        st.cache_data.clear()
-                    st.rerun()
-
-                if c2.button("🚫 Bloquear Crédito (Uso/Consumo Definitivo)", key=f"bloq_{item_id_key}", use_container_width=True):
-                    dados_alterados = False
+                        persistir_decisao(
+                            item, "Aprovado Manualmente Contador", credito
+                        )
+                    except Exception as ex:
+                        logging.getLogger(__name__).exception(
+                            "Falha ao aprovar item %s para empresa %s.",
+                            item.get("id"),
+                            empresa_id,
+                        )
+                        st.error(f"A aprovação não foi salva no Supabase: {ex}")
+                    else:
+                        limpar_caches_dados()
+                        st.session_state["modulo_ativo"] = "quarentena"
+                        st.toast(
+                            f"✅ +R$ {credito:,.2f} liberados para o Crédito Validado!",
+                            icon="💰",
+                        )
+                        st.rerun()
+                if rejeitar.button(
+                    "🚫 Bloquear Crédito (Uso/Consumo Definitivo)",
+                    key=f"bloq_{item_id}",
+                    use_container_width=True,
+                ):
                     try:
-                        resultado = supabase.table("itens_nota_fiscal").update({
-                            "classificacao_item": "Rejeitado",
-                            "aliquota_aplicada": xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
-                        }).eq("id", item["id"]).eq("nota_id", item["nota_id"]).select("id").execute()
-                        dados_alterados = bool(resultado.data)
-                    except Exception:
-                        try:
-                            resultado = supabase.table("itens_nota_fiscal").update({
-                                "classificacao_item": "Rejeitado"
-                            }).eq("id", item["id"]).eq("nota_id", item["nota_id"]).select("id").execute()
-                            dados_alterados = bool(resultado.data)
-                        except Exception:
-                            item["classificacao_item"] = "Rejeitado"
-                        item["aliquota_aplicada"] = xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
-                    if dados_alterados:
-                        st.cache_data.clear()
-                    st.rerun()
+                        persistir_decisao(item, "Rejeitado", credito)
+                    except Exception as ex:
+                        logging.getLogger(__name__).exception(
+                            "Falha ao rejeitar item %s para empresa %s.",
+                            item.get("id"),
+                            empresa_id,
+                        )
+                        st.error(f"A rejeição não foi salva no Supabase: {ex}")
+                    else:
+                        limpar_caches_dados()
+                        st.session_state["modulo_ativo"] = "quarentena"
+                        st.toast(
+                            f"🛡️ R$ {credito:,.2f} glosados (Art. 57) — risco fiscal eliminado!",
+                            icon="🛡️",
+                        )
+                        st.rerun()
                 st.markdown("---")
-    else:
-        st.success("🎉 Nenhum item pendente de análise na quarentena para este cliente.")
+        else:
+            st.success("🎉 Nenhum item pendente de análise na quarentena para este cliente.")
 
-    if itens_auditados:
-        st.markdown("#### 📜 Histórico Permanente de Auditoria Manual")
-        df_audit = pd.DataFrame([
-            {
-                "ID Item": i.get("id", "-"),
-                "Descrição": i.get("descricao", ""),
-                "NCM": i.get("ncm", ""),
-                "CFOP": i.get("cfop", ""),
-                "Valor Contábil (R$)": float(i.get("valor_item", 0.0)),
-                "Status / Decisão do Contador": i.get("classificacao_item", "")
-            }
-            for i in itens_auditados
-        ])
-        st.dataframe(df_audit, height=250, hide_index=True, use_container_width=True)
+        if auditados:
+            st.markdown("#### 📜 Histórico Permanente de Auditoria Manual")
+            df_audit = pd.DataFrame([
+                {
+                    "ID Item": item.get("id", "-"),
+                    "Descrição": item.get("descricao", ""),
+                    "NCM": item.get("ncm", ""),
+                    "CFOP": item.get("cfop", ""),
+                    "Valor Contábil (R$)": float(item.get("valor_item", 0.0)),
+                    "Status / Decisão do Contador": item.get("classificacao_item", ""),
+                }
+                for item in auditados
+            ])
+            st.dataframe(df_audit, height=250, hide_index=True, use_container_width=True)
+
+
+renderizar_fila_quarentena(itens_pendentes, itens_auditados, empresa_id_ativo)
 
 # MÓDULO 5: NOTAS FISCAIS RECEBIDAS (COM SELETOR DE DOWNLOAD NOTA POR NOTA DO CLIENTE)
 with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} notas acumuladas deste cliente)", expanded=False):
@@ -2014,146 +2237,192 @@ with st.expander(f"📁 6. Conciliação de Devoluções ({len(devolucoes)} regi
         st.info("Nenhuma devolução registrada no período.")
 
 # MÓDULO 7: SIMULADOR ESTRATÉGICO
-with st.expander("📁 7. ⚖️ Simulador Estratégico de Migração (Simples Tradicional vs. Regime Híbrido)", expanded=False):
-    st.markdown(f"Simulação fiscal focada nas operações de **{empresa_ativa['razao_social']}**.")
+@fragment_decorator
+def renderizar_simulador(empresa_ativa: dict, itens_mes: list[dict], devolucoes_empresa_mes: list[dict], empresa_id_ativo: int | str, saldo_credito_disponivel: float) -> None:
+    def manter_simulador_aberto() -> None:
+        st.session_state["modulo_ativo"] = "simulador"
 
-    compras_revenda_reais = sum([
-        float(i.get("valor_item", 0.0))
-        for i in itens_mes
-        if i.get("classificacao_item") in ["Aprovado Revenda", "Aprovado Manualmente Contador"]
-    ])
-    devolucoes_reais = sum([float(d.get("valor_mercadoria_devolvida", 0.0)) for d in devolucoes_mes])
-    quarentena_reais = sum([
-        float(i.get("valor_item", 0.0))
-        for i in itens_mes
-        if i.get("classificacao_item") == "Quarentena Uso/Consumo"
-    ])
+    with st.expander(
+        "📁 7. ⚖️ Simulador Estratégico de Migração (Simples Tradicional vs. Regime Híbrido)",
+        expanded=st.session_state.get("modulo_ativo") == "simulador",
+    ):
+        st.markdown(f"Simulação fiscal focada nas operações de **{empresa_ativa['razao_social']}**.")
 
-    faixas_simples = {
-        "1ª Faixa (Até R$ 15 mil/mês) — Alíquota Nominal: 4,00%": {"das_total": 4.00, "fatia_consumo": 1.34},
-        "2ª Faixa (R$ 15 mil a R$ 30 mil/mês) — Alíquota Nominal: 7,30%": {"das_total": 7.30, "fatia_consumo": 2.45},
-        "3ª Faixa (R$ 30 mil a R$ 60 mil/mês) — Alíquota Nominal: 9,50%": {"das_total": 9.50, "fatia_consumo": 3.18},
-        "4ª Faixa (R$ 60 mil a R$ 150 mil/mês) — Alíquota Nominal: 10,70%": {"das_total": 10.70, "fatia_consumo": 3.58},
-        "5ª Faixa (R$ 150 mil a R$ 300 mil/mês) — Alíquota Nominal: 14,30%": {"das_total": 14.30, "fatia_consumo": 4.79},
-        "6ª Faixa (R$ 300 mil a R$ 400 mil/mês) — Alíquota Nominal: 19,00%": {"das_total": 19.00, "fatia_consumo": 6.36},
-    }
+        compras_revenda_reais = sum([
+            float(i.get("valor_item", 0.0))
+            for i in itens_mes
+            if i.get("classificacao_item") in ["Aprovado Revenda", "Aprovado Manualmente Contador"]
+        ])
+        devolucoes_reais = sum([float(d.get("valor_mercadoria_devolvida", 0.0)) for d in devolucoes_empresa_mes])
+        quarentena_reais = sum([
+            float(i.get("valor_item", 0.0))
+            for i in itens_mes
+            if i.get("classificacao_item") == "Quarentena Uso/Consumo"
+        ])
 
-    with st.form(key="form_simulador_estrategico", border=False):
-        col_in1, col_in2, col_in3 = st.columns([1.2, 2, 1])
-        faturamento_vendas = col_in1.number_input("💰 Vendas no Mês / Faturamento (R$)", value=15000.0, step=1000.0, format="%.2f")
-        faixa_escolhida = col_in2.selectbox("📊 Faixa do Simples Nacional (Anexo I - Comércio)", list(faixas_simples.keys()))
-        aliquota_iva = col_in3.number_input("🏛️ Alíquota Base IBS + CBS (%)", value=26.5, step=0.5, format="%.1f")
+        faixas_simples = {
+            "1ª Faixa (Até R$ 15 mil/mês) — Alíquota Nominal: 4,00%": {"das_total": 4.00, "fatia_consumo": 1.34},
+            "2ª Faixa (R$ 15 mil a R$ 30 mil/mês) — Alíquota Nominal: 7,30%": {"das_total": 7.30, "fatia_consumo": 2.45},
+            "3ª Faixa (R$ 30 mil a R$ 60 mil/mês) — Alíquota Nominal: 9,50%": {"das_total": 9.50, "fatia_consumo": 3.18},
+            "4ª Faixa (R$ 60 mil a R$ 150 mil/mês) — Alíquota Nominal: 10,70%": {"das_total": 10.70, "fatia_consumo": 3.58},
+            "5ª Faixa (R$ 150 mil a R$ 300 mil/mês) — Alíquota Nominal: 14,30%": {"das_total": 14.30, "fatia_consumo": 4.79},
+            "6ª Faixa (R$ 300 mil a R$ 400 mil/mês) — Alíquota Nominal: 19,00%": {"das_total": 19.00, "fatia_consumo": 6.36},
+        }
 
-        col_comp1, col_comp2, col_comp3 = st.columns(3)
-        compras_mercadorias = col_comp1.number_input("🛒 Compras p/ Revenda no Mês (R$)", value=float(compras_revenda_reais), step=500.0, format="%.2f")
-        devolucoes_mes = col_comp2.number_input("🔄 Devoluções de Compras (R$)", value=float(devolucoes_reais), step=500.0, format="%.2f")
-        compras_quarentena_input = col_comp3.number_input("⚠️ Compras Travadas na Quarentena (R$)", value=float(quarentena_reais), step=100.0, format="%.2f")
+        with st.form(key=f"form_simulador_estrategico_{empresa_id_ativo}", border=False):
+            col_in1, col_in2, col_in3 = st.columns([1.2, 2, 1])
+            faturamento_vendas = col_in1.number_input(
+                "💰 Vendas no Mês / Faturamento (R$)",
+                value=15000.0,
+                step=1000.0,
+                format="%.2f",
+                key=f"sim_vendas_{empresa_id_ativo}",
+            )
+            faixa_escolhida = col_in2.selectbox(
+                "📊 Faixa do Simples Nacional (Anexo I - Comércio)",
+                list(faixas_simples.keys()),
+                key=f"sim_faixa_{empresa_id_ativo}",
+            )
+            aliquota_iva = col_in3.number_input(
+                "🏛️ Alíquota Base IBS + CBS (%)",
+                value=26.5,
+                step=0.5,
+                format="%.1f",
+                key=f"sim_aliquota_{empresa_id_ativo}",
+            )
 
-        st.write("")
-        st.form_submit_button("⚡ Aplicar Parâmetros e Calcular Simulação", use_container_width=True)
+            col_comp1, col_comp2, col_comp3 = st.columns(3)
+            compras_mercadorias = col_comp1.number_input(
+                "🛒 Compras p/ Revenda no Mês (R$)",
+                value=float(compras_revenda_reais),
+                step=500.0,
+                format="%.2f",
+                key=f"sim_compras_{empresa_id_ativo}",
+            )
+            devolucoes_mes = col_comp2.number_input(
+                "🔄 Devoluções de Compras (R$)",
+                value=float(devolucoes_reais),
+                step=500.0,
+                format="%.2f",
+                key=f"sim_devolucoes_{empresa_id_ativo}",
+            )
+            compras_quarentena_input = col_comp3.number_input(
+                "⚠️ Compras Travadas na Quarentena (R$)",
+                value=float(quarentena_reais),
+                step=100.0,
+                format="%.2f",
+                key=f"sim_quarentena_{empresa_id_ativo}",
+            )
 
-    compras_liquidas_creditaveis = max(0.0, compras_mercadorias - devolucoes_mes)
-    credito_gerado_simulado = compras_liquidas_creditaveis * (aliquota_iva / 100)
+            st.write("")
+            st.form_submit_button("⚡ Aplicar Parâmetros e Calcular Simulação", use_container_width=True, on_click=manter_simulador_aberto)
 
-    aliquota_das_total = faixas_simples[faixa_escolhida]["das_total"]
-    aliquota_consumo_embutida = faixas_simples[faixa_escolhida]["fatia_consumo"]
-    aliquota_fixa_simples = aliquota_das_total - aliquota_consumo_embutida
+        compras_liquidas_creditaveis = max(0.0, compras_mercadorias - devolucoes_mes)
+        credito_gerado_simulado = compras_liquidas_creditaveis * (aliquota_iva / 100)
 
-    imposto_tradicional = faturamento_vendas * (aliquota_das_total / 100)
+        aliquota_das_total = faixas_simples[faixa_escolhida]["das_total"]
+        aliquota_consumo_embutida = faixas_simples[faixa_escolhida]["fatia_consumo"]
+        aliquota_fixa_simples = aliquota_das_total - aliquota_consumo_embutida
 
-    das_reduzido = faturamento_vendas * (aliquota_fixa_simples / 100)
-    debito_ibs_cbs_vendas = faturamento_vendas * (aliquota_iva / 100)
-    ibs_cbs_a_pagar = max(0.0, debito_ibs_cbs_vendas - credito_gerado_simulado)
-    imposto_total_hibrido = das_reduzido + ibs_cbs_a_pagar
+        imposto_tradicional = faturamento_vendas * (aliquota_das_total / 100)
 
-    diferenca_caixa = imposto_tradicional - imposto_total_hibrido
+        das_reduzido = faturamento_vendas * (aliquota_fixa_simples / 100)
+        debito_ibs_cbs_vendas = faturamento_vendas * (aliquota_iva / 100)
+        ibs_cbs_a_pagar = max(0.0, debito_ibs_cbs_vendas - credito_gerado_simulado)
+        imposto_total_hibrido = das_reduzido + ibs_cbs_a_pagar
 
-    st.markdown("---")
-    st.markdown("#### 🧮 Memória de Cálculo Contábil (Transparência)")
+        diferenca_caixa = imposto_tradicional - imposto_total_hibrido
 
-    credito_aplicado_simulacao = min(saldo_credito_disponivel, debito_ibs_cbs_vendas)
-    saldo_liquido_pos_abatimento = max(0.0, debito_ibs_cbs_vendas - credito_aplicado_simulacao)
-    st.metric(
-        "Saldo Líquido / Disponível pós-Abatimento (Crédito Validado)",
-        f"R$ {saldo_liquido_pos_abatimento:,.2f}",
-        help=(
-            f"Débito estimado de R$ {debito_ibs_cbs_vendas:,.2f} menos "
-            f"R$ {credito_aplicado_simulacao:,.2f} de crédito validado disponível. "
-            "Este abatimento não altera o crédito bruto nem o total histórico gerado."
-        ),
-    )
+        st.markdown("---")
+        st.markdown("#### 🧮 Memória de Cálculo Contábil (Transparência)")
 
-    mc1, mc2, mc3, mc4 = st.columns(4)
-    with mc1:
-        st.markdown(f"""
-        <div class="sub-calc-card">
-            <div class="sub-calc-title">1. Compras Líquidas</div>
-            <div class="sub-calc-value">R$ {compras_liquidas_creditaveis:,.2f}</div>
-            <div class="sub-calc-desc">Revenda menos devoluções</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with mc2:
-        st.markdown(f"""
-        <div class="sub-calc-card">
-            <div class="sub-calc-title">2. Crédito Gerado</div>
-            <div class="sub-calc-value">R$ {credito_gerado_simulado:,.2f}</div>
-            <div class="sub-calc-desc">{aliquota_iva}% sobre as compras</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with mc3:
-        st.markdown(f"""
-        <div class="sub-calc-card">
-            <div class="sub-calc-title">3. Imposto Vendas (Bruto)</div>
-            <div class="sub-calc-value">R$ {debito_ibs_cbs_vendas:,.2f}</div>
-            <div class="sub-calc-desc">{aliquota_iva}% sobre as vendas</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with mc4:
-        st.markdown(f"""
-        <div class="sub-calc-card">
-            <div class="sub-calc-title">4. IBS/CBS Líquido</div>
-            <div class="sub-calc-value">R$ {ibs_cbs_a_pagar:,.2f}</div>
-            <div class="sub-calc-desc">Após abatimento de créditos</div>
-        </div>
-        """, unsafe_allow_html=True)
+        credito_aplicado_simulacao = min(saldo_credito_disponivel, debito_ibs_cbs_vendas)
+        saldo_liquido_pos_abatimento = max(0.0, debito_ibs_cbs_vendas - credito_aplicado_simulacao)
+        st.metric(
+            "Saldo Líquido / Disponível pós-Abatimento (Crédito Validado)",
+            f"R$ {saldo_liquido_pos_abatimento:,.2f}",
+            help=(
+                f"Débito estimado de R$ {debito_ibs_cbs_vendas:,.2f} menos "
+                f"R$ {credito_aplicado_simulacao:,.2f} de crédito validado disponível. "
+                "Este abatimento não altera o crédito bruto nem o total histórico gerado."
+            ),
+        )
 
-    st.markdown("---")
-    st.markdown("#### 🏆 Veredito Estratégico de Consultoria")
-
-    cr1, cr2, cr3 = st.columns(3)
-    with cr1:
-        st.markdown(f"""
-        <div class="sub-calc-card">
-            <div class="sub-calc-title">🏢 Simples Tradicional</div>
-            <div class="sub-calc-value">R$ {imposto_tradicional:,.2f}</div>
-            <div class="sub-calc-desc">Alíquota de {aliquota_das_total:.2f}% (Sem créditos)</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with cr2:
-        st.markdown(f"""
-        <div class="sub-calc-card">
-            <div class="sub-calc-title">⚡ Simples Híbrido</div>
-            <div class="sub-calc-value">R$ {imposto_total_hibrido:,.2f}</div>
-            <div class="sub-calc-desc">DAS Reduzido + IBS/CBS Líquido</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with cr3:
-        if diferenca_caixa > 0:
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        with mc1:
             st.markdown(f"""
-            <div class="sub-calc-card" style="border-left: 4px solid #34d399;">
-                <div class="sub-calc-title" style="color: #34d399;">🏆 Diagnóstico do Sistema</div>
-                <div class="sub-calc-value" style="color: #34d399;">R$ {diferenca_caixa:,.2f}</div>
-                <div class="sub-calc-desc" style="color: #34d399; font-weight: bold;">✅ MIGRAR PARA O HÍBRIDO</div>
+            <div class="sub-calc-card">
+                <div class="sub-calc-title">1. Compras Líquidas</div>
+                <div class="sub-calc-value">R$ {compras_liquidas_creditaveis:,.2f}</div>
+                <div class="sub-calc-desc">Revenda menos devoluções</div>
             </div>
             """, unsafe_allow_html=True)
-        else:
+        with mc2:
             st.markdown(f"""
-            <div class="sub-calc-card" style="border-left: 4px solid #f87171;">
-                <div class="sub-calc-title" style="color: #f87171;">🏆 Diagnóstico do Sistema</div>
-                <div class="sub-calc-value" style="color: #f87171;">R$ {abs(diferenca_caixa):,.2f}</div>
-                <div class="sub-calc-desc" style="color: #f87171; font-weight: bold;">🛑 MANTER NO TRADICIONAL</div>
+            <div class="sub-calc-card">
+                <div class="sub-calc-title">2. Crédito Gerado</div>
+                <div class="sub-calc-value">R$ {credito_gerado_simulado:,.2f}</div>
+                <div class="sub-calc-desc">{aliquota_iva}% sobre as compras</div>
             </div>
             """, unsafe_allow_html=True)
+        with mc3:
+            st.markdown(f"""
+            <div class="sub-calc-card">
+                <div class="sub-calc-title">3. Imposto Vendas (Bruto)</div>
+                <div class="sub-calc-value">R$ {debito_ibs_cbs_vendas:,.2f}</div>
+                <div class="sub-calc-desc">{aliquota_iva}% sobre as vendas</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with mc4:
+            st.markdown(f"""
+            <div class="sub-calc-card">
+                <div class="sub-calc-title">4. IBS/CBS Líquido</div>
+                <div class="sub-calc-value">R$ {ibs_cbs_a_pagar:,.2f}</div>
+                <div class="sub-calc-desc">Após abatimento de créditos</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown("#### 🏆 Veredito Estratégico de Consultoria")
+
+        cr1, cr2, cr3 = st.columns(3)
+        with cr1:
+            st.markdown(f"""
+            <div class="sub-calc-card">
+                <div class="sub-calc-title">🏢 Simples Tradicional</div>
+                <div class="sub-calc-value">R$ {imposto_tradicional:,.2f}</div>
+                <div class="sub-calc-desc">Alíquota de {aliquota_das_total:.2f}% (Sem créditos)</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with cr2:
+            st.markdown(f"""
+            <div class="sub-calc-card">
+                <div class="sub-calc-title">⚡ Simples Híbrido</div>
+                <div class="sub-calc-value">R$ {imposto_total_hibrido:,.2f}</div>
+                <div class="sub-calc-desc">DAS Reduzido + IBS/CBS Líquido</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with cr3:
+            if diferenca_caixa > 0:
+                st.markdown(f"""
+                <div class="sub-calc-card" style="border-left: 4px solid #34d399;">
+                    <div class="sub-calc-title" style="color: #34d399;">🏆 Diagnóstico do Sistema</div>
+                    <div class="sub-calc-value" style="color: #34d399;">R$ {diferenca_caixa:,.2f}</div>
+                    <div class="sub-calc-desc" style="color: #34d399; font-weight: bold;">✅ MIGRAR PARA O HÍBRIDO</div>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                <div class="sub-calc-card" style="border-left: 4px solid #f87171;">
+                    <div class="sub-calc-title" style="color: #f87171;">🏆 Diagnóstico do Sistema</div>
+                    <div class="sub-calc-value" style="color: #f87171;">R$ {abs(diferenca_caixa):,.2f}</div>
+                    <div class="sub-calc-desc" style="color: #f87171; font-weight: bold;">🛑 MANTER NO TRADICIONAL</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+renderizar_simulador(
+    empresa_ativa, itens_mes, devolucoes_mes, empresa_id_ativo, saldo_credito_disponivel
+)
 
 # MÓDULO 8: DOSSIÊ EXECUTIVO DE FECHAMENTO
 relatorio_engine.renderizar_modulo_relatorio(

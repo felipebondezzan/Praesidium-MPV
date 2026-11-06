@@ -12,6 +12,15 @@ VERSAO_REGRA_TRIBUTARIA = "LC 214/2025 - Art. 47/57 v1.0"
 ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA = 0.265
 
 
+def fragment_if_supported(func):
+    fragment = getattr(st, "fragment", None)
+    return fragment(func) if callable(fragment) else func
+
+
+def limpar_caches_dados() -> None:
+    st.cache_data.clear()
+
+
 def obter_data_referencia_nota(nota: dict):
     """Retorna a data de emissão ou, em dados legados, a data de registro."""
     for campo in ("data_emissao", "created_at"):
@@ -447,6 +456,8 @@ def processar_xml_bytes(
     empresa_ativa: dict,
     ignorar_trava_cnpj: bool = False
 ) -> tuple[bool, str]:
+    if supabase is None:
+        return False, "Importação cancelada: conexão com o Supabase indisponível."
     if empresa_id_ativo is None or str(empresa_id_ativo).strip() == "":
         return False, "Importação cancelada: a empresa ativa não possui um ID válido."
     if str(empresa_ativa.get("id")) != str(empresa_id_ativo):
@@ -469,7 +480,11 @@ def processar_xml_bytes(
         if dup_check.data:
             return False, "Nota bloqueada: XML já importado anteriormente (Hash SHA-256 idêntico)."
     except Exception:
-        pass
+        logging.getLogger(__name__).exception(
+            "Falha ao verificar duplicidade do XML da empresa %s.",
+            empresa_id_ativo,
+        )
+        return False, "Importação cancelada: não foi possível verificar duplicidade no Supabase."
 
     try:
         dados_xml = xmltodict.parse(xml_bytes)
@@ -497,7 +512,11 @@ def processar_xml_bytes(
         if dup_chave.data:
             return False, f"Nota bloqueada: Chave {chave_raw[:12]}... já consta na base deste cliente."
     except Exception:
-        pass
+        logging.getLogger(__name__).exception(
+            "Falha ao verificar duplicidade da chave NF-e na empresa %s.",
+            empresa_id_ativo,
+        )
+        return False, "Importação cancelada: não foi possível verificar a chave fiscal no Supabase."
 
     ide = inf_nfe.get("ide", {})
     emit = inf_nfe.get("emit", {})
@@ -609,7 +628,12 @@ def processar_xml_bytes(
                 "A nota foi removida para evitar um registro parcial."
             )
 
-    st.cache_data.clear()
+    limpar_caches_dados()
+    credito_bruto_nota = calcular_resumo_creditos(itens_para_inserir)["bruto"]
+    st.toast(
+        f"✅ NF-e auditada; R$ {credito_bruto_nota:,.2f} de crédito bruto calculado.",
+        icon="💰",
+    )
     mensagem_final = (
         f"NF-e {chave_raw[:10]}... auditada com sucesso "
         f"({len(itens_para_inserir)} itens processados)."
@@ -622,6 +646,7 @@ def processar_xml_bytes(
 # ==========================================
 # 4. INTERFACE: MÓDULO DE INGESTÃO XML & ROBÔ SEFAZ
 # ==========================================
+@fragment_if_supported
 def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
     upload_feedback_key = f"upload_feedback_{empresa_id_ativo}"
     feedback_upload = st.session_state.pop(upload_feedback_key, None)
@@ -633,7 +658,10 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
     if aviso_regra:
         st.warning(aviso_regra)
 
-    with st.expander("📁 1. Central de Ingestão XML & Sincronização Robô SEFAZ (A1 / Upload em Lote)", expanded=False):
+    with st.expander(
+        "📁 1. Central de Ingestão XML & Sincronização Robô SEFAZ (A1 / Upload em Lote)",
+        expanded=st.session_state.get("modulo_ativo") == "xml",
+    ):
         c_rob, c_up = st.columns([1.1, 1.9])
 
         with c_rob:
@@ -733,8 +761,14 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                     )
                     st.stop()
 
-                st.cache_data.clear()
+                limpar_caches_dados()
+                credito_lote = calcular_resumo_creditos(novos_itens)["bruto"]
+                st.toast(
+                    f"✅ Lote sincronizado: R$ {credito_lote:,.2f} em crédito bruto auditado.",
+                    icon="💰",
+                )
                 st.success("✅ Lote SEFAZ sincronizado e classificado com sucesso!")
+                st.session_state["modulo_ativo"] = "xml"
                 if msg_nf != "OK":
                     st.session_state[f"aviso_regra_{empresa_id_ativo}"] = msg_nf
                 st.rerun()
@@ -746,13 +780,13 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 value=True,
                 key=f"chk_ignorar_cnpj_{empresa_id_ativo}"
             )
-            uploader_reset_key = f"uploader_reset_id_{empresa_id_ativo}"
-            uploader_reset_id = int(st.session_state.get(uploader_reset_key, 0) or 0)
+            if "up_reset" not in st.session_state:
+                st.session_state["up_reset"] = 0
             arquivos_xml = st.file_uploader(
                 "Selecione um ou mais arquivos .XML de NF-e",
                 type=["xml"],
                 accept_multiple_files=True,
-                key=f"uploader_xml_{empresa_id_ativo}_{uploader_reset_id}"
+                key=f"xml_up_{empresa_id_ativo}_{st.session_state.get('up_reset', 0)}"
             )
             if arquivos_xml:
                 if st.button("⚡ Auditar e Importar XMLs Selecionados", use_container_width=True, key=f"btn_proc_xml_{empresa_id_ativo}"):
@@ -769,18 +803,23 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                                 st.session_state[f"aviso_regra_{empresa_id_ativo}"] = msg
                         else:
                             feedback_processamento.append(("warning", f"⚠️ {arq.name}: {msg}"))
-                    st.session_state[uploader_reset_key] = uploader_reset_id + 1
+                    st.session_state["up_reset"] += 1
                     st.session_state[upload_feedback_key] = feedback_processamento
                     if sucessos:
-                        st.cache_data.clear()
+                        limpar_caches_dados()
+                    st.session_state["modulo_ativo"] = "xml"
                     st.rerun()
 
 
 # ==========================================
 # 5. INTERFACE: EMISSOR DE NF-e DE DEVOLUÇÃO EXPRESSA
 # ==========================================
+@fragment_if_supported
 def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, itens: list):
-    with st.expander("📁 2. Emissor Express de NF-e de Devolução (Avaria / Divergência Física & Estorno Split Payment)", expanded=False):
+    with st.expander(
+        "📁 2. Emissor Express de NF-e de Devolução (Avaria / Divergência Física & Estorno Split Payment)",
+        expanded=st.session_state.get("modulo_ativo") == "devolucao",
+    ):
         if not notas:
             st.info("Importe ou sincronize ao menos uma NF-e acima para habilitar o emissor de devolução.")
             return
@@ -892,7 +931,12 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
             )
             st.session_state[f"ultimo_xml_dev_{empresa_ativa['id']}"] = (chave_dev, xml_dev_str)
             if ok_dev:
-                st.cache_data.clear()
+                limpar_caches_dados()
+                st.toast(
+                    f"↩️ Devolução registrada; R$ {credito_a_estornar:,.2f} de crédito serão estornados.",
+                    icon="🛡️",
+                )
+                st.session_state["modulo_ativo"] = "devolucao"
                 st.success("✅ Devolução registrada e crédito estornado em tempo real!")
                 st.rerun()
             else:

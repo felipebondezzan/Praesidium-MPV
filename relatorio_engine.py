@@ -216,7 +216,7 @@ def gerar_html_dossie_analitico(
 <meta charset="UTF-8">
 <title>Dossiê Analítico - {empresa_ativa['razao_social']}</title>
 <style>
-    body {{ font-family: 'Segoe UI', Arial, sans-serif; background-color: #0b0f19; color: #f3f4f6; padding: 30px; margin: 0; }}
+    body {{ font-family: 'Segoe UI', Arial, sans-serif; background-color: #0b0f19; color: #f3f4f6; padding: 30px; margin: 0; font-variant-numeric: tabular-nums; }}
     .container {{ max-width: 1080px; margin: auto; background: #111827; border: 1px solid #374151; border-top: 5px solid #d4af37; border-radius: 12px; padding: 35px; }}
     .header-top {{ display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid #374151; padding-bottom: 18px; margin-bottom: 24px; }}
     h1 {{ color: #ffffff; margin: 0 0 6px 0; font-size: 22px; }}
@@ -230,7 +230,7 @@ def gerar_html_dossie_analitico(
     .val-green {{ color: #34d399; font-size: 20px; font-weight: 800; margin-top: 6px; font-family: monospace; }}
     .val-amber {{ color: #fbbf24; font-size: 20px; font-weight: 800; margin-top: 6px; font-family: monospace; }}
     .val-red {{ color: #f87171; font-size: 20px; font-weight: 800; margin-top: 6px; font-family: monospace; }}
-    table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; background: #0f172a; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; background: #0f172a; font-variant-numeric: tabular-nums; }}
     th {{ background: #1f2937; color: #d1d5db; text-align: left; padding: 10px 12px; font-size: 11px; text-transform: uppercase; border-bottom: 1px solid #374151; }}
     td {{ padding: 9px 12px; border-bottom: 1px solid #1f2937; color: #e5e7eb; }}
     .tfoot-row td {{ background: #1f2937; font-weight: bold; border-top: 2px solid #d4af37; color: #ffffff; }}
