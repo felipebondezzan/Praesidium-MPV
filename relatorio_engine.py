@@ -184,7 +184,7 @@ def gerar_html_dossie_analitico(
     linhas_html_itens = ""
     tot_cont = tot_cred = tot_quar = 0.0
     if not df_itens_filtrados.empty:
-        for _, row in df_itens_filtrados.iterrows():
+        for row in df_itens_filtrados.to_dict(orient="records"):
             vl_cont = float(row["Valor Contábil (R$)"])
             vl_cred = float(row["Crédito Efetivo (R$)"])
             vl_quar = float(row["Risco / Quarentena (R$)"])

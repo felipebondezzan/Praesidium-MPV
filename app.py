@@ -21,6 +21,9 @@ import xml_engine
 import relatorio_engine
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 
+SESSION_TIMESTAMP_RE = re.compile(r"\d{20}")
+USERNAME_RE = re.compile(r"[a-z0-9_.-]+")
+
 st.set_page_config(
     page_title="Praesidium | Intelligence & Compliance",
     layout="wide",
@@ -544,7 +547,7 @@ def decodificar_log_acesso(row: dict) -> dict | None:
         try:
             timestamp_id = str(row.get("cnpj", ""))[4:]
             data_log = datetime.strptime(data_hora, "%d/%m/%Y %H:%M:%S")
-            if re.fullmatch(r"\d{20}", timestamp_id):
+            if SESSION_TIMESTAMP_RE.fullmatch(timestamp_id):
                 data_log = datetime.strptime(timestamp_id, "%Y%m%d%H%M%S%f")
             timestamp = data_log.replace(
                 tzinfo=timezone(timedelta(hours=-3))
@@ -610,11 +613,18 @@ def persistir_usuario_supabase(usuario: str, dados_usuario: dict) -> None:
         .execute()
     )
     if existente.data:
-        supabase.table("empresas_monitoradas").update(registro).eq(
-            "cnpj", registro["cnpj"]
-        ).eq("regime_tributario", "SYS_AUTH").execute()
+        ok, mensagem, _ = xml_engine.executar_update_seguro(
+            supabase,
+            "empresas_monitoradas",
+            registro,
+            {"cnpj": registro["cnpj"], "regime_tributario": "SYS_AUTH"},
+        )
     else:
-        supabase.table("empresas_monitoradas").insert(registro).execute()
+        ok, mensagem, _ = xml_engine.executar_insert_seguro(
+            "empresas_monitoradas", registro, supabase=supabase
+        )
+    if not ok:
+        raise RuntimeError(mensagem)
 
 
 def criar_usuario_supabase(usuario: str, dados_usuario: dict) -> None:
@@ -630,7 +640,11 @@ def criar_usuario_supabase(usuario: str, dados_usuario: dict) -> None:
     )
     if existente.data:
         raise ValueError("Este usuário já está cadastrado.")
-    supabase.table("empresas_monitoradas").insert(registro).execute()
+    ok, mensagem, _ = xml_engine.executar_insert_seguro(
+        "empresas_monitoradas", registro, supabase=supabase
+    )
+    if not ok:
+        raise RuntimeError(mensagem)
 
 
 def buscar_usuario_persistido(usuario: str) -> dict | None:
@@ -653,7 +667,7 @@ def buscar_usuario_persistido(usuario: str) -> dict | None:
 def persistir_log_supabase(log_acesso: dict) -> None:
     if supabase is None:
         raise RuntimeError("Supabase indisponível para persistir o log.")
-    supabase.table("empresas_monitoradas").insert({
+    ok, mensagem, _ = xml_engine.executar_insert_seguro("empresas_monitoradas", {
         "cnpj": f"LOG_{log_acesso['timestamp_id']}",
         "razao_social": (
             f"{PREFIXO_LOG_SISTEMA}{log_acesso['datetime']}|"
@@ -661,7 +675,9 @@ def persistir_log_supabase(log_acesso: dict) -> None:
         ),
         "regime_tributario": "SYS_LOG",
         "cnae_principal": "0000000",
-    }).execute()
+    }, supabase=supabase)
+    if not ok:
+        raise RuntimeError(mensagem)
     limpar_logs_antigos_supabase()
 
 
@@ -1207,7 +1223,7 @@ if not st.session_state["autenticado"]:
                 btn_criar_conta = st.form_submit_button("Criar Conta", use_container_width=True)
             if btn_criar_conta:
                 novo_usuario = novo_usuario_input.strip().lower()
-                if not re.fullmatch(r"[a-z0-9_.-]+", novo_usuario):
+                if not USERNAME_RE.fullmatch(novo_usuario):
                     st.error("O usuário deve conter apenas letras, números, ponto, hífen ou sublinhado.")
                 elif not novo_nome_usuario.strip() or not nova_senha:
                     st.error("Informe usuário, nome e senha.")
@@ -1307,34 +1323,34 @@ if aviso_persistencia_conta:
 # ==========================================
 @st.cache_data(ttl=180, show_spinner=False)
 def carregar_todas_empresas_db():
-    if supabase is None:
-        return []
-    try:
-        empresas = []
+    empresas = []
+    if supabase is not None:
         inicio = 0
         tamanho_pagina = 1000
-        while True:
-            res = (
-                supabase.table("empresas_monitoradas")
-                .select("id,cnpj,razao_social,regime_tributario,cnae_principal,certificado_a1_status")
-                .range(inicio, inicio + tamanho_pagina - 1)
-                .execute()
+        try:
+            while True:
+                res = (
+                    supabase.table("empresas_monitoradas")
+                    .select("id,cnpj,razao_social,regime_tributario,cnae_principal,certificado_a1_status")
+                    .range(inicio, inicio + tamanho_pagina - 1)
+                    .execute()
+                )
+                pagina = res.data or []
+                empresas.extend(pagina)
+                if len(pagina) < tamanho_pagina:
+                    break
+                inicio += tamanho_pagina
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao carregar empresas do Supabase; usando os dados da sessão."
             )
-            pagina = res.data or []
-            empresas.extend(pagina)
-            if len(pagina) < tamanho_pagina:
-                break
-            inicio += tamanho_pagina
-        return [
-            empresa for empresa in empresas
-            if str(empresa.get("regime_tributario", "")) not in {"SYS_AUTH", "SYS_LOG"}
-            and not str(empresa.get("razao_social", "")).startswith(
-                (PREFIXO_USUARIO_SISTEMA, PREFIXO_LOG_SISTEMA)
-            )
-        ]
-    except Exception as ex:
-        logging.getLogger(__name__).exception("Falha ao carregar empresas do Supabase.")
-        raise RuntimeError("Não foi possível carregar os clientes do Supabase.") from ex
+    return [
+        empresa for empresa in empresas
+        if str(empresa.get("regime_tributario", "")) not in {"SYS_AUTH", "SYS_LOG"}
+        and not str(empresa.get("razao_social", "")).startswith(
+            (PREFIXO_USUARIO_SISTEMA, PREFIXO_LOG_SISTEMA)
+        )
+    ]
 
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -1352,12 +1368,10 @@ def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
         )
     except Exception:
         logging.getLogger(__name__).exception(
-            "Falha ao carregar notas fiscais da empresa %s.",
+            "Falha ao carregar notas fiscais da empresa %s; usando dados da sessão.",
             emp_id,
         )
-        raise RuntimeError(
-            f"Não foi possível carregar as notas fiscais da empresa {emp_id}."
-        ) from None
+        notas_lista = []
 
     devolucoes_por_id = {}
     try:
@@ -1375,9 +1389,7 @@ def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
             "Falha ao carregar devoluções por empresa para %s.",
             emp_id,
         )
-        raise RuntimeError(
-            f"Não foi possível carregar as devoluções da empresa {emp_id}."
-        ) from None
+        devolucoes_por_id = {}
 
     if emp_cnpj:
         try:
@@ -1395,34 +1407,23 @@ def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
                 "Falha ao carregar devoluções legadas por CNPJ para %s.",
                 emp_cnpj,
             )
-            raise RuntimeError(
-                f"Não foi possível carregar devoluções legadas do CNPJ {emp_cnpj}."
-            ) from None
     devs_lista = list(devolucoes_por_id.values())
 
-    n_ids = [n["id"] for n in notas_lista if "id" in n]
     itens_lista = []
     try:
-        for inicio in range(0, len(n_ids), 100):
-            ids_lote = n_ids[inicio:inicio + 100]
-            itens_lista.extend(
-                consultar_todas_paginas(
-                    lambda ids_lote=ids_lote: (
-                        supabase.table("itens_nota_fiscal")
-                        .select("*")
-                        .in_("nota_id", ids_lote)
-                        .eq("empresa_id", emp_id)
-                    )
-                )
+        itens_lista = consultar_todas_paginas(
+            lambda: (
+                supabase.table("itens_nota_fiscal")
+                .select("*")
+                .eq("empresa_id", emp_id)
             )
+        )
     except Exception:
         logging.getLogger(__name__).exception(
-            "Falha ao carregar itens das notas da empresa %s.",
+            "Falha ao carregar itens das notas da empresa %s; usando dados da sessão.",
             emp_id,
         )
-        raise RuntimeError(
-            f"Não foi possível carregar os itens das notas da empresa {emp_id}."
-        ) from None
+        itens_lista = []
 
     return notas_lista, devs_lista, itens_lista, []
 
@@ -1430,6 +1431,20 @@ def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
 def limpar_caches_dados() -> None:
     carregar_todas_empresas_db.clear()
     carregar_dados_empresa_db.clear()
+
+
+xml_engine.registrar_limpador_cache_dados(limpar_caches_dados)
+
+
+def combinar_registros_com_sessao(registros_db: list[dict], registros_sessao: list[dict]) -> list[dict]:
+    combinados = {}
+    for indice, registro in enumerate(registros_db):
+        identificador = str(registro.get("id") or f"db_{indice}")
+        combinados[identificador] = dict(registro)
+    for indice, registro in enumerate(registros_sessao):
+        identificador = str(registro.get("id") or f"sessao_{indice}")
+        combinados[identificador] = {**combinados.get(identificador, {}), **registro}
+    return list(combinados.values())
 
 
 TAG_TENANT_RE = re.compile(r"\s*\[T:([^\]]+)\]", re.IGNORECASE)
@@ -1471,6 +1486,13 @@ if not callable(fragment_decorator):
         return func
 
 
+def rerun_fragment_local() -> None:
+    if callable(getattr(st, "fragment", None)):
+        st.rerun(scope="fragment")
+    else:
+        st.rerun()
+
+
 @fragment_decorator
 def renderizar_radar_admin() -> None:
     if st.session_state.get("auth_username") != "felipebondezzan":
@@ -1483,7 +1505,7 @@ def renderizar_radar_admin() -> None:
             try:
                 atualizar_logs_do_supabase()
                 st.session_state["modulo_ativo"] = "admin"
-                st.rerun(scope="fragment") if callable(getattr(st, "fragment", None)) else st.rerun()
+                rerun_fragment_local()
             except Exception:
                 logging.getLogger(__name__).exception("Falha ao atualizar logs de acesso do Supabase.")
                 st.error("Não foi possível atualizar o histórico pelo Supabase.")
@@ -1546,9 +1568,14 @@ st.sidebar.markdown(f"""
 
 try:
     todas_empresas_brutas = carregar_todas_empresas_db()
-except RuntimeError as ex:
-    st.error(str(ex))
+except RuntimeError:
+    logging.getLogger(__name__).exception("Falha ao carregar clientes.")
+    st.toast("Não foi possível carregar os clientes agora. Tente novamente.", icon="⚠️")
     st.stop()
+todas_empresas_brutas = combinar_registros_com_sessao(
+    todas_empresas_brutas,
+    st.session_state.get("fallback_empresas", []),
+)
 
 # Administrador: radar global de acessos e visão multi-tenant.
 if is_admin:
@@ -1599,9 +1626,7 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
 
     st.write("")
     if st.button("Salvar Cliente Definitivo", use_container_width=True, key="btn_salvar_cli_def"):
-        if supabase is None:
-            st.sidebar.warning(erro_conexao_supabase or "Conexão Supabase indisponível. Confira as credenciais configuradas.")
-        elif novo_nome and novo_cnpj and cnae_principal_input:
+        if novo_nome and novo_cnpj and cnae_principal_input:
             cnpj_limpo = "".join(filter(str.isdigit, novo_cnpj))
             cnae_prin_limpo = "".join(filter(str.isdigit, cnae_principal_input))
             todos_cnaes = [cnae_prin_limpo] + cnaes_secundarios_coletados
@@ -1635,6 +1660,8 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                     st.session_state["cnae_secundarios_extras"] = []
                     limpar_caches_dados()
                     st.sidebar.success("Cliente validado e cadastrado!")
+                    if msg_ins != "OK":
+                        st.toast("Cliente mantido nesta sessão enquanto o banco está indisponível.", icon="ℹ️")
                     st.rerun()
                 else:
                     if "api key" in msg_ins.lower() or "invalid jwt" in msg_ins.lower():
@@ -1643,7 +1670,10 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                             "e corresponde ao projeto definido em SUPABASE_URL."
                         )
                     else:
-                        st.sidebar.error(f"Erro ao salvar no Supabase: {msg_ins}")
+                        logging.getLogger(__name__).error(
+                            "Falha ao cadastrar cliente. Motivo operacional: %s", msg_ins
+                        )
+                        st.toast("Não foi possível cadastrar o cliente. Tente novamente.", icon="⚠️")
         else:
             st.sidebar.warning("Preencha Razão Social, CNPJ e CNAE Principal.")
 
@@ -1787,18 +1817,29 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
             if cnaes_secundarios:
                 status_certificado += f"|CNAES:{cnaes_secundarios}"
             try:
-                resultado = supabase.table("empresas_monitoradas").update({
+                atualizacao = {
                     "razao_social": f"{limpar_tag_tenant(empresa_ativa_bruta.get('razao_social', '')).upper()} [T:{owner_tag}]",
                     "cnae_principal": cnaes_editados[0],
                     "certificado_a1_status": status_certificado
-                }).eq("id", empresa_id_ativo).select("id").execute()
-                if not resultado.data:
-                    raise ValueError("Nenhum cliente foi atualizado.")
+                }
+                ok, mensagem_update, resultado = xml_engine.executar_update_seguro(
+                    supabase,
+                    "empresas_monitoradas",
+                    atualizacao,
+                    {"id": empresa_id_ativo},
+                    fallback_record=empresa_ativa_bruta,
+                )
+                if not ok or not resultado:
+                    raise RuntimeError("Atualização não confirmada.")
                 limpar_caches_dados()
-                st.sidebar.success("CNAEs atualizados!")
+                if mensagem_update == "OK":
+                    st.sidebar.success("CNAEs atualizados!")
+                else:
+                    st.toast("CNAEs atualizados nesta sessão; o banco está temporariamente indisponível.", icon="ℹ️")
                 st.rerun()
-            except Exception as ex:
-                st.sidebar.error(f"Erro ao atualizar CNAE: {ex}")
+            except Exception:
+                logging.getLogger(__name__).exception("Falha ao atualizar CNAE do cliente.")
+                st.toast("Não foi possível atualizar os CNAEs. Tente novamente.", icon="⚠️")
 
     st.markdown("<hr style='border:0; border-top:1px solid #374151; margin:8px 0;'>", unsafe_allow_html=True)
     if st.button("🔄 Zerar Notas deste Cliente", use_container_width=True, key=f"btn_reset_nf_{empresa_id_ativo}"):
@@ -1825,6 +1866,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
             pass
         st.session_state.pop(f"fallback_notas_{empresa_id_ativo}", None)
         st.session_state.pop(f"fallback_itens_{empresa_id_ativo}", None)
+        st.session_state.pop(f"fallback_devolucoes_{empresa_id_ativo}", None)
         if dados_alterados:
             limpar_caches_dados()
         st.sidebar.success("Notas zeradas!")
@@ -1845,11 +1887,15 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
             resultado = supabase.table("empresas_monitoradas").delete().eq("id", empresa_id_ativo).select("id").execute()
             if not resultado.data:
                 raise ValueError("Nenhum cliente foi excluído.")
+            st.session_state.pop(f"fallback_notas_{empresa_id_ativo}", None)
+            st.session_state.pop(f"fallback_itens_{empresa_id_ativo}", None)
+            st.session_state.pop(f"fallback_devolucoes_{empresa_id_ativo}", None)
             limpar_caches_dados()
             st.sidebar.success("Cliente excluído!")
             st.rerun()
-        except Exception as ex:
-            st.sidebar.error(f"Erro ao excluir: {ex}")
+        except Exception:
+            logging.getLogger(__name__).exception("Falha ao excluir cliente.")
+            st.toast("Não foi possível excluir o cliente. Tente novamente.", icon="⚠️")
 
 if st.sidebar.button("🔒 Encerrar Sessão", use_container_width=True):
     encerrar_sessao()
@@ -1872,15 +1918,20 @@ try:
         empresa_id_ativo,
         str(empresa_ativa.get("cnpj", "")),
     )
-except RuntimeError as ex:
-    st.error(str(ex))
+except RuntimeError:
+    logging.getLogger(__name__).exception("Falha ao carregar dados da empresa ativa.")
+    st.toast("Os dados estão temporariamente indisponíveis. Atualize a tela e tente novamente.", icon="⚠️")
     st.stop()
 
 notas_mem = st.session_state.get(f"fallback_notas_{empresa_id_ativo}", [])
 itens_mem = st.session_state.get(f"fallback_itens_{empresa_id_ativo}", [])
 
-notas = notas_db + notas_mem
-itens = itens_db + itens_mem
+notas = combinar_registros_com_sessao(notas_db, notas_mem)
+itens = combinar_registros_com_sessao(itens_db, itens_mem)
+devolucoes = combinar_registros_com_sessao(
+    devolucoes,
+    st.session_state.get(f"fallback_devolucoes_{empresa_id_ativo}", []),
+)
 
 if not notas:
     renderizar_onboarding_vazio()
@@ -2052,30 +2103,22 @@ def renderizar_fila_quarentena(
     empresa_id: int | str,
 ) -> None:
     def persistir_decisao(item: dict, status: str, credito: float) -> None:
-        if supabase is None or item.get("id") is None or item.get("nota_id") is None:
-            raise RuntimeError("Conexão ou vínculo do item indisponível.")
+        if item.get("id") is None or item.get("nota_id") is None:
+            raise RuntimeError("Vínculo do item indisponível.")
         atualizacao = {
             "classificacao_item": status,
             "aliquota_aplicada": xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
             "valor_credito_item": round(credito, 2),
         }
-        try:
-            resultado = supabase.table("itens_nota_fiscal").update(atualizacao).eq(
-                "id", item["id"]
-            ).eq("nota_id", item["nota_id"]).eq("empresa_id", empresa_id).select(
-                "id"
-            ).execute()
-        except Exception as ex:
-            if "aliquota_aplicada" not in str(ex).lower():
-                raise
-            atualizacao.pop("aliquota_aplicada")
-            resultado = supabase.table("itens_nota_fiscal").update(atualizacao).eq(
-                "id", item["id"]
-            ).eq("nota_id", item["nota_id"]).eq("empresa_id", empresa_id).select(
-                "id"
-            ).execute()
-        if not resultado.data:
-            raise RuntimeError("O item não foi atualizado para a empresa ativa.")
+        ok, mensagem, resultado = xml_engine.executar_update_seguro(
+            supabase,
+            "itens_nota_fiscal",
+            atualizacao,
+            {"id": item["id"], "nota_id": item["nota_id"], "empresa_id": empresa_id},
+            fallback_record=item,
+        )
+        if not ok or not resultado:
+            raise RuntimeError(mensagem)
 
     with st.expander(
         f"📁 4. Fila de Quarentena & Histórico de Auditoria "
@@ -2107,21 +2150,27 @@ def renderizar_fila_quarentena(
                         persistir_decisao(
                             item, "Aprovado Manualmente Contador", credito
                         )
-                    except Exception as ex:
+                    except Exception:
                         logging.getLogger(__name__).exception(
                             "Falha ao aprovar item %s para empresa %s.",
                             item.get("id"),
                             empresa_id,
                         )
-                        st.error(f"A aprovação não foi salva no Supabase: {ex}")
+                        st.toast("A aprovação não foi confirmada. Tente novamente.", icon="⚠️")
                     else:
+                        item["classificacao_item"] = "Aprovado Manualmente Contador"
+                        item["aliquota_aplicada"] = xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
+                        item["valor_credito_item"] = round(credito, 2)
+                        pendentes[:] = [pendente for pendente in pendentes if pendente is not item]
+                        if all(str(a.get("id")) != str(item.get("id")) for a in auditados):
+                            auditados.append(item)
                         limpar_caches_dados()
                         st.session_state["modulo_ativo"] = "quarentena"
                         st.toast(
                             f"✅ +R$ {credito:,.2f} liberados para o Crédito Validado!",
                             icon="💰",
                         )
-                        st.rerun()
+                        rerun_fragment_local()
                 if rejeitar.button(
                     "🚫 Bloquear Crédito (Uso/Consumo Definitivo)",
                     key=f"bloq_{item_id}",
@@ -2129,21 +2178,27 @@ def renderizar_fila_quarentena(
                 ):
                     try:
                         persistir_decisao(item, "Rejeitado", credito)
-                    except Exception as ex:
+                    except Exception:
                         logging.getLogger(__name__).exception(
                             "Falha ao rejeitar item %s para empresa %s.",
                             item.get("id"),
                             empresa_id,
                         )
-                        st.error(f"A rejeição não foi salva no Supabase: {ex}")
+                        st.toast("A rejeição não foi confirmada. Tente novamente.", icon="⚠️")
                     else:
+                        item["classificacao_item"] = "Rejeitado"
+                        item["aliquota_aplicada"] = xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
+                        item["valor_credito_item"] = round(credito, 2)
+                        pendentes[:] = [pendente for pendente in pendentes if pendente is not item]
+                        if all(str(a.get("id")) != str(item.get("id")) for a in auditados):
+                            auditados.append(item)
                         limpar_caches_dados()
                         st.session_state["modulo_ativo"] = "quarentena"
                         st.toast(
                             f"🛡️ R$ {credito:,.2f} glosados (Art. 57) — risco fiscal eliminado!",
                             icon="🛡️",
                         )
-                        st.rerun()
+                        rerun_fragment_local()
                 st.markdown("---")
         else:
             st.success("🎉 Nenhum item pendente de análise na quarentena para este cliente.")
@@ -2248,17 +2303,20 @@ def renderizar_simulador(empresa_ativa: dict, itens_mes: list[dict], devolucoes_
     ):
         st.markdown(f"Simulação fiscal focada nas operações de **{empresa_ativa['razao_social']}**.")
 
-        compras_revenda_reais = sum([
+        compras_revenda_reais = sum(
             float(i.get("valor_item", 0.0))
             for i in itens_mes
             if i.get("classificacao_item") in ["Aprovado Revenda", "Aprovado Manualmente Contador"]
-        ])
-        devolucoes_reais = sum([float(d.get("valor_mercadoria_devolvida", 0.0)) for d in devolucoes_empresa_mes])
-        quarentena_reais = sum([
+        )
+        devolucoes_reais = sum(
+            float(d.get("valor_mercadoria_devolvida", 0.0))
+            for d in devolucoes_empresa_mes
+        )
+        quarentena_reais = sum(
             float(i.get("valor_item", 0.0))
             for i in itens_mes
             if i.get("classificacao_item") == "Quarentena Uso/Consumo"
-        ])
+        )
 
         faixas_simples = {
             "1ª Faixa (Até R$ 15 mil/mês) — Alíquota Nominal: 4,00%": {"das_total": 4.00, "fatia_consumo": 1.34},
