@@ -162,7 +162,8 @@ def gerar_html_dossie_analitico(
     imposto_quarentena: float,
     imposto_estornado: float,
     notas_filtradas: list,
-    df_itens_filtrados: pd.DataFrame
+    df_itens_filtrados: pd.DataFrame,
+    valor_retido_split_payment: float = 0.0,
 ) -> str:
     data_emissao = datetime.now().strftime("%d/%m/%Y às %H:%M")
 
@@ -223,7 +224,7 @@ def gerar_html_dossie_analitico(
     h2 {{ color: #d4af37; font-size: 15px; text-transform: uppercase; letter-spacing: 1px; margin: 28px 0 12px 0; border-left: 3px solid #d4af37; padding-left: 10px; }}
     .sub {{ color: #9ca3af; font-size: 12px; line-height: 1.6; }}
     .badge-fechamento {{ background: #1f2937; border: 1px solid #d4af37; color: #f6c443; padding: 6px 12px; border-radius: 6px; font-size: 11px; font-weight: bold; text-transform: uppercase; }}
-    .grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 24px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 24px; }}
     .card {{ background: #1f2937; border: 1px solid #374151; border-radius: 8px; padding: 15px; }}
     .label {{ color: #9ca3af; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; font-weight: bold; }}
     .val-gold {{ color: #f6c443; font-size: 20px; font-weight: 800; margin-top: 6px; font-family: monospace; }}
@@ -262,6 +263,7 @@ def gerar_html_dossie_analitico(
         <div class="card"><div class="label">✅ Crédito Líquido Validado</div><div class="val-green">R$ {credito_validado:,.2f}</div></div>
         <div class="card"><div class="label">🔒 Retido em Quarentena</div><div class="val-amber">R$ {imposto_quarentena:,.2f}</div></div>
         <div class="card"><div class="label">↩️ Estornos Devolução</div><div class="val-red">R$ {imposto_estornado:,.2f}</div></div>
+        <div class="card"><div class="label">🏛️ Split Payment Retido</div><div class="val-red">R$ {valor_retido_split_payment:,.2f}</div></div>
     </div>
 
     <h2>1. Notas Fiscais Auditadas ({len(notas_filtradas)} documentos)</h2>
@@ -306,7 +308,8 @@ def renderizar_modulo_relatorio(
     imposto_quarentena,
     imposto_estornado,
     notas,
-    itens
+    itens,
+    valor_retido_split_payment=0.0,
 ):
     injetar_css_blindado_relatorio()
 
@@ -462,7 +465,8 @@ def renderizar_modulo_relatorio(
         st.markdown("---")
         html_analitico = gerar_html_dossie_analitico(
             empresa_ativa, modalidade_fechamento, imposto_bruto_mes, credito_validado_tempo_real,
-            imposto_quarentena, imposto_estornado, notas_filtradas, df_filtrado
+            imposto_quarentena, imposto_estornado, notas_filtradas, df_filtrado,
+            valor_retido_split_payment,
         )
         csv_bytes = gerar_csv_auditado(df_filtrado)
 

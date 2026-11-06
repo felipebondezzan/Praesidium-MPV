@@ -1,10 +1,19 @@
 import hashlib
+import hmac
+import json
 import logging
+import math
 import random
 import re
+import threading
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from datetime import timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from email.utils import parsedate_to_datetime
+from urllib.parse import urljoin, urlparse
 import requests
 import streamlit as st
 import pandas as pd
@@ -13,6 +22,11 @@ VERSAO_REGRA_TRIBUTARIA = "LC 214/2025 - Art. 47/57 v1.0"
 ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA = 0.265
 TAG_TENANT_PATTERN = re.compile(r"\s*\[T:[^\]]+\]", re.IGNORECASE)
 CHAVE_ACESSO_PATTERN = re.compile(r"\d{44}")
+DESCRICAO_USO_INTERNO_PATTERN = re.compile(
+    r"\b(?:uso\s+interno|consumo\s+interno|uso\s+proprio|uso\s+pr[oó]prio|"
+    r"ativo\s+imobilizado|equipamento\s+administrativo)\b",
+    re.IGNORECASE,
+)
 CODIGO_ERRO_PATTERN = re.compile(r"""['"]code['"]\s*:\s*['"]([A-Z0-9]+)['"]""")
 COLUNA_ERRO_PATTERNS = (
     re.compile(r"""column\s+['"]([^'"]+)['"]""", re.IGNORECASE),
@@ -20,6 +34,328 @@ COLUNA_ERRO_PATTERNS = (
 )
 
 _limpador_cache_dados = None
+_gateway_rate_lock = threading.Lock()
+_gateway_last_request_by_tenant: dict[str, float] = {}
+_gateway_request_interval = 1.0
+_gateway_max_retries = 2
+_CNPJ_PATTERN = re.compile(r"\D")
+
+
+def _ler_configuracao_secreta(nome: str) -> str:
+    try:
+        valor = st.secrets[nome]
+    except Exception:
+        valor = None
+    if valor:
+        return str(valor).strip()
+    import os
+
+    return (os.environ.get(nome) or "").strip()
+
+
+class FiscalGatewayClient:
+    """Pool HTTP limitado por tenant para gateways fiscais autorizados.
+
+    Não consulta a SEFAZ diretamente nem usa proxies rotativos. O contrato
+    específico do fornecedor fica a cargo do caminho/configuração do gateway.
+    """
+
+    def __init__(self, base_url: str, api_key: str):
+        parsed_url = urlparse(base_url)
+        if parsed_url.scheme != "https" or not parsed_url.netloc:
+            raise ValueError("A URL do gateway fiscal deve usar HTTPS.")
+        self.base_url = base_url.rstrip("/") + "/"
+        self.api_key = api_key
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=8,
+            pool_maxsize=16,
+            max_retries=0,
+        )
+        self.session.mount("https://", adapter)
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        tenant_id: str,
+        authorized_cnpjs: list[str],
+        *,
+        json_body: dict | None = None,
+        idempotency_key: str | None = None,
+        timeout: tuple[float, float] = (3.05, 15.0),
+    ) -> requests.Response:
+        metodo = method.upper()
+        if metodo not in {"GET", "POST"}:
+            raise ValueError("O gateway fiscal aceita somente GET ou POST.")
+        if metodo == "POST" and (not json_body or not idempotency_key):
+            raise ValueError("O POST do gateway exige corpo JSON e chave idempotente.")
+        cnpjs = sorted({
+            _CNPJ_PATTERN.sub("", str(cnpj))
+            for cnpj in authorized_cnpjs
+            if len(_CNPJ_PATTERN.sub("", str(cnpj))) == 14
+        })
+        if not cnpjs:
+            raise ValueError("Nenhum CNPJ autorizado foi informado ao gateway.")
+        relative_path = str(path or "").lstrip("/")
+        url = urljoin(self.base_url, relative_path)
+        if urlparse(url).netloc != urlparse(self.base_url).netloc:
+            raise ValueError("O caminho do gateway deve permanecer no host configurado.")
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+            "X-Tenant-ID": str(tenant_id),
+        }
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+        ultimo_erro = None
+        for tentativa in range(_gateway_max_retries + 1):
+            with _gateway_rate_lock:
+                agora = time.monotonic()
+                anterior = _gateway_last_request_by_tenant.get(str(tenant_id), 0.0)
+                instante = max(agora, anterior + _gateway_request_interval)
+                _gateway_last_request_by_tenant[str(tenant_id)] = instante
+            if instante > agora:
+                time.sleep(instante - agora)
+
+            try:
+                resposta = self.session.request(
+                    metodo,
+                    url,
+                    headers=headers,
+                    params={"cnpjs": ",".join(cnpjs)},
+                    json=json_body,
+                    timeout=timeout,
+                )
+            except requests.RequestException as erro:
+                ultimo_erro = erro
+                if tentativa >= _gateway_max_retries:
+                    raise
+                time.sleep(0.25 * (2 ** tentativa))
+                continue
+
+            if resposta.status_code not in {429, 502, 503, 504}:
+                resposta.raise_for_status()
+                return resposta
+            if tentativa >= _gateway_max_retries:
+                resposta.raise_for_status()
+            retry_after = resposta.headers.get("Retry-After", "")
+            try:
+                espera_retry = min(2.0, max(0.0, float(retry_after)))
+            except ValueError:
+                try:
+                    data_retry = parsedate_to_datetime(retry_after)
+                    espera_retry = min(
+                        2.0,
+                        max(0.0, (data_retry - datetime.now(timezone.utc)).total_seconds()),
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    espera_retry = 0.25 * (2 ** tentativa)
+            time.sleep(espera_retry)
+
+        if ultimo_erro:
+            raise ultimo_erro
+        raise requests.RequestException("Falha na comunicação com o gateway fiscal.")
+
+
+@st.cache_resource(show_spinner=False)
+def obter_cliente_gateway_fiscal() -> FiscalGatewayClient:
+    base_url = _ler_configuracao_secreta("FISCAL_GATEWAY_URL")
+    api_key = _ler_configuracao_secreta("FISCAL_GATEWAY_API_KEY")
+    if not base_url or not api_key:
+        raise ValueError("Gateway fiscal não configurado.")
+    return FiscalGatewayClient(base_url, api_key)
+
+
+def requisitar_documentos_gateway_fiscal(
+    path: str,
+    empresa_id_ativa,
+    empresa_ativa: dict,
+    cnpjs_adicionais_autorizados: list[str] | None = None,
+) -> requests.Response:
+    if str(empresa_ativa.get("id", "")) != str(empresa_id_ativa):
+        raise ValueError("A empresa ativa não corresponde à seleção atual.")
+    cnpjs_autorizados = obter_cnpjs_autorizados_empresa(
+        empresa_ativa,
+        cnpjs_adicionais_autorizados,
+    )
+    cliente = obter_cliente_gateway_fiscal()
+    return cliente.request(
+        "GET",
+        path,
+        str(empresa_id_ativa),
+        sorted(cnpjs_autorizados),
+    )
+
+
+def processar_webhook_split_payment(
+    supabase,
+    corpo_bruto: bytes,
+    assinatura: str,
+) -> tuple[bool, str, dict]:
+    """Valida e grava evento assinado; pronto para ser chamado por endpoint ASGI."""
+    segredo = _ler_configuracao_secreta("SPLIT_PAYMENT_WEBHOOK_SECRET")
+    if not segredo:
+        return False, "Webhook de Split Payment não configurado.", {}
+    if not corpo_bruto:
+        return False, "O corpo do evento está vazio.", {}
+    if len(corpo_bruto) > 1_000_000:
+        return False, "O evento excede o limite de tamanho permitido.", {}
+    assinatura_recebida = str(assinatura or "").strip()
+    if assinatura_recebida.lower().startswith("sha256="):
+        assinatura_recebida = assinatura_recebida.split("=", 1)[1]
+    assinatura_esperada = hmac.new(
+        segredo.encode("utf-8"),
+        corpo_bruto,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(assinatura_recebida.lower(), assinatura_esperada):
+        return False, "Assinatura do evento inválida.", {}
+
+    try:
+        evento = json.loads(corpo_bruto.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False, "Formato do evento inválido.", {}
+    if not isinstance(evento, dict):
+        return False, "Formato do evento inválido.", {}
+
+    evento_id = str(evento.get("event_id") or evento.get("id") or "").strip()
+    empresa_id = evento.get("empresa_id")
+    cnpj_evento = _CNPJ_PATTERN.sub("", str(evento.get("cnpj") or ""))
+    try:
+        valor_retido_decimal = Decimal(str(evento.get("valor_retido")))
+        valor_bruto_decimal = Decimal(
+            str(evento.get("valor_bruto") or evento.get("gross_amount") or 0.0)
+        )
+    except (InvalidOperation, TypeError, ValueError):
+        return False, "Os valores financeiros do evento são inválidos.", {}
+    ocorrido_em = str(evento.get("ocorrido_em") or evento.get("occurred_at") or "").strip()
+    if (
+        not evento_id
+        or len(evento_id) > 200
+        or empresa_id is None
+        or not str(empresa_id).strip()
+        or len(cnpj_evento) != 14
+        or not ocorrido_em
+        or len(str(evento.get("transaction_id") or evento_id)) > 200
+        or len(str(evento.get("event_type") or "split_payment.retained")) > 100
+        or not valor_retido_decimal.is_finite()
+        or valor_retido_decimal <= 0
+        or valor_retido_decimal > Decimal("9999999999999999.99")
+        or not valor_bruto_decimal.is_finite()
+        or valor_bruto_decimal < 0
+        or valor_bruto_decimal > Decimal("9999999999999999.99")
+    ):
+        return False, "O evento não contém os dados financeiros obrigatórios.", {}
+    try:
+        data_evento = datetime.fromisoformat(ocorrido_em.replace("Z", "+00:00"))
+    except ValueError:
+        return False, "A data do evento é inválida.", {}
+    if data_evento.tzinfo is None:
+        data_evento = data_evento.replace(tzinfo=timezone.utc)
+
+    if str(evento.get("currency") or "BRL").upper() != "BRL":
+        return False, "Moeda do evento não suportada.", {}
+    if valor_bruto_decimal > 0 and valor_retido_decimal > valor_bruto_decimal:
+        return False, "A retenção informada supera o valor bruto da transação.", {}
+    if supabase is None:
+        return False, "Registro do evento indisponível no momento.", {}
+    try:
+        resposta_empresa = (
+            supabase.table("empresas_monitoradas")
+            .select("*")
+            .eq("id", empresa_id)
+            .limit(1)
+            .execute()
+        )
+        empresas = resposta_empresa.data or []
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao validar empresa do evento de Split Payment."
+        )
+        return False, "Não foi possível validar a empresa do evento.", {}
+    if not empresas:
+        return False, "Empresa do evento não encontrada.", {}
+    empresa = empresas[0]
+    if str(empresa.get("id")) != str(empresa_id):
+        return False, "Empresa do evento não corresponde ao cadastro informado.", {}
+    try:
+        resposta_cnpjs = (
+            supabase.table("empresa_cnpjs_autorizados")
+            .select("cnpj")
+            .eq("empresa_id", empresa["id"])
+            .execute()
+        )
+        empresa["cnpjs_autorizados"] = [
+            registro.get("cnpj", "")
+            for registro in (resposta_cnpjs.data or [])
+        ]
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao carregar CNPJs secundários autorizados da empresa %s.",
+            empresa_id,
+        )
+    if cnpj_evento not in obter_cnpjs_autorizados_empresa(empresa):
+        return False, "CNPJ do evento não está autorizado para a empresa.", {}
+
+    payload = {
+        "empresa_id": empresa["id"],
+        "event_id": evento_id,
+        "transaction_id": str(evento.get("transaction_id") or evento_id),
+        "event_type": str(evento.get("event_type") or "split_payment.retained"),
+        "gross_amount": float(
+            valor_bruto_decimal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        ),
+        "retained_amount": float(
+            valor_retido_decimal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        ),
+        "currency": str(evento.get("currency") or "BRL")[:3].upper(),
+        "occurred_at": data_evento.isoformat(),
+        "payload_sha256": hashlib.sha256(corpo_bruto).hexdigest(),
+    }
+    payload = sanitizar_payload_supabase("split_payment_events", payload)
+
+    try:
+        resultado = (
+            supabase.table("split_payment_events")
+            .insert(payload)
+            .select("*")
+            .execute()
+        )
+        dados = resultado.data or []
+        if dados:
+            limpar_caches_dados()
+            return True, "Evento de retenção registrado.", dados[0]
+        return False, "Não foi possível confirmar o evento de retenção.", {}
+    except Exception as erro:
+        if _codigo_erro_supabase(erro) == "23505":
+            try:
+                existente = (
+                    supabase.table("split_payment_events")
+                    .select("*")
+                    .eq("empresa_id", empresa_id)
+                    .eq("event_id", evento_id)
+                    .limit(1)
+                    .execute()
+                )
+                registros = existente.data or []
+                if registros and (
+                    round(float(registros[0].get("retained_amount", 0.0)), 2)
+                    == payload["retained_amount"]
+                    and str(registros[0].get("payload_sha256", ""))
+                    == payload["payload_sha256"]
+                ):
+                    return True, "Evento já processado anteriormente.", registros[0]
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Falha ao confirmar a idempotência do evento de Split Payment."
+                )
+        logging.getLogger(__name__).exception(
+            "Falha ao persistir evento de Split Payment para empresa %s.",
+            empresa_id,
+        )
+        return False, "Não foi possível registrar o evento de retenção.", {}
 
 
 def registrar_limpador_cache_dados(func) -> None:
@@ -142,6 +478,30 @@ CNAES_VALIDOS_FALLBACK = {
 
 def limpar_tag_tenant_empresa(nome_empresa: str) -> str:
     return TAG_TENANT_PATTERN.sub("", str(nome_empresa)).strip()
+
+
+def obter_cnpjs_autorizados_empresa(
+    empresa_ativa: dict,
+    cnpjs_adicionais: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> set[str]:
+    autorizados = {
+        _CNPJ_PATTERN.sub("", str(empresa_ativa.get("cnpj", "")))
+    }
+    configurados = empresa_ativa.get("cnpjs_autorizados", [])
+    if isinstance(configurados, str):
+        configurados = re.split(r"[,;\s]+", configurados)
+    if not isinstance(configurados, (list, tuple, set)):
+        configurados = []
+    configurados = list(configurados) + list(cnpjs_adicionais or [])
+    autorizados.update(
+        _CNPJ_PATTERN.sub("", str(cnpj))
+        for cnpj in configurados
+        if len(_CNPJ_PATTERN.sub("", str(cnpj))) == 14
+    )
+    return {
+        cnpj for cnpj in autorizados
+        if len(cnpj) == 14
+    }
 
 
 # ==========================================
@@ -302,6 +662,23 @@ def sanitizar_payload_supabase(tabela: str, payload, parcial: bool = False):
             for coluna in obrigatorios:
                 if atual.get(coluna) is None:
                     atual[coluna] = _valor_padrao_coluna(tabela, coluna, atual)
+        elif tabela == "split_payment_events" and not parcial:
+            obrigatorios_split = {
+                "empresa_id": "",
+                "event_id": "",
+                "transaction_id": "",
+                "event_type": "split_payment.retained",
+                "gross_amount": 0.0,
+                "retained_amount": 0.0,
+                "currency": "BRL",
+                "occurred_at": datetime.now().astimezone().isoformat(),
+                "payload_sha256": "",
+            }
+            for coluna, padrao in obrigatorios_split.items():
+                if atual.get(coluna) is None:
+                    atual[coluna] = padrao
+            for coluna in ("gross_amount", "retained_amount"):
+                atual[coluna] = _float_seguro(atual.get(coluna), 0.0)
         sanitizados.append(atual)
     return sanitizados if isinstance(payload, list) else sanitizados[0]
 
@@ -371,16 +748,24 @@ def _guardar_fallback(tabela: str, payload, operacao: str = "insert", filtros: d
         identificador = registro.get("id")
         encontrado = False
         for indice, existente in enumerate(existentes):
-            corresponde = (
+            filtros_correspondem = all(
+                str(existente.get(k)) == str(v)
+                for k, v in (filtros or {}).items()
+            )
+            mesmo_id = (
                 identificador is not None
                 and str(existente.get("id")) == str(identificador)
-            ) or (
-                operacao == "update"
-                and all(str(existente.get(k)) == str(v) for k, v in (filtros or {}).items())
+            )
+            corresponde = (
+                (mesmo_id or filtros_correspondem)
+                and (operacao != "update" or filtros_correspondem)
             )
             if corresponde:
                 existentes[indice] = {**existente, **registro}
                 guardados.append(existentes[indice])
+                encontrado = True
+                break
+            if operacao == "update" and mesmo_id:
                 encontrado = True
                 break
         if not encontrado:
@@ -440,6 +825,31 @@ def executar_insert_seguro(
             codigo = _codigo_erro_supabase(erro)
             coluna = _coluna_erro_supabase(erro)
             colunas_presentes = set(dados[0] if isinstance(dados, list) and dados else dados)
+            if codigo == "23505" and tabela == "conciliacao_devolucoes":
+                registro = registros[0] if registros else {}
+                chave_devolucao = registro.get("chave_nota_devolucao")
+                empresa_id = registro.get("empresa_id")
+                if chave_devolucao and empresa_id is not None:
+                    try:
+                        existente = (
+                            supabase.table(tabela)
+                            .select("*")
+                            .eq("empresa_id", empresa_id)
+                            .eq("chave_nota_devolucao", chave_devolucao)
+                            .limit(1)
+                            .execute()
+                        )
+                        if existente.data:
+                            return (
+                                True,
+                                "Devolução já registrada anteriormente.",
+                                existente.data,
+                            )
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "Falha ao confirmar a idempotência da devolução."
+                        )
+                return False, "A devolução já foi registrada ou conflita com outro lançamento.", []
             if codigo == "23502" and coluna:
                 if coluna in colunas_corrigidas:
                     break
@@ -518,7 +928,7 @@ def executar_update_seguro(
             resultado = consulta.select("*").execute()
             if resultado.data:
                 return True, "OK", resultado.data
-            break
+            return False, "A decisão já foi processada ou o item não está mais pendente.", []
         except Exception as erro:
             codigo = _codigo_erro_supabase(erro)
             coluna = _coluna_erro_supabase(erro)
@@ -544,8 +954,8 @@ def executar_update_seguro(
             break
 
     fallback = dict(fallback_record or {})
-    fallback.update(dados)
     fallback.update(filtros)
+    fallback.update(dados)
     local = _guardar_fallback(tabela, fallback, "update", filtros)
     if local:
         return True, "Alteração mantida temporariamente nesta sessão.", local
@@ -592,7 +1002,8 @@ def classificar_item_inteligente(
     vprod: float,
     crt_emitente: str,
     cnaes_cliente_str: str,
-    em_contingencia: bool
+    em_contingencia: bool,
+    descricao: str = "",
 ) -> tuple[str, float, float]:
     ncm_limpo = "".join(filter(str.isdigit, str(ncm))).ljust(8, "0")[:8]
     cfop_limpo = "".join(filter(str.isdigit, str(cfop)))
@@ -610,6 +1021,9 @@ def classificar_item_inteligente(
         return "Quarentena Uso/Consumo", 0.0, 0.0
 
     if cfop_limpo in {"1556", "2556", "5556", "6556", "1551", "2551", "5551", "6551"}:
+        return "Quarentena Uso/Consumo", 0.0, 0.0
+
+    if DESCRICAO_USO_INTERNO_PATTERN.search(str(descricao)):
         return "Quarentena Uso/Consumo", 0.0, 0.0
 
     lista_cnaes = [
@@ -640,11 +1054,21 @@ def classificar_item_inteligente(
         credito = round(vprod * aliquota_base, 2)
         return "Aprovado Revenda", aliquota_base, credito
 
-    if cfop_limpo in {"1102", "2102", "5102", "6102", "1101", "2101", "5101", "6101", "5405"} and qcom >= 3:
-        credito = round(vprod * aliquota_base, 2)
-        return "Aprovado Revenda", aliquota_base, credito
-
     return "Quarentena Uso/Consumo", 0.0, 0.0
+
+
+def _justificativa_classificacao_item(
+    descricao: str,
+    status: str,
+) -> str:
+    if DESCRICAO_USO_INTERNO_PATTERN.search(descricao):
+        return "Art. 57: descrição indica uso/consumo interno ou ativo imobilizado."
+    if status == "Quarentena Uso/Consumo":
+        return (
+            "Art. 47/57: compatibilidade NCM/CNAE não comprovada, operação de uso/consumo "
+            "ou documentação fiscal requer análise do contador."
+        )
+    return "Art. 47: item compatível com CNAE autorizado e NCM previsto no motor tributário."
 
 
 # ==========================================
@@ -809,7 +1233,8 @@ def _xml_texto(elemento, nome: str, padrao: str = "") -> str:
 
 def _float_seguro(valor, padrao: float) -> float:
     try:
-        return float(valor)
+        convertido = float(valor)
+        return convertido if math.isfinite(convertido) else padrao
     except (TypeError, ValueError):
         return padrao
 
@@ -841,20 +1266,20 @@ def _preparar_xml_nfe(
     xml_bytes: bytes,
     empresa_id_ativo,
     empresa_ativa: dict,
-    ignorar_trava_cnpj: bool,
     hashes_existentes: set[str],
     chaves_existentes: set[str],
     hashes_lote: set[str],
     chaves_lote: set[str],
+    cnpjs_autorizados: set[str] | None = None,
 ) -> tuple[dict | None, list[dict], str]:
     if empresa_id_ativo is None or str(empresa_id_ativo).strip() == "":
         return None, [], "Importação cancelada: a empresa ativa não possui um ID válido."
     if str(empresa_ativa.get("id")) != str(empresa_id_ativo):
         return None, [], "Importação cancelada: o ID da empresa ativa não corresponde ao cadastro selecionado."
 
-    cnpj_empresa_ativa = "".join(filter(str.isdigit, str(empresa_ativa.get("cnpj", ""))))
-    if not cnpj_empresa_ativa:
-        return None, [], "Importação cancelada: a empresa ativa não possui CNPJ cadastrado."
+    cnpjs_empresa = cnpjs_autorizados or obter_cnpjs_autorizados_empresa(empresa_ativa)
+    if not cnpjs_empresa:
+        return None, [], "Importação cancelada: não há CNPJ autorizado configurado."
 
     hash_sha256 = hashlib.sha256(xml_bytes).hexdigest()
     notas_locais = st.session_state.get(f"fallback_notas_{empresa_id_ativo}", [])
@@ -888,13 +1313,11 @@ def _preparar_xml_nfe(
     total = _xml_filho(_xml_filho(inf_nfe, "total"), "ICMSTot")
     cnpj_emit = "".join(filter(str.isdigit, _xml_texto(emit, "CNPJ", _xml_texto(emit, "CPF", _CNPJ_FORNECEDOR_PADRAO))))
     cnpj_dest = "".join(filter(str.isdigit, _xml_texto(dest, "CNPJ", _xml_texto(dest, "CPF"))))
-    cnpj_cliente_ativo = cnpj_empresa_ativa
-
-    if not ignorar_trava_cnpj and cnpj_dest and cnpj_cliente_ativo and cnpj_dest != cnpj_cliente_ativo:
+    if not cnpj_dest or cnpj_dest not in cnpjs_empresa:
         return (
             None,
             [],
-            f"Trava de Segurança: O XML pertence ao destinatário {cnpj_dest}, diferente do cliente ativo ({cnpj_cliente_ativo})."
+            "Trava de segurança: o destinatário da NF-e não pertence à lista de CNPJs autorizados para esta empresa."
         )
 
     tp_emis = _xml_texto(ide, "tpEmis", "1")
@@ -932,7 +1355,6 @@ def _preparar_xml_nfe(
 
     hashes_lote.add(hash_sha256)
     chaves_lote.add(chave_raw)
-    cnaes_cliente = str(empresa_ativa.get("cnae_principal", "4711302"))
     itens = []
     for det in _xml_filhos(inf_nfe, "det"):
         prod = _xml_filho(det, "prod")
@@ -941,31 +1363,309 @@ def _preparar_xml_nfe(
         cfop = _xml_texto(prod, "CFOP", "5102")
         qcom = _float_seguro(_xml_texto(prod, "qCom", "1"), 1.0)
         vprod = _float_seguro(_xml_texto(prod, "vProd", "0"), 0.0)
-
-        classificacao, aliq, vl_cred = classificar_item_inteligente(
-            ncm=ncm,
-            cfop=cfop,
-            qcom=qcom,
-            vprod=vprod,
-            crt_emitente=crt_emitente,
-            cnaes_cliente_str=cnaes_cliente,
-            em_contingencia=em_contingencia
-        )
-        if classificacao == "Quarentena Uso/Consumo":
-            aliq = ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
-
         itens.append({
             "empresa_id": empresa_id_ativo,
             "descricao": xprod,
             "ncm": ncm,
             "cfop": cfop,
+            "quantidade_comercial": qcom,
             "valor_item": round(vprod, 2),
-            "aliquota_aplicada": aliq,
-            "valor_credito_item": vl_cred,
-            "classificacao_item": classificacao
         })
 
     return payload_nf, itens, ""
+
+
+def processar_devolucao_nfe_xml(
+    xml_bytes: bytes,
+    supabase,
+    empresa_id_ativo,
+    empresa_ativa: dict,
+    cnpjs_autorizados: set[str] | None = None,
+) -> tuple[bool, str]:
+    try:
+        raiz = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return False, "XML de devolução inválido."
+
+    nfe = _xml_filho(raiz, "NFe") or raiz
+    inf_nfe = _xml_filho(nfe, "infNFe")
+    ide = _xml_filho(inf_nfe, "ide")
+    if inf_nfe is None or _xml_texto(ide, "finNFe") != "4":
+        return False, "O arquivo não contém uma NF-e de devolução."
+
+    empresa_id_xml = str(empresa_ativa.get("id", ""))
+    if (
+        empresa_id_ativo is None
+        or not empresa_id_xml
+        or empresa_id_xml != str(empresa_id_ativo)
+    ):
+        return False, "Devolução cancelada: a empresa ativa não corresponde ao cadastro."
+
+    cnpjs_permitidos = cnpjs_autorizados or obter_cnpjs_autorizados_empresa(empresa_ativa)
+    emitente = _xml_filho(inf_nfe, "emit")
+    cnpj_emitente = _CNPJ_PATTERN.sub("", _xml_texto(emitente, "CNPJ"))
+    if not cnpj_emitente or cnpj_emitente not in cnpjs_permitidos:
+        return False, "Devolução bloqueada: o emitente não pertence à empresa autorizada."
+
+    id_nfe = str(inf_nfe.attrib.get("Id", "")).replace("NFe", "").strip()
+    if not CHAVE_ACESSO_PATTERN.fullmatch(id_nfe):
+        return False, "Devolução bloqueada: chave de acesso inválida."
+    protocolo = _xml_filho(raiz, "protNFe")
+    inf_protocolo = _xml_filho(protocolo, "infProt")
+    chave_protocolo = _xml_texto(inf_protocolo, "chNFe")
+    if _xml_texto(inf_protocolo, "cStat") != "100" or chave_protocolo != id_nfe:
+        return (
+            False,
+            "Devolução bloqueada: o XML não contém protocolo de autorização SEFAZ correspondente.",
+        )
+
+    referencias = _xml_filhos(ide, "NFref")
+    chave_original = ""
+    for referencia in referencias:
+        valor_referencia = _xml_texto(referencia, "refNFe")
+        if CHAVE_ACESSO_PATTERN.fullmatch(valor_referencia):
+            chave_original = valor_referencia
+            break
+    if not chave_original:
+        return False, "Devolução bloqueada: não foi encontrada a chave da nota original."
+
+    nota_original = None
+    itens_originais = []
+    devolucoes_existentes = []
+    if supabase is not None:
+        try:
+            resposta_nota = (
+                supabase.table("notas_fiscais_recebidas")
+                .select("*")
+                .eq("empresa_id", empresa_id_ativo)
+                .eq("chave_acesso", chave_original)
+                .limit(1)
+                .execute()
+            )
+            notas_encontradas = resposta_nota.data or []
+            nota_original = notas_encontradas[0] if notas_encontradas else None
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao localizar nota original da devolução na empresa %s.",
+                empresa_id_ativo,
+            )
+
+    notas_fallback = st.session_state.get(
+        f"fallback_notas_{empresa_id_ativo}",
+        [],
+    )
+    if nota_original is None:
+        nota_original = next(
+            (
+                nota for nota in notas_fallback
+                if str(nota.get("chave_acesso", "")) == chave_original
+                and str(nota.get("empresa_id", "")) == str(empresa_id_ativo)
+            ),
+            None,
+        )
+    if nota_original is None:
+        return False, "Devolução bloqueada: a nota original não está registrada para esta empresa."
+
+    nota_original_id = nota_original.get("id")
+    if supabase is not None and nota_original_id is not None:
+        try:
+            resposta_itens = (
+                supabase.table("itens_nota_fiscal")
+                .select("*")
+                .eq("empresa_id", empresa_id_ativo)
+                .eq("nota_id", nota_original_id)
+                .execute()
+            )
+            itens_originais = resposta_itens.data or []
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao localizar itens da nota original %s.",
+                nota_original_id,
+            )
+    if not itens_originais:
+        itens_originais = [
+            item
+            for item in st.session_state.get(f"fallback_itens_{empresa_id_ativo}", [])
+            if str(item.get("nota_id", "")) == str(nota_original_id)
+            and str(item.get("empresa_id", "")) == str(empresa_id_ativo)
+        ]
+    if not itens_originais:
+        return False, "Devolução bloqueada: não há itens auditados na nota original."
+
+    if supabase is not None:
+        try:
+            existente = (
+                supabase.table("conciliacao_devolucoes")
+                .select("id")
+                .eq("empresa_id", empresa_id_ativo)
+                .eq("chave_nota_devolucao", id_nfe)
+                .limit(1)
+                .execute()
+            )
+            if existente.data:
+                return True, "Esta devolução já foi processada anteriormente."
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao verificar duplicidade da chave de devolução."
+            )
+    if any(
+        str(devolucao.get("chave_nota_devolucao", "")) == id_nfe
+        and str(devolucao.get("empresa_id", "")) == str(empresa_id_ativo)
+        for devolucao in st.session_state.get(
+            f"fallback_devolucoes_{empresa_id_ativo}",
+            [],
+        )
+    ):
+        return True, "Esta devolução já foi processada anteriormente."
+
+    total_original = _float_seguro(nota_original.get("valor_total_nf"), 0.0)
+    if total_original <= 0:
+        total_original = sum(
+            _float_seguro(item.get("valor_item", item.get("valor_total_bruto")), 0.0)
+            for item in itens_originais
+        )
+    total_devolvido = 0.0
+    devolucao_por_ncm: dict[str, float] = {}
+    for detalhe in _xml_filhos(inf_nfe, "det"):
+        produto = _xml_filho(detalhe, "prod")
+        ncm = "".join(filter(str.isdigit, _xml_texto(produto, "NCM")))
+        valor = _float_seguro(_xml_texto(produto, "vProd"), 0.0)
+        if ncm and valor > 0:
+            total_devolvido += valor
+            devolucao_por_ncm[ncm] = devolucao_por_ncm.get(ncm, 0.0) + valor
+
+    total_devolvido = round(
+        total_devolvido or _float_seguro(
+            _xml_texto(
+                _xml_filho(_xml_filho(inf_nfe, "total"), "ICMSTot"),
+                "vNF",
+            ),
+            0.0,
+        ),
+        2,
+    )
+    if total_devolvido <= 0 or total_original <= 0:
+        return False, "Devolução bloqueada: os valores da nota não permitem calcular o estorno."
+
+    total_estornavel = 0.0
+    for item in itens_originais:
+        if item.get("classificacao_item") not in {
+            "Aprovado Revenda",
+            "Aprovado Manualmente Contador",
+        }:
+            continue
+        total_estornavel += max(
+            0.0,
+            _float_seguro(item.get("valor_credito_item"), 0.0),
+        )
+
+    if devolucao_por_ncm:
+        credito_estornado = 0.0
+        for ncm, valor_devolvido_ncm in devolucao_por_ncm.items():
+            itens_ncm = [
+                item for item in itens_originais
+                if "".join(filter(str.isdigit, str(item.get("ncm", "")))) == ncm
+                and item.get("classificacao_item") in {
+                    "Aprovado Revenda",
+                    "Aprovado Manualmente Contador",
+                }
+            ]
+            valor_original_ncm = sum(
+                max(
+                    0.0,
+                    _float_seguro(
+                        item.get("valor_item", item.get("valor_total_bruto")),
+                        0.0,
+                    ),
+                )
+                for item in itens_ncm
+            )
+            credito_ncm = sum(
+                max(0.0, _float_seguro(item.get("valor_credito_item"), 0.0))
+                for item in itens_ncm
+            )
+            if valor_original_ncm > 0:
+                credito_estornado += credito_ncm * min(
+                    1.0,
+                    valor_devolvido_ncm / valor_original_ncm,
+                )
+    else:
+        credito_estornado = total_estornavel * min(1.0, total_devolvido / total_original)
+
+    if not devolucao_por_ncm:
+        credito_estornado = min(
+            total_estornavel,
+            total_estornavel * min(1.0, total_devolvido / total_original),
+        )
+    credito_estornado = round(min(total_estornavel, credito_estornado), 2)
+
+    if supabase is not None:
+        try:
+            resposta_devolucoes = (
+                supabase.table("conciliacao_devolucoes")
+                .select("valor_mercadoria_devolvida,credito_estornado")
+                .eq("empresa_id", empresa_id_ativo)
+                .eq("nota_original_id", nota_original_id)
+                .execute()
+            )
+            devolucoes_existentes = resposta_devolucoes.data or []
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao calcular o saldo estornável das devoluções anteriores."
+            )
+    if not devolucoes_existentes:
+        devolucoes_existentes = [
+            devolucao
+            for devolucao in st.session_state.get(
+                f"fallback_devolucoes_{empresa_id_ativo}",
+                [],
+            )
+            if str(devolucao.get("nota_original_id", "")) == str(nota_original_id)
+        ]
+    valor_ja_devolvido = sum(
+        max(0.0, _float_seguro(item.get("valor_mercadoria_devolvida"), 0.0))
+        for item in devolucoes_existentes
+    )
+    credito_ja_estornado = sum(
+        max(0.0, _float_seguro(item.get("credito_estornado"), 0.0))
+        for item in devolucoes_existentes
+    )
+    valor_restante = max(0.0, total_original - valor_ja_devolvido)
+    valor_devolvido_registrado = min(total_devolvido, valor_restante)
+    if total_devolvido > 0 and valor_devolvido_registrado < total_devolvido:
+        credito_estornado *= valor_devolvido_registrado / total_devolvido
+    credito_estornado = min(
+        credito_estornado,
+        max(0.0, total_estornavel - credito_ja_estornado),
+    )
+
+    payload_devolucao = {
+        "empresa_id": empresa_id_ativo,
+        "nota_original_id": nota_original_id,
+        "chave_nota_devolucao": id_nfe,
+        "valor_mercadoria_devolvida": round(valor_devolvido_registrado, 2),
+        "credito_estornado": round(credito_estornado, 2),
+        "data_devolucao": datetime.now().astimezone().isoformat(),
+        "motivo_ajuste": (
+            f"NF-e de devolução finNFe=4; referência à chave {chave_original}; "
+            "estorno proporcional por NCM."
+        ),
+    }
+    if payload_devolucao["valor_mercadoria_devolvida"] <= 0:
+        return True, "O valor da mercadoria já foi integralmente devolvido."
+    ok, _, _ = inserir_seguro_supabase(
+        supabase,
+        "conciliacao_devolucoes",
+        payload_devolucao,
+    )
+    if not ok:
+        return False, "Não foi possível registrar o estorno da devolução."
+    limpar_caches_dados()
+    st.toast(
+        f"↩️ Devolução vinculada; R$ {credito_estornado:,.2f} de crédito estornados.",
+        icon="🛡️",
+    )
+    return True, f"Devolução registrada; estorno de crédito R$ {credito_estornado:,.2f}."
 
 
 def processar_xml_lote_bytes(
@@ -973,7 +1673,7 @@ def processar_xml_lote_bytes(
     supabase,
     empresa_id_ativo,
     empresa_ativa: dict,
-    ignorar_trava_cnpj: bool = False,
+    cnpjs_adicionais_autorizados: list[str] | None = None,
 ) -> list[tuple[bool, str]]:
     hashes_existentes, chaves_existentes = _carregar_indices_duplicidade(
         supabase, empresa_id_ativo
@@ -982,17 +1682,38 @@ def processar_xml_lote_bytes(
     chaves_lote: set[str] = set()
     preparados = []
     resultados = [(False, "Não foi possível processar o XML.") for _ in arquivos]
+    cnpjs_autorizados = obter_cnpjs_autorizados_empresa(
+        empresa_ativa,
+        cnpjs_adicionais_autorizados,
+    )
 
     for indice, (nome_arquivo, conteudo) in enumerate(arquivos):
+        try:
+            raiz = ET.fromstring(conteudo)
+            nfe = _xml_filho(raiz, "NFe") or raiz
+            inf_nfe = _xml_filho(nfe, "infNFe")
+            ide = _xml_filho(inf_nfe, "ide")
+            if _xml_texto(ide, "finNFe") == "4":
+                resultados[indice] = processar_devolucao_nfe_xml(
+                    conteudo,
+                    supabase,
+                    empresa_id_ativo,
+                    empresa_ativa,
+                    cnpjs_autorizados,
+                )
+                continue
+        except ET.ParseError:
+            pass
+
         nota, itens, erro = _preparar_xml_nfe(
             conteudo,
             empresa_id_ativo,
             empresa_ativa,
-            ignorar_trava_cnpj,
             hashes_existentes,
             chaves_existentes,
             hashes_lote,
             chaves_lote,
+            cnpjs_autorizados,
         )
         if erro:
             resultados[indice] = (False, erro)
@@ -1024,7 +1745,36 @@ def processar_xml_lote_bytes(
         if nota_id is None:
             resultados[indice] = (False, "Não foi possível confirmar o registro da nota.")
             continue
-        itens_da_nota = [{**item, "nota_id": nota_id} for item in itens]
+        itens_da_nota = []
+        cnaes_cliente = str(empresa_ativa.get("cnae_principal", "4711302"))
+        em_contingencia = "Contingência" in str(
+            nota_payload.get("manifestacao_status", "")
+        )
+        for item in itens:
+            status, aliquota, credito = classificar_item_inteligente(
+                ncm=str(item.get("ncm", "")),
+                cfop=str(item.get("cfop", "")),
+                qcom=_float_seguro(item.get("quantidade_comercial"), 0.0),
+                vprod=_float_seguro(item.get("valor_item"), 0.0),
+                crt_emitente=str(nota_payload.get("crt_emitente") or "3"),
+                cnaes_cliente_str=cnaes_cliente,
+                em_contingencia=em_contingencia,
+                descricao=str(item.get("descricao", "")),
+            )
+            if status == "Quarentena Uso/Consumo":
+                aliquota = ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
+                credito = 0.0
+            itens_da_nota.append({
+                **item,
+                "nota_id": nota_id,
+                "aliquota_aplicada": aliquota,
+                "valor_credito_item": round(credito, 2),
+                "classificacao_item": status,
+                "justificativa_motor": _justificativa_classificacao_item(
+                    str(item.get("descricao", "")),
+                    status,
+                ),
+            })
         itens_lote.extend(itens_da_nota)
         dados_sucesso.append((indice, nome_arquivo, nota_payload, itens_da_nota))
 
@@ -1066,10 +1816,11 @@ def processar_xml_lote_bytes(
             "Notas mantidas nesta sessão; sincronize novamente quando o banco estiver disponível.",
             icon="ℹ️",
         )
-    st.toast(
-        f"✅ {len(dados_sucesso)} NF-e(s) importadas em lote.",
-        icon="💰",
-    )
+    if dados_sucesso:
+        st.toast(
+            f"✅ {len(dados_sucesso)} NF-e(s) importadas em lote.",
+            icon="💰",
+        )
     return resultados
 
 
@@ -1078,14 +1829,14 @@ def processar_xml_bytes(
     supabase,
     empresa_id_ativo,
     empresa_ativa: dict,
-    ignorar_trava_cnpj: bool = False,
+    cnpjs_adicionais_autorizados: list[str] | None = None,
 ) -> tuple[bool, str]:
     return processar_xml_lote_bytes(
         [("arquivo.xml", xml_bytes)],
         supabase,
         empresa_id_ativo,
         empresa_ativa,
-        ignorar_trava_cnpj,
+        cnpjs_adicionais_autorizados,
     )[0]
 
 
@@ -1177,7 +1928,14 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 novos_itens = []
                 for desc, ncm, cfop, qcom, vprod in itens_sim:
                     status_it, aliq, cred = classificar_item_inteligente(
-                        ncm, cfop, qcom, vprod, "3", cnaes_str, False
+                        ncm,
+                        cfop,
+                        qcom,
+                        vprod,
+                        "3",
+                        cnaes_str,
+                        False,
+                        descricao=desc,
                     )
                     if status_it == "Quarentena Uso/Consumo":
                         aliq = ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
@@ -1216,15 +1974,19 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 st.success("✅ Lote SEFAZ sincronizado e classificado com sucesso!")
                 if msg_nf != "OK":
                     st.toast("Conexão temporária: o lote está disponível nesta sessão.", icon="ℹ️")
+                if msg_it != "OK":
+                    st.toast(
+                        "Itens disponíveis nesta sessão; sincronização com o banco pendente.",
+                        icon="ℹ️",
+                    )
                 st.session_state["modulo_ativo"] = "xml"
                 rerun_fragment()
 
         with c_up:
             st.markdown("##### 📤 Upload Manual de Arquivos XML NF-e")
-            ignorar_cnpj = st.checkbox(
-                "Modo Homologação: Permitir XML com CNPJ destinatário de terceiros para teste",
-                value=True,
-                key=f"chk_ignorar_cnpj_{empresa_id_ativo}"
+            st.caption(
+                "Cada NF-e será vinculada somente a um CNPJ autorizado desta empresa; "
+                "arquivos de terceiros são rejeitados."
             )
             if "up_reset" not in st.session_state:
                 st.session_state["up_reset"] = 0
@@ -1242,7 +2004,6 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                         supabase,
                         empresa_id_ativo,
                         empresa_ativa,
-                        ignorar_trava_cnpj=ignorar_cnpj,
                     )
                     sucessos = sum(1 for ok, _ in resultados_lote if ok)
                     feedback_processamento = [
@@ -1361,6 +2122,7 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
                 "chave_nota_devolucao": chave_dev,
                 "valor_mercadoria_devolvida": round(valor_devolvido, 2),
                 "credito_estornado": credito_a_estornar,
+                "data_devolucao": datetime.now().astimezone().isoformat(),
                 "motivo_ajuste": motivo_formatado
             }
             ok_dev, msg_dev, dados_dev = inserir_seguro_supabase(
@@ -1396,6 +2158,11 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
                     f"↩️ Devolução registrada; R$ {credito_a_estornar:,.2f} de crédito serão estornados.",
                     icon="🛡️",
                 )
+                if msg_dev == "Mantido temporariamente nesta sessão.":
+                    st.toast(
+                        "Registro da devolução mantido nesta sessão; sincronização pendente.",
+                        icon="ℹ️",
+                    )
                 st.session_state["modulo_ativo"] = "devolucao"
                 st.success("✅ Devolução registrada e crédito estornado em tempo real!")
                 rerun_fragment()

@@ -22,13 +22,35 @@ import relatorio_engine
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 
 SESSION_TIMESTAMP_RE = re.compile(r"\d{20}")
-USERNAME_RE = re.compile(r"[a-z0-9_.-]+")
 
 st.set_page_config(
     page_title="Praesidium | Intelligence & Compliance",
     layout="wide",
     page_icon="🛡️",
     initial_sidebar_state="expanded"
+)
+
+st.markdown(
+    """
+    <style>
+        html, body,
+        html body .stApp,
+        body [data-testid="stAppViewContainer"],
+        body [data-testid="stMain"],
+        body [data-testid="stAppViewContainer"] > .main,
+        body [data-testid="stAppViewContainer"] > .main .block-container {
+            background-color: #0e1117 !important;
+            color: #ffffff !important;
+            color-scheme: dark !important;
+        }
+        body [data-testid="stSidebar"] {
+            background-color: #111827 !important;
+            color: #ffffff !important;
+            color-scheme: dark !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 # ==========================================
@@ -458,7 +480,7 @@ def usuario_from_row(row: dict) -> tuple[str, dict] | None:
     razao_social = str(row.get("razao_social", ""))
     if not cnpj.startswith("USR_") or not razao_social.startswith(PREFIXO_USUARIO_SISTEMA):
         return None
-    username = cnpj[4:].strip().lower()
+    username = cnpj[4:].lower()
     registro_usuario = razao_social[len(PREFIXO_USUARIO_SISTEMA):]
     try:
         dados = json.loads(registro_usuario)
@@ -475,7 +497,7 @@ def usuario_from_row(row: dict) -> tuple[str, dict] | None:
     if not username or not isinstance(dados, dict):
         return None
     password_hash = str(dados.get("password_hash", ""))
-    nome = str(dados.get("name", "")).strip()
+    nome = str(dados.get("name", ""))
     if not password_hash or not nome:
         return None
     return username, {
@@ -1185,7 +1207,7 @@ if not st.session_state["autenticado"]:
                 manter_conectado = st.checkbox("Manter conectado neste aparelho", value=True)
                 btn_entrar = st.form_submit_button("Entrar", use_container_width=True)
             if btn_entrar:
-                username = identificacao_input.strip().lower()
+                username = identificacao_input.lower()
                 if username:
                     try:
                         atualizar_usuario_do_supabase(username)
@@ -1222,10 +1244,8 @@ if not st.session_state["autenticado"]:
                 nova_senha = st.text_input("Senha", type="password")
                 btn_criar_conta = st.form_submit_button("Criar Conta", use_container_width=True)
             if btn_criar_conta:
-                novo_usuario = novo_usuario_input.strip().lower()
-                if not USERNAME_RE.fullmatch(novo_usuario):
-                    st.error("O usuário deve conter apenas letras, números, ponto, hífen ou sublinhado.")
-                elif not novo_nome_usuario.strip() or not nova_senha:
+                novo_usuario = novo_usuario_input.lower()
+                if not novo_usuario or not novo_nome_usuario or not nova_senha:
                     st.error("Informe usuário, nome e senha.")
                 elif supabase is None:
                     st.error("Cadastro indisponível: configure a conexão Supabase para persistir a conta.")
@@ -1254,7 +1274,7 @@ if not st.session_state["autenticado"]:
                                 novo_registro_usuario = {
                                     "password_hash": hash_senha(nova_senha),
                                     "role": "contador",
-                                    "name": novo_nome_usuario.strip(),
+                                    "name": novo_nome_usuario,
                                 }
                                 persistencia_supabase_ok = False
                                 duplicado_remoto = False
@@ -1301,7 +1321,7 @@ if not st.session_state["autenticado"]:
                                     atualizar_espelho_sessao()
                                     registrar_e_notificar_acesso(
                                         novo_usuario,
-                                        novo_nome_usuario.strip(),
+                                        novo_nome_usuario,
                                         "Novo Cadastro",
                                     )
                                     iniciar_sessao_usuario(novo_usuario)
@@ -1356,7 +1376,7 @@ def carregar_todas_empresas_db():
 @st.cache_data(ttl=180, show_spinner=False)
 def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
     if supabase is None:
-        return [], [], [], []
+        return [], [], [], [], []
 
     try:
         notas_lista = consultar_todas_paginas(
@@ -1425,12 +1445,56 @@ def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
         )
         itens_lista = []
 
-    return notas_lista, devs_lista, itens_lista, []
+    eventos_split = []
+    try:
+        eventos_split = consultar_todas_paginas(
+            lambda: (
+                supabase.table("split_payment_events")
+                .select("*")
+                .eq("empresa_id", emp_id)
+                .gte(
+                    "occurred_at",
+                    (datetime.now(timezone.utc) - timedelta(days=400)).isoformat(),
+                )
+            )
+        )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao carregar eventos de Split Payment da empresa %s.",
+            emp_id,
+        )
+
+    return notas_lista, devs_lista, itens_lista, [], eventos_split
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def carregar_cnpjs_autorizados_db(emp_id: int | str) -> list[str]:
+    if supabase is None:
+        return []
+    try:
+        resposta = (
+            supabase.table("empresa_cnpjs_autorizados")
+            .select("cnpj")
+            .eq("empresa_id", emp_id)
+            .execute()
+        )
+        return [
+            str(registro.get("cnpj", ""))
+            for registro in (resposta.data or [])
+            if len("".join(filter(str.isdigit, str(registro.get("cnpj", ""))))) == 14
+        ]
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao carregar CNPJs autorizados para a empresa %s.",
+            emp_id,
+        )
+        return []
 
 
 def limpar_caches_dados() -> None:
     carregar_todas_empresas_db.clear()
     carregar_dados_empresa_db.clear()
+    carregar_cnpjs_autorizados_db.clear()
 
 
 xml_engine.registrar_limpador_cache_dados(limpar_caches_dados)
@@ -1767,6 +1831,9 @@ dono_exibicao_ativo = (
 empresa_ativa = dict(empresa_ativa_bruta)
 empresa_ativa["razao_social"] = limpar_tag_tenant(empresa_ativa_bruta.get("razao_social", ""))
 empresa_ativa["cnae_principal"] = extrair_cnae_limpo_empresa(empresa_ativa_bruta)
+empresa_ativa["cnpjs_autorizados"] = carregar_cnpjs_autorizados_db(
+    empresa_id_ativo
+)
 
 st.sidebar.markdown(f"""
 <div class="sidebar-exec-card">
@@ -1914,7 +1981,7 @@ st.markdown(f"""
 # 7. CÁLCULO DOS DADOS DA EMPRESA SELECIONADA (COM SUPORTE A FALLBACK)
 # ==========================================
 try:
-    notas_db, devolucoes, itens_db, _ = carregar_dados_empresa_db(
+    notas_db, devolucoes, itens_db, _, eventos_split_db = carregar_dados_empresa_db(
         empresa_id_ativo,
         str(empresa_ativa.get("cnpj", "")),
     )
@@ -1931,6 +1998,10 @@ itens = combinar_registros_com_sessao(itens_db, itens_mem)
 devolucoes = combinar_registros_com_sessao(
     devolucoes,
     st.session_state.get(f"fallback_devolucoes_{empresa_id_ativo}", []),
+)
+eventos_split = combinar_registros_com_sessao(
+    eventos_split_db,
+    st.session_state.get(f"fallback_split_payment_{empresa_id_ativo}", []),
 )
 
 if not notas:
@@ -1956,13 +2027,52 @@ ids_notas_mes = {
     if str(n.get("id")) in periodo_por_nota
     and periodo_por_nota[str(n.get("id"))] == competencia_atual
 }
+
+def devolucao_na_competencia(devolucao: dict, competencia: pd.Period) -> bool:
+    data_devolucao = pd.to_datetime(
+        devolucao.get("data_devolucao") or devolucao.get("created_at"),
+        errors="coerce",
+        utc=True,
+    )
+    if not pd.isna(data_devolucao):
+        return data_devolucao.tz_convert(None).to_period("M") == competencia
+    return str(devolucao.get("nota_original_id", "")) in ids_notas_mes
+
+
 devolucoes_mes = [
-    d for d in devolucoes
-    if str(d.get("nota_original_id", "")) in ids_notas_mes
+    devolucao
+    for devolucao in devolucoes
+    if devolucao_na_competencia(devolucao, competencia_atual)
 ]
 imposto_estornado = sum(float(d.get("credito_estornado", 0.0)) for d in devolucoes_mes)
+
+
+def evento_split_na_competencia(evento: dict, competencia: pd.Period) -> bool:
+    data_evento = pd.to_datetime(
+        evento.get("occurred_at"),
+        errors="coerce",
+        utc=True,
+    )
+    return bool(
+        not pd.isna(data_evento)
+        and data_evento.tz_convert(None).to_period("M") == competencia
+    )
+
+
+eventos_split_mes = [
+    evento
+    for evento in eventos_split
+    if evento_split_na_competencia(evento, competencia_atual)
+]
+valor_retido_split_payment = sum(
+    max(0.0, float(evento.get("retained_amount", 0.0) or 0.0))
+    for evento in eventos_split_mes
+)
 credito_validado_tempo_real = imposto_validado_mes
-saldo_credito_disponivel = max(0.0, credito_validado_tempo_real - imposto_estornado)
+saldo_credito_disponivel = max(
+    0.0,
+    credito_validado_tempo_real - imposto_estornado - valor_retido_split_payment,
+)
 
 # ==========================================
 # 8. PAINEL SUPERIOR: IMPOSTÔMETRO LUXO
@@ -1983,7 +2093,7 @@ with col2:
     <div class="exec-card card-validado">
         <div class="card-label">✅ Crédito Validado (Tempo Real)</div>
         <div class="card-value-validado">R$ {credito_validado_tempo_real:,.2f}</div>
-        <div class="card-desc">Crédito aprovado no mês; disponível após estornos: R$ {saldo_credito_disponivel:,.2f}</div>
+        <div class="card-desc">Após estornos e retenção Split Payment de R$ {valor_retido_split_payment:,.2f}: R$ {saldo_credito_disponivel:,.2f}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2105,20 +2215,32 @@ def renderizar_fila_quarentena(
     def persistir_decisao(item: dict, status: str, credito: float) -> None:
         if item.get("id") is None or item.get("nota_id") is None:
             raise RuntimeError("Vínculo do item indisponível.")
+        justificativa = (
+            "Art. 47/57: aprovação após revalidação documental manual pelo contador."
+            if status == "Aprovado Manualmente Contador"
+            else "Art. 57: crédito glosado após análise manual do contador."
+        )
         atualizacao = {
             "classificacao_item": status,
             "aliquota_aplicada": xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
             "valor_credito_item": round(credito, 2),
+            "justificativa_motor": justificativa,
         }
         ok, mensagem, resultado = xml_engine.executar_update_seguro(
             supabase,
             "itens_nota_fiscal",
             atualizacao,
-            {"id": item["id"], "nota_id": item["nota_id"], "empresa_id": empresa_id},
+            {
+                "id": item["id"],
+                "nota_id": item["nota_id"],
+                "empresa_id": empresa_id,
+                "classificacao_item": "Quarentena Uso/Consumo",
+            },
             fallback_record=item,
         )
         if not ok or not resultado:
             raise RuntimeError(mensagem)
+        item["justificativa_motor"] = justificativa
 
     with st.expander(
         f"📁 4. Fila de Quarentena & Histórico de Auditoria "
@@ -2375,7 +2497,10 @@ def renderizar_simulador(empresa_ativa: dict, itens_mes: list[dict], devolucoes_
             st.write("")
             st.form_submit_button("⚡ Aplicar Parâmetros e Calcular Simulação", use_container_width=True, on_click=manter_simulador_aberto)
 
-        compras_liquidas_creditaveis = max(0.0, compras_mercadorias - devolucoes_mes)
+        compras_liquidas_creditaveis = max(
+            0.0,
+            compras_mercadorias - devolucoes_mes - compras_quarentena_input,
+        )
         credito_gerado_simulado = compras_liquidas_creditaveis * (aliquota_iva / 100)
 
         aliquota_das_total = faixas_simples[faixa_escolhida]["das_total"]
@@ -2412,7 +2537,7 @@ def renderizar_simulador(empresa_ativa: dict, itens_mes: list[dict], devolucoes_
             <div class="sub-calc-card">
                 <div class="sub-calc-title">1. Compras Líquidas</div>
                 <div class="sub-calc-value">R$ {compras_liquidas_creditaveis:,.2f}</div>
-                <div class="sub-calc-desc">Revenda menos devoluções</div>
+                <div class="sub-calc-desc">Revenda menos devoluções e quarentena</div>
             </div>
             """, unsafe_allow_html=True)
         with mc2:
@@ -2420,7 +2545,7 @@ def renderizar_simulador(empresa_ativa: dict, itens_mes: list[dict], devolucoes_
             <div class="sub-calc-card">
                 <div class="sub-calc-title">2. Crédito Gerado</div>
                 <div class="sub-calc-value">R$ {credito_gerado_simulado:,.2f}</div>
-                <div class="sub-calc-desc">{aliquota_iva}% sobre as compras</div>
+                <div class="sub-calc-desc">{aliquota_iva}% sobre compras elegíveis</div>
             </div>
             """, unsafe_allow_html=True)
         with mc3:
@@ -2484,6 +2609,13 @@ renderizar_simulador(
 
 # MÓDULO 8: DOSSIÊ EXECUTIVO DE FECHAMENTO
 relatorio_engine.renderizar_modulo_relatorio(
-    empresa_ativa, imposto_bruto_mes, credito_validado_tempo_real, imposto_quarentena, imposto_estornado, notas, itens
+    empresa_ativa,
+    imposto_bruto_mes,
+    credito_validado_tempo_real,
+    imposto_quarentena,
+    imposto_estornado,
+    notas,
+    itens,
+    valor_retido_split_payment,
 )
 persistir_estado_sessao()
