@@ -1994,7 +1994,10 @@ notas_mem = st.session_state.get(f"fallback_notas_{empresa_id_ativo}", [])
 itens_mem = st.session_state.get(f"fallback_itens_{empresa_id_ativo}", [])
 
 notas = combinar_registros_com_sessao(notas_db, notas_mem)
-itens = combinar_registros_com_sessao(itens_db, itens_mem)
+itens = [
+    xml_engine.normalizar_item_credito(item)
+    for item in combinar_registros_com_sessao(itens_db, itens_mem)
+]
 devolucoes = combinar_registros_com_sessao(
     devolucoes,
     st.session_state.get(f"fallback_devolucoes_{empresa_id_ativo}", []),
@@ -2222,8 +2225,17 @@ def renderizar_fila_quarentena(
         )
         atualizacao = {
             "classificacao_item": status,
+            "status_credito": (
+                "Validado"
+                if status == "Aprovado Manualmente Contador"
+                else "Rejeitado"
+            ),
             "aliquota_aplicada": xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
+            "aliquota_ibs_aplicada": xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
+            "aliquota_cbs_aplicada": 0.0,
             "valor_credito_item": round(credito, 2),
+            "credito_ibs_gerado": round(credito, 2),
+            "credito_cbs_gerado": 0.0,
             "justificativa_motor": justificativa,
         }
         ok, mensagem, resultado = xml_engine.executar_update_seguro(
@@ -2292,7 +2304,7 @@ def renderizar_fila_quarentena(
                             f"✅ +R$ {credito:,.2f} liberados para o Crédito Validado!",
                             icon="💰",
                         )
-                        rerun_fragment_local()
+                        st.rerun()
                 if rejeitar.button(
                     "🚫 Bloquear Crédito (Uso/Consumo Definitivo)",
                     key=f"bloq_{item_id}",
@@ -2320,7 +2332,7 @@ def renderizar_fila_quarentena(
                             f"🛡️ R$ {credito:,.2f} glosados (Art. 57) — risco fiscal eliminado!",
                             icon="🛡️",
                         )
-                        rerun_fragment_local()
+                        st.rerun()
                 st.markdown("---")
         else:
             st.success("🎉 Nenhum item pendente de análise na quarentena para este cliente.")

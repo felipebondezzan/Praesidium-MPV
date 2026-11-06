@@ -393,6 +393,7 @@ def obter_data_referencia_nota(nota: dict):
 
 def obter_credito_quarentena(item: dict) -> float:
     """Calcula o crédito potencial com a alíquota persistida, compatível com dados legados."""
+    item = normalizar_item_credito(item)
     credito = float(item.get("valor_credito_item", 0.0) or 0.0)
     if credito > 0:
         return credito
@@ -407,6 +408,7 @@ def obter_credito_quarentena(item: dict) -> float:
 
 
 def obter_credito_rejeitado(item: dict) -> float:
+    item = normalizar_item_credito(item)
     credito = float(item.get("valor_credito_item", 0.0) or 0.0)
     if credito > 0:
         return credito
@@ -422,7 +424,8 @@ def calcular_resumo_creditos(itens: list) -> dict[str, float]:
     validados = 0.0
     quarentena = 0.0
     rejeitados = 0.0
-    for item in itens:
+    for registro in itens:
+        item = normalizar_item_credito(registro)
         status = item.get("classificacao_item")
         valor_credito = float(item.get("valor_credito_item", 0.0) or 0.0)
         if status in {"Aprovado Revenda", "Aprovado Manualmente Contador"}:
@@ -437,6 +440,63 @@ def calcular_resumo_creditos(itens: list) -> dict[str, float]:
         "rejeitado": rejeitados,
         "bruto": validados + quarentena,
     }
+
+
+def normalizar_item_credito(item: dict) -> dict:
+    """Converte aliases persistidos no Supabase para o formato usado pelos módulos."""
+    normalizado = dict(item)
+    if not normalizado.get("descricao"):
+        normalizado["descricao"] = normalizado.get("descricao_produto", "")
+    if normalizado.get("valor_item") is None:
+        normalizado["valor_item"] = normalizado.get("valor_total_bruto", 0.0)
+    if normalizado.get("quantidade_comercial") is None:
+        normalizado["quantidade_comercial"] = normalizado.get("qcom", 0.0)
+    if normalizado.get("qcom") is None:
+        normalizado["qcom"] = normalizado["quantidade_comercial"]
+    if normalizado.get("aliquota_aplicada") is None:
+        normalizado["aliquota_aplicada"] = (
+            float(normalizado.get("aliquota_ibs_aplicada", 0.0) or 0.0)
+            + float(normalizado.get("aliquota_cbs_aplicada", 0.0) or 0.0)
+        )
+    if normalizado.get("valor_credito_item") is None:
+        normalizado["valor_credito_item"] = (
+            float(normalizado.get("credito_ibs_gerado", 0.0) or 0.0)
+            + float(normalizado.get("credito_cbs_gerado", 0.0) or 0.0)
+        )
+    if not normalizado.get("justificativa_motor"):
+        normalizado["justificativa_motor"] = normalizado.get("justificativa", "")
+
+    classificacao = str(normalizado.get("classificacao_item") or "").strip()
+    if not classificacao:
+        status_credito = str(normalizado.get("status_credito") or "").strip().casefold()
+        classificacoes_conhecidas = {
+            "aprovado revenda",
+            "aprovado manualmente contador",
+            "quarentena uso/consumo",
+            "rejeitado",
+            "rejeitado pelo contador",
+        }
+        if status_credito in classificacoes_conhecidas:
+            classificacao = str(normalizado.get("status_credito")).strip()
+        elif status_credito in {"validado", "aprovado", "crédito validado"}:
+            classificacao = "Aprovado Revenda"
+        elif status_credito in {"quarentena", "pendente", "em quarentena"}:
+            classificacao = "Quarentena Uso/Consumo"
+        elif status_credito in {"rejeitado", "glosado", "rejeitado art. 57"}:
+            classificacao = "Rejeitado"
+    if classificacao:
+        normalizado["classificacao_item"] = classificacao
+    return normalizado
+
+
+def _status_credito_persistido(classificacao: str) -> str:
+    if classificacao in {"Aprovado Revenda", "Aprovado Manualmente Contador"}:
+        return "Validado"
+    if classificacao == "Quarentena Uso/Consumo":
+        return "Quarentena"
+    if classificacao in {"Rejeitado", "Rejeitado pelo Contador"}:
+        return "Rejeitado"
+    return classificacao or "N/A"
 
 
 # ==========================================
@@ -643,11 +703,13 @@ def sanitizar_payload_supabase(tabela: str, payload, parcial: bool = False):
                 "descricao_produto": atual.get("descricao", "N/A"),
                 "quantidade_comercial": atual.get("qcom", 0.0),
                 "valor_total_bruto": atual.get("valor_item", 0.0),
-                "status_credito": atual.get("classificacao_item", "N/A"),
+                "status_credito": _status_credito_persistido(
+                    str(atual.get("classificacao_item", ""))
+                ),
                 "justificativa_motor": atual.get("justificativa", "N/A"),
-                "aliquota_ibs_aplicada": 0.0,
+                "aliquota_ibs_aplicada": atual.get("aliquota_aplicada", 0.0),
                 "aliquota_cbs_aplicada": 0.0,
-                "credito_ibs_gerado": 0.0,
+                "credito_ibs_gerado": atual.get("valor_credito_item", 0.0),
                 "credito_cbs_gerado": 0.0,
             }
             for coluna, padrao in aliases.items():
@@ -919,11 +981,12 @@ def executar_update_seguro(
     dados = sanitizar_payload_supabase(tabela, payload, parcial=True)
     if not dados:
         return False, "Não há alterações disponíveis para salvar.", []
+    filtros_ativos = dict(filtros)
     colunas_corrigidas = set()
     for _ in range(32):
         try:
             consulta = supabase.table(tabela).update(dados)
-            for coluna, valor in filtros.items():
+            for coluna, valor in filtros_ativos.items():
                 consulta = consulta.eq(coluna, valor)
             resultado = consulta.select("*").execute()
             if resultado.data:
@@ -943,6 +1006,17 @@ def executar_update_seguro(
                 )
                 continue
             colunas_presentes = set(dados)
+            if (
+                codigo == "PGRST204"
+                and tabela == "itens_nota_fiscal"
+                and coluna == "classificacao_item"
+                and coluna in filtros_ativos
+            ):
+                status_esperado = str(filtros_ativos.pop(coluna))
+                filtros_ativos["status_credito"] = _status_credito_persistido(
+                    status_esperado
+                )
+                continue
             if codigo == "PGRST204" and coluna and coluna in colunas_presentes:
                 dados.pop(coluna, None)
                 if dados:
@@ -1849,7 +1923,8 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
     feedback_upload = st.session_state.pop(upload_feedback_key, None)
     if feedback_upload:
         for nivel, mensagem in feedback_upload:
-            getattr(st, nivel)(mensagem)
+            icone = "✅" if nivel == "success" else "⚠️"
+            st.toast(mensagem, icon=icone)
 
     aviso_regra = st.session_state.pop(f"aviso_regra_{empresa_id_ativo}", None)
     if aviso_regra:
@@ -1945,10 +2020,16 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                         "descricao": desc,
                         "ncm": ncm,
                         "cfop": cfop,
+                        "qcom": qcom,
+                        "quantidade_comercial": qcom,
                         "valor_item": vprod,
                         "aliquota_aplicada": aliq,
                         "valor_credito_item": cred,
-                        "classificacao_item": status_it
+                        "classificacao_item": status_it,
+                        "justificativa_motor": _justificativa_classificacao_item(
+                            desc,
+                            status_it,
+                        ),
                     })
 
                 ok_it, msg_it, _ = inserir_seguro_supabase(supabase, "itens_nota_fiscal", novos_itens)
@@ -1971,7 +2052,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                     f"✅ Lote sincronizado: R$ {credito_lote:,.2f} em crédito bruto auditado.",
                     icon="💰",
                 )
-                st.success("✅ Lote SEFAZ sincronizado e classificado com sucesso!")
+                st.toast("Lote SEFAZ sincronizado e classificado com sucesso.", icon="✅")
                 if msg_nf != "OK":
                     st.toast("Conexão temporária: o lote está disponível nesta sessão.", icon="ℹ️")
                 if msg_it != "OK":
@@ -1980,7 +2061,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                         icon="ℹ️",
                     )
                 st.session_state["modulo_ativo"] = "xml"
-                rerun_fragment()
+                st.rerun()
 
         with c_up:
             st.markdown("##### 📤 Upload Manual de Arquivos XML NF-e")
@@ -2018,7 +2099,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                     if sucessos:
                         limpar_caches_dados()
                     st.session_state["modulo_ativo"] = "xml"
-                    rerun_fragment()
+                    st.rerun()
 
 
 # ==========================================
