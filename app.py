@@ -13,6 +13,7 @@ from pathlib import Path
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit.errors import StreamlitSecretNotFoundError
 import pandas as pd
 from supabase import create_client, Client
 from urllib.parse import urlparse
@@ -338,12 +339,20 @@ st.markdown(CSS_DARK_LUXURY.replace("\n\n", "\n"), unsafe_allow_html=True)
 # ==========================================
 url = ""
 key = ""
-try:
-    url = str(st.secrets["SUPABASE_URL"]).strip()
-    key = str(st.secrets["SUPABASE_KEY"]).strip()
-except Exception:
-    url = ""
-    key = ""
+
+
+def obter_configuracao_supabase(nome: str) -> str:
+    try:
+        valor = st.secrets[nome]
+    except (KeyError, StreamlitSecretNotFoundError):
+        valor = None
+    if not valor:
+        valor = os.environ.get(nome)
+    return str(valor or "").strip()
+
+
+url = obter_configuracao_supabase("SUPABASE_URL")
+key = obter_configuracao_supabase("SUPABASE_KEY")
 
 
 @st.cache_resource
@@ -357,17 +366,17 @@ url_validada = urlparse(url)
 if not url or not key:
     erro_conexao_supabase = (
         "Credenciais do Supabase ausentes. Configure SUPABASE_URL e SUPABASE_KEY "
-        "em st.secrets."
+        "em st.secrets ou nas variáveis de ambiente."
     )
-elif url_validada.scheme not in {"https", "http"} or not url_validada.netloc:
-    erro_conexao_supabase = "SUPABASE_URL inválida. Informe uma URL completa com http:// ou https://."
+elif url_validada.scheme != "https" or not url_validada.netloc:
+    erro_conexao_supabase = "SUPABASE_URL inválida. Informe uma URL completa com https://."
 else:
     try:
         supabase = iniciar_conexao_supabase(url, key)
     except Exception:
         erro_conexao_supabase = (
             "Não foi possível inicializar a conexão Supabase. Confira SUPABASE_URL "
-            "e SUPABASE_KEY em st.secrets."
+            "e SUPABASE_KEY em st.secrets ou nas variáveis de ambiente."
         )
 
 if erro_conexao_supabase:
