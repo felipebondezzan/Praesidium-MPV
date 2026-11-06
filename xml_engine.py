@@ -586,10 +586,10 @@ def persistir_espelho_empresa(
         })
     if not payload:
         return True
-    for inicio in range(0, len(payload), 500):
+    for inicio in range(0, len(payload), 25):
         try:
             supabase.table("praesidium_empresa_mirror").upsert(
-                payload[inicio:inicio + 500],
+                payload[inicio:inicio + 25],
                 on_conflict="empresa_id,record_type,record_key",
             ).execute()
         except Exception:
@@ -1004,7 +1004,9 @@ def _guardar_fallback(tabela: str, payload, operacao: str = "insert", filtros: d
             )
             corresponde = (
                 (mesmo_id or filtros_correspondem)
-                and (operacao != "update" or filtros_correspondem)
+                and filtros_correspondem
+                if operacao == "update"
+                else mesmo_id
             )
             if corresponde:
                 existentes[indice] = {**existente, **registro}
@@ -1079,13 +1081,13 @@ def executar_insert_seguro(
             else (False, "Não foi possível registrar os dados nesta sessão.", [])
         )
 
-    if tabela == "itens_nota_fiscal" and len(registros) > 500:
+    if tabela == "itens_nota_fiscal" and len(registros) > 25:
         persistidos = []
         mensagens = []
-        for inicio in range(0, len(registros), 500):
+        for inicio in range(0, len(registros), 25):
             ok_lote, mensagem_lote, itens_lote = executar_insert_seguro(
                 tabela,
-                registros[inicio:inicio + 500],
+                registros[inicio:inicio + 25],
                 supabase=supabase,
                 operacao="upsert",
             )
@@ -1175,7 +1177,11 @@ def executar_insert_seguro(
                 if coluna == "item_uid":
                     conflito_item_uid = False
                 continue
-            if isinstance(dados, list) and len(dados) > 1:
+            if (
+                isinstance(dados, list)
+                and len(dados) > 1
+                and tabela != "itens_nota_fiscal"
+            ):
                 registros_salvos = []
                 falha_individual = False
                 for registro in dados:
@@ -1796,6 +1802,7 @@ def _limpar_itens_anteriores(
         ]
         return True
 
+    limpeza_completa = True
     try:
         espelho_resposta = (
             supabase.table("praesidium_empresa_mirror")
@@ -1820,26 +1827,35 @@ def _limpar_itens_anteriores(
                 .in_("record_key", chaves_espelho)
                 .execute()
             )
-        (
-            supabase.table("itens_nota_fiscal")
-            .delete()
-            .eq("empresa_id", empresa_id)
-            .in_("nota_id", list(nota_ids))
-            .execute()
-        )
     except Exception:
-        logging.getLogger(__name__).exception(
-            "Falha ao limpar itens truncados antes do reprocessamento da empresa %s.",
-            empresa_id,
-        )
-        return False
+            logging.getLogger(__name__).exception(
+                "Falha ao limpar itens do espelho antes do reprocessamento da empresa %s.",
+                empresa_id,
+            )
+            limpeza_completa = False
+
+    try:
+            (
+                supabase.table("itens_nota_fiscal")
+                .delete()
+                .eq("empresa_id", empresa_id)
+                .in_("nota_id", list(nota_ids))
+                .execute()
+            )
+    except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao limpar itens da tabela antes do reprocessamento da empresa %s; "
+                "a sincronização continuará via upsert.",
+                empresa_id,
+            )
+            limpeza_completa = False
 
     st.session_state[chave_sessao] = [
-        item
-        for item in st.session_state.get(chave_sessao, [])
-        if str(item.get("nota_id")) not in nota_ids
+            item
+            for item in st.session_state.get(chave_sessao, [])
+            if str(item.get("nota_id")) not in nota_ids
     ]
-    return True
+    return limpeza_completa
 
 
 def processar_devolucao_nfe_xml(
@@ -2308,34 +2324,50 @@ def processar_xml_lote_bytes(
             notas_reprocessadas_ids.add(str(nota_id))
 
     if itens_lote:
-        if not _limpar_itens_anteriores(
+        _limpar_itens_anteriores(
             supabase,
             empresa_id_ativo,
             notas_reprocessadas_ids,
-        ):
-            for indice, _, nota_payload, _ in dados_sucesso:
-                if str(notas_por_chave[str(nota_payload["chave_acesso"])].get("id")) in notas_reprocessadas_ids:
-                    resultados[indice] = (
-                        False,
-                        "Não foi possível preparar a sincronização dos itens existentes.",
-                    )
-            dados_sucesso = [
-                dados
-                for dados in dados_sucesso
-                if str(notas_por_chave[str(dados[2]["chave_acesso"])].get("id"))
-                not in notas_reprocessadas_ids
-            ]
-            itens_lote = [
-                item
-                for _, _, _, itens_nota in dados_sucesso
-                for item in itens_nota
-            ]
-        if not itens_lote:
-            return resultados
-        ok_itens, mensagem_itens, _ = inserir_seguro_supabase(
-            supabase, "itens_nota_fiscal", itens_lote
         )
-        if not ok_itens:
+        mensagens_itens = []
+        persistencia_completa = True
+        for inicio in range(0, len(itens_lote), 25):
+            lote_itens = itens_lote[inicio:inicio + 25]
+            ok_itens, mensagem_lote, _ = inserir_seguro_supabase(
+                supabase,
+                "itens_nota_fiscal",
+                lote_itens,
+            )
+            if not ok_itens:
+                espelho_ok = persistir_espelho_empresa(
+                    supabase,
+                    empresa_id_ativo,
+                    "item",
+                    lote_itens,
+                )
+                if espelho_ok:
+                    mensagem_lote = "Espelho Supabase persistido."
+                else:
+                    mensagem_lote = "Mantido temporariamente nesta sessão."
+            mensagens_itens.append(mensagem_lote)
+            itens_em_memoria = _guardar_fallback(
+                "itens_nota_fiscal",
+                lote_itens,
+                operacao="upsert",
+            )
+            if not itens_em_memoria and not ok_itens:
+                persistencia_completa = False
+
+        mensagem_itens = (
+            "Espelho Supabase persistido."
+            if "Espelho Supabase persistido." in mensagens_itens
+            else (
+                "Mantido temporariamente nesta sessão."
+                if "Mantido temporariamente nesta sessão." in mensagens_itens
+                else "OK"
+            )
+        )
+        if not persistencia_completa:
             for indice, _, nota_payload, _ in dados_sucesso:
                 try:
                     nota_id = notas_por_chave[str(nota_payload["chave_acesso"])]["id"]
