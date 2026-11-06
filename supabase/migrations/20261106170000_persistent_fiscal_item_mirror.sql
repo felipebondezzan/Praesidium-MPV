@@ -10,7 +10,7 @@ ALTER TABLE public.itens_nota_fiscal
     ALTER COLUMN item_uid SET NOT NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS itens_nota_fiscal_item_uid_uq
-    ON public.itens_nota_fiscal (item_uid);
+    ON public.itens_nota_fiscal (empresa_id, item_uid);
 
 CREATE INDEX IF NOT EXISTS itens_nota_fiscal_empresa_nota_idx
     ON public.itens_nota_fiscal (empresa_id, nota_id);

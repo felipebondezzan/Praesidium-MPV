@@ -1511,13 +1511,39 @@ def limpar_caches_dados() -> None:
 xml_engine.registrar_limpador_cache_dados(limpar_caches_dados)
 
 
-def combinar_registros_com_sessao(registros_db: list[dict], registros_sessao: list[dict]) -> list[dict]:
+def combinar_registros_com_sessao(
+    registros_db: list[dict],
+    registros_sessao: list[dict],
+    tipo: str = "",
+) -> list[dict]:
     combinados = {}
     for indice, registro in enumerate(registros_db):
-        identificador = str(registro.get("id") or f"db_{indice}")
+        if tipo == "item":
+            identificador = str(
+                registro.get("item_uid")
+                or (
+                    f"{registro.get('nota_id')}|{registro.get('nitem')}"
+                    if registro.get("nota_id") is not None
+                    and registro.get("nitem") is not None
+                    else f"db_item_{indice}"
+                )
+            )
+        else:
+            identificador = str(registro.get("id") or f"db_{indice}")
         combinados[identificador] = dict(registro)
     for indice, registro in enumerate(registros_sessao):
-        identificador = str(registro.get("id") or f"sessao_{indice}")
+        if tipo == "item":
+            identificador = str(
+                registro.get("item_uid")
+                or (
+                    f"{registro.get('nota_id')}|{registro.get('nitem')}"
+                    if registro.get("nota_id") is not None
+                    and registro.get("nitem") is not None
+                    else f"sessao_item_{indice}"
+                )
+            )
+        else:
+            identificador = str(registro.get("id") or f"sessao_{indice}")
         combinados[identificador] = {**combinados.get(identificador, {}), **registro}
     return list(combinados.values())
 
@@ -2012,7 +2038,7 @@ itens_mem = st.session_state.get(f"fallback_itens_{empresa_id_ativo}", [])
 notas = combinar_registros_com_sessao(notas_db, notas_mem)
 itens = [
     xml_engine.normalizar_item_credito(item)
-    for item in combinar_registros_com_sessao(itens_db, itens_mem)
+    for item in combinar_registros_com_sessao(itens_db, itens_mem, tipo="item")
 ]
 devolucoes = combinar_registros_com_sessao(
     devolucoes,

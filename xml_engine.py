@@ -533,7 +533,14 @@ _TIPOS_ESPELHO = {
 
 def _chave_registro_espelho(tipo: str, registro: dict) -> str:
     if tipo == "item":
-        return str(registro.get("item_uid") or registro.get("id") or "")
+        item_uid = str(registro.get("item_uid") or "").strip()
+        if item_uid:
+            return item_uid
+        nota_id = str(registro.get("nota_id") or "").strip()
+        numero_item = registro.get("nitem")
+        if nota_id and numero_item is not None:
+            return f"{nota_id}|{numero_item}"
+        return ""
     if tipo == "devolucao":
         return str(
             registro.get("chave_nota_devolucao")
@@ -579,19 +586,20 @@ def persistir_espelho_empresa(
         })
     if not payload:
         return True
-    try:
-        supabase.table("praesidium_empresa_mirror").upsert(
-            payload,
-            on_conflict="empresa_id,record_type,record_key",
-        ).execute()
-        return True
-    except Exception:
-        logging.getLogger(__name__).exception(
-            "Falha ao persistir o espelho %s da empresa %s.",
-            tipo,
-            empresa_id,
-        )
-        return False
+    for inicio in range(0, len(payload), 500):
+        try:
+            supabase.table("praesidium_empresa_mirror").upsert(
+                payload[inicio:inicio + 500],
+                on_conflict="empresa_id,record_type,record_key",
+            ).execute()
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao persistir o espelho %s da empresa %s.",
+                tipo,
+                empresa_id,
+            )
+            return False
+    return True
 
 
 def carregar_espelho_empresa(supabase, empresa_id) -> dict[str, list[dict]]:
@@ -635,10 +643,17 @@ def carregar_espelho_empresa(supabase, empresa_id) -> dict[str, list[dict]]:
         if str(normalizado["empresa_id"]) != str(empresa_id):
             continue
         if tipo == "item":
+            record_key = str(linha.get("record_key") or "")
+            if not normalizado.get("item_uid") and record_key:
+                normalizado["item_uid"] = (
+                    record_key
+                    if record_key.startswith("legacy:")
+                    else f"legacy:{record_key}"
+                )
             normalizado = normalizar_item_credito(normalizado)
             normalizado.setdefault(
                 "id",
-                f"mirror_{linha.get('record_key') or normalizado.get('item_uid', '')}",
+                f"mirror_{record_key or normalizado.get('item_uid', '')}",
             )
         registros[tipo].append(normalizado)
     return registros
@@ -654,9 +669,14 @@ def combinar_registros_espelho(
         chave = _chave_registro_espelho(tipo, registro)
         if chave:
             combinados[chave] = dict(registro)
+        elif tipo != "item" and registro.get("id") is not None:
+            combinados[str(registro["id"])] = dict(registro)
     for registro in espelho:
         chave = _chave_registro_espelho(tipo, registro)
         if chave:
+            combinados[chave] = {**combinados.get(chave, {}), **registro}
+        elif tipo != "item" and registro.get("id") is not None:
+            chave = str(registro["id"])
             combinados[chave] = {**combinados.get(chave, {}), **registro}
     return list(combinados.values())
 
@@ -1059,6 +1079,27 @@ def executar_insert_seguro(
             else (False, "Não foi possível registrar os dados nesta sessão.", [])
         )
 
+    if tabela == "itens_nota_fiscal" and len(registros) > 500:
+        persistidos = []
+        mensagens = []
+        for inicio in range(0, len(registros), 500):
+            ok_lote, mensagem_lote, itens_lote = executar_insert_seguro(
+                tabela,
+                registros[inicio:inicio + 500],
+                supabase=supabase,
+                operacao="upsert",
+            )
+            if not ok_lote:
+                return False, mensagem_lote, persistidos
+            mensagens.append(mensagem_lote)
+            persistidos.extend(itens_lote)
+        mensagem_final = (
+            "Espelho Supabase persistido."
+            if "Espelho Supabase persistido." in mensagens
+            else "OK"
+        )
+        return True, mensagem_final, persistidos
+
     colunas_corrigidas = set()
     conflito_item_uid = tabela == "itens_nota_fiscal"
     for _ in range(32):
@@ -1070,7 +1111,7 @@ def executar_insert_seguro(
                 ):
                     construtor = construtor.upsert(
                         dados,
-                        on_conflict="item_uid",
+                        on_conflict="empresa_id,item_uid",
                     )
                 else:
                     construtor = construtor.upsert(dados)
@@ -1144,7 +1185,7 @@ def executar_insert_seguro(
                             if conflito_item_uid and registro.get("item_uid"):
                                 construtor_item = construtor_item.upsert(
                                     registro,
-                                    on_conflict="item_uid",
+                                    on_conflict="empresa_id,item_uid",
                                 )
                             else:
                                 construtor_item = construtor_item.upsert(registro)
@@ -1568,27 +1609,15 @@ def gerar_xml_devolucao_nfe(
 def _xml_filhos(elemento, nome: str):
     if elemento is None:
         return []
-    candidatos = (
-        list(elemento.findall(nome))
-        + list(elemento.findall(f"{{*}}{nome}"))
-        + [
-            filho
-            for filho in list(elemento)
-            if filho.tag.rsplit("}", 1)[-1] == nome
-        ]
-    )
-    encontrados = []
-    vistos = set()
-    for filho in candidatos:
-        if id(filho) not in vistos:
-            vistos.add(id(filho))
-            encontrados.append(filho)
-    return encontrados
+    return [
+        filho
+        for filho in elemento.iter()
+        if filho is not elemento and filho.tag.rsplit("}", 1)[-1] == nome
+    ]
 
 
-def _gerar_item_uid(empresa_id, chave_acesso: str, numero_item: str) -> str:
-    identidade = f"{empresa_id}|{chave_acesso}|{numero_item}"
-    return hashlib.sha256(identidade.encode("utf-8")).hexdigest()
+def _gerar_item_uid(chave_acesso: str, numero_item: int | str) -> str:
+    return f"{chave_acesso}_ITEM_{int(numero_item):04d}"
 
 
 def _xml_filho(elemento, nome: str):
@@ -1609,35 +1638,37 @@ def _float_seguro(valor, padrao: float) -> float:
         return padrao
 
 
-def _carregar_indices_duplicidade(supabase, empresa_id_ativo) -> tuple[set[str], set[str]]:
+def _carregar_notas_existentes(
+    supabase,
+    empresa_id_ativo,
+) -> dict[str, dict]:
     if supabase is None:
-        return set(), set()
+        return {}
     try:
         resposta = (
             supabase.table("notas_fiscais_recebidas")
-            .select("hash_sha256_xml,chave_acesso")
+            .select("id,chave_acesso")
             .eq("empresa_id", empresa_id_ativo)
             .execute()
         )
         linhas = resposta.data or []
-        return (
-            {str(n.get("hash_sha256_xml")) for n in linhas if n.get("hash_sha256_xml")},
-            {str(n.get("chave_acesso")) for n in linhas if n.get("chave_acesso")},
-        )
+        return {
+            str(n.get("chave_acesso")): n
+            for n in linhas
+            if n.get("chave_acesso") and n.get("id") is not None
+        }
     except Exception:
         logging.getLogger(__name__).exception(
             "Falha ao carregar índice de duplicidade para empresa %s.",
             empresa_id_ativo,
         )
-        return set(), set()
+        return {}
 
 
 def _preparar_xml_nfe(
     xml_bytes: bytes,
     empresa_id_ativo,
     empresa_ativa: dict,
-    hashes_existentes: set[str],
-    chaves_existentes: set[str],
     hashes_lote: set[str],
     chaves_lote: set[str],
     cnpjs_autorizados: set[str] | None = None,
@@ -1652,12 +1683,7 @@ def _preparar_xml_nfe(
         return None, [], "Importação cancelada: não há CNPJ autorizado configurado."
 
     hash_sha256 = hashlib.sha256(xml_bytes).hexdigest()
-    notas_locais = st.session_state.get(f"fallback_notas_{empresa_id_ativo}", [])
-    if (
-        hash_sha256 in hashes_existentes
-        or hash_sha256 in hashes_lote
-        or any(nota.get("hash_sha256_xml") == hash_sha256 for nota in notas_locais)
-    ):
+    if hash_sha256 in hashes_lote:
         return None, [], "Nota bloqueada: este XML já foi registrado."
 
     try:
@@ -1674,8 +1700,8 @@ def _preparar_xml_nfe(
     chave_raw = str(inf_nfe.attrib.get("Id", "")).replace("NFe", "").strip()
     if len(chave_raw) != 44:
         chave_raw = "".join([str(random.randint(0, 9)) for _ in range(44)])
-    if chave_raw in chaves_existentes or chave_raw in chaves_lote:
-        return None, [], f"Nota bloqueada: Chave {chave_raw[:12]}... já consta na base deste cliente."
+    if chave_raw in chaves_lote:
+        return None, [], f"Nota bloqueada: Chave {chave_raw[:12]}... repetida no lote."
 
     ide = _xml_filho(inf_nfe, "ide")
     emit = _xml_filho(inf_nfe, "emit")
@@ -1731,6 +1757,8 @@ def _preparar_xml_nfe(
         numero_item = str(det.attrib.get("nItem") or ordinal).strip()
         if not numero_item.isdigit() or numero_item in numeros_itens:
             numero_item = str(ordinal)
+            while numero_item in numeros_itens:
+                numero_item = str(int(numero_item) + 1)
         numeros_itens.add(numero_item)
         prod = _xml_filho(det, "prod")
         xprod = _xml_texto(prod, "xProd", "Item NF-e")
@@ -1740,11 +1768,7 @@ def _preparar_xml_nfe(
         vprod = _float_seguro(_xml_texto(prod, "vProd", "0"), 0.0)
         itens.append({
             "empresa_id": empresa_id_ativo,
-            "item_uid": _gerar_item_uid(
-                empresa_id_ativo,
-                chave_raw,
-                numero_item,
-            ),
+            "item_uid": _gerar_item_uid(chave_raw, numero_item),
             "nitem": int(numero_item),
             "descricao": xprod,
             "ncm": ncm,
@@ -1754,6 +1778,68 @@ def _preparar_xml_nfe(
         })
 
     return payload_nf, itens, ""
+
+
+def _limpar_itens_anteriores(
+    supabase,
+    empresa_id,
+    nota_ids: set[str],
+) -> bool:
+    if not nota_ids:
+        return True
+    chave_sessao = f"fallback_itens_{empresa_id}"
+    if supabase is None:
+        st.session_state[chave_sessao] = [
+            item
+            for item in st.session_state.get(chave_sessao, [])
+            if str(item.get("nota_id")) not in nota_ids
+        ]
+        return True
+
+    try:
+        espelho_resposta = (
+            supabase.table("praesidium_empresa_mirror")
+            .select("record_key,payload")
+            .eq("empresa_id", empresa_id)
+            .eq("record_type", "item")
+            .execute()
+        )
+        chaves_espelho = [
+            str(linha.get("record_key"))
+            for linha in (espelho_resposta.data or [])
+            if isinstance(linha.get("payload"), dict)
+            and str(linha["payload"].get("nota_id")) in nota_ids
+            and linha.get("record_key")
+        ]
+        if chaves_espelho:
+            (
+                supabase.table("praesidium_empresa_mirror")
+                .delete()
+                .eq("empresa_id", empresa_id)
+                .eq("record_type", "item")
+                .in_("record_key", chaves_espelho)
+                .execute()
+            )
+        (
+            supabase.table("itens_nota_fiscal")
+            .delete()
+            .eq("empresa_id", empresa_id)
+            .in_("nota_id", list(nota_ids))
+            .execute()
+        )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao limpar itens truncados antes do reprocessamento da empresa %s.",
+            empresa_id,
+        )
+        return False
+
+    st.session_state[chave_sessao] = [
+        item
+        for item in st.session_state.get(chave_sessao, [])
+        if str(item.get("nota_id")) not in nota_ids
+    ]
+    return True
 
 
 def processar_devolucao_nfe_xml(
@@ -2056,9 +2142,15 @@ def processar_xml_lote_bytes(
     empresa_ativa: dict,
     cnpjs_adicionais_autorizados: list[str] | None = None,
 ) -> list[tuple[bool, str]]:
-    hashes_existentes, chaves_existentes = _carregar_indices_duplicidade(
-        supabase, empresa_id_ativo
+    notas_existentes = _carregar_notas_existentes(supabase, empresa_id_ativo)
+    notas_locais = st.session_state.get(
+        f"fallback_notas_{empresa_id_ativo}",
+        [],
     )
+    for nota_local in notas_locais:
+        chave_local = str(nota_local.get("chave_acesso") or "")
+        if chave_local and nota_local.get("id") is not None:
+            notas_existentes.setdefault(chave_local, nota_local)
     hashes_lote: set[str] = set()
     chaves_lote: set[str] = set()
     preparados = []
@@ -2090,8 +2182,6 @@ def processar_xml_lote_bytes(
             conteudo,
             empresa_id_ativo,
             empresa_ativa,
-            hashes_existentes,
-            chaves_existentes,
             hashes_lote,
             chaves_lote,
             cnpjs_autorizados,
@@ -2104,23 +2194,76 @@ def processar_xml_lote_bytes(
     if not preparados:
         return resultados
 
-    ok_notas, mensagem_notas, notas_resultado = inserir_seguro_supabase(
-        supabase,
-        "notas_fiscais_recebidas",
-        [nota for _, _, nota, _ in preparados],
-    )
-    if not ok_notas or len(notas_resultado) != len(preparados):
-        for indice, _, _, _ in preparados:
-            resultados[indice] = (False, "Não foi possível registrar a nota. Tente novamente.")
-        return resultados
+    notas_por_chave = {}
+    novas_notas = []
+    notas_para_atualizar = []
+    for item_preparado in preparados:
+        indice, _, nota_payload, _ = item_preparado
+        chave = str(nota_payload["chave_acesso"])
+        nota_existente = notas_existentes.get(chave)
+        if nota_existente is not None:
+            notas_para_atualizar.append((item_preparado, nota_existente))
+        else:
+            novas_notas.append(item_preparado)
 
-    notas_por_chave = {
-        str(nota.get("chave_acesso")): nota
-        for nota in notas_resultado
-    }
+    mensagem_notas = "OK"
+    for item_preparado, nota_existente in notas_para_atualizar:
+        indice, _, nota_payload, _ = item_preparado
+        nota_id_existente = nota_existente.get("id")
+        if nota_id_existente is None:
+            resultados[indice] = (
+                False,
+                "A nota existente não possui vínculo persistente para sincronizar os itens.",
+            )
+            continue
+        ok_atualizacao, mensagem_atualizacao, atualizada = executar_update_seguro(
+            supabase,
+            "notas_fiscais_recebidas",
+            nota_payload,
+            {
+                "id": nota_id_existente,
+                "empresa_id": empresa_id_ativo,
+            },
+            fallback_record=nota_existente,
+        )
+        if not ok_atualizacao:
+            resultados[indice] = (
+                False,
+                "Não foi possível atualizar a nota existente para sincronizar seus itens.",
+            )
+            continue
+        notas_por_chave[str(nota_payload["chave_acesso"])] = (
+            atualizada[0] if atualizada else {**nota_existente, **nota_payload}
+        )
+        if mensagem_atualizacao != "OK":
+            mensagem_notas = mensagem_atualizacao
+
+    if novas_notas:
+        ok_notas, mensagem_novas_notas, notas_resultado = inserir_seguro_supabase(
+            supabase,
+            "notas_fiscais_recebidas",
+            [nota for _, _, nota, _ in novas_notas],
+        )
+        if not ok_notas or len(notas_resultado) != len(novas_notas):
+            for indice, _, _, _ in novas_notas:
+                resultados[indice] = (
+                    False,
+                    "Não foi possível registrar a nota. Tente novamente.",
+                )
+            return resultados
+        mensagem_notas = mensagem_novas_notas
+        notas_por_chave.update({
+            str(nota.get("chave_acesso")): nota
+            for nota in notas_resultado
+            if nota.get("chave_acesso")
+        })
+
     itens_lote = []
     dados_sucesso = []
+    notas_reprocessadas_ids = set()
     for indice, nome_arquivo, nota_payload, itens in preparados:
+        if not resultados[indice][0] and resultados[indice][1] != "Não foi possível processar o XML.":
+            continue
         nota_resultado = notas_por_chave.get(str(nota_payload["chave_acesso"]))
         nota_id = nota_resultado.get("id") if nota_resultado else None
         if nota_id is None:
@@ -2158,8 +2301,37 @@ def processar_xml_lote_bytes(
             })
         itens_lote.extend(itens_da_nota)
         dados_sucesso.append((indice, nome_arquivo, nota_payload, itens_da_nota))
+        if str(nota_payload["chave_acesso"]) in {
+            str(nota["chave_acesso"])
+            for _, nota in notas_para_atualizar
+        }:
+            notas_reprocessadas_ids.add(str(nota_id))
 
     if itens_lote:
+        if not _limpar_itens_anteriores(
+            supabase,
+            empresa_id_ativo,
+            notas_reprocessadas_ids,
+        ):
+            for indice, _, nota_payload, _ in dados_sucesso:
+                if str(notas_por_chave[str(nota_payload["chave_acesso"])].get("id")) in notas_reprocessadas_ids:
+                    resultados[indice] = (
+                        False,
+                        "Não foi possível preparar a sincronização dos itens existentes.",
+                    )
+            dados_sucesso = [
+                dados
+                for dados in dados_sucesso
+                if str(notas_por_chave[str(dados[2]["chave_acesso"])].get("id"))
+                not in notas_reprocessadas_ids
+            ]
+            itens_lote = [
+                item
+                for _, _, _, itens_nota in dados_sucesso
+                for item in itens_nota
+            ]
+        if not itens_lote:
+            return resultados
         ok_itens, mensagem_itens, _ = inserir_seguro_supabase(
             supabase, "itens_nota_fiscal", itens_lote
         )
@@ -2335,13 +2507,9 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                     if status_it == "Quarentena Uso/Consumo":
                         aliq = ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
                     novos_itens.append({
-                        "empresa_id": empresa_id_ativo,
-                        "nota_id": n_id,
-                        "item_uid": _gerar_item_uid(
-                            empresa_id_ativo,
-                            chave_sim,
-                            str(nitem),
-                        ),
+                            "empresa_id": empresa_id_ativo,
+                            "nota_id": n_id,
+                            "item_uid": _gerar_item_uid(chave_sim, nitem),
                         "nitem": nitem,
                         "descricao": desc,
                         "ncm": ncm,
