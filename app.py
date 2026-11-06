@@ -561,49 +561,77 @@ def decodificar_log_acesso(row: dict) -> dict | None:
     try:
         log = json.loads(conteudo)
     except (TypeError, ValueError):
-        campos = conteudo.split("|", 3)
-        if len(campos) != 4:
+        campos = conteudo.split("|", 4)
+        if len(campos) == 5:
+            ts_epoch, data_hora, username, nome, evento = campos
+            try:
+                data_log = datetime.fromtimestamp(
+                    int(ts_epoch),
+                    tz=timezone(timedelta(hours=-3)),
+                )
+                timestamp = data_log.isoformat(timespec="microseconds")
+            except (OverflowError, OSError, ValueError):
+                timestamp = ""
+            log = {
+                "ts_epoch": ts_epoch,
+                "datetime": data_hora,
+                "timestamp": timestamp,
+                "username": username,
+                "name": nome,
+                "event": evento,
+            }
+        elif len(campos) == 4:
+            data_hora, username, nome, evento = campos
+            try:
+                timestamp_id = str(row.get("cnpj", ""))[4:]
+                data_log = datetime.strptime(data_hora, "%d/%m/%Y %H:%M:%S")
+                if SESSION_TIMESTAMP_RE.fullmatch(timestamp_id):
+                    data_log = datetime.strptime(timestamp_id, "%Y%m%d%H%M%S%f")
+                timestamp = data_log.replace(
+                    tzinfo=timezone(timedelta(hours=-3))
+                ).isoformat(timespec="microseconds")
+            except ValueError:
+                timestamp = ""
+            log = {
+                "datetime": data_hora,
+                "timestamp": timestamp,
+                "username": username,
+                "name": nome,
+                "event": evento,
+            }
+        else:
             logging.getLogger(__name__).error("Registro de acesso do Supabase malformado.")
             return None
-        data_hora, username, nome, evento = campos
-        try:
-            timestamp_id = str(row.get("cnpj", ""))[4:]
-            data_log = datetime.strptime(data_hora, "%d/%m/%Y %H:%M:%S")
-            if SESSION_TIMESTAMP_RE.fullmatch(timestamp_id):
-                data_log = datetime.strptime(timestamp_id, "%Y%m%d%H%M%S%f")
-            timestamp = data_log.replace(
-                tzinfo=timezone(timedelta(hours=-3))
-            ).isoformat(timespec="microseconds")
-        except ValueError:
-            timestamp = ""
-        log = {
-            "datetime": data_hora,
-            "timestamp": timestamp,
-            "username": username,
-            "name": nome,
-            "event": evento,
-        }
     return log if isinstance(log, dict) else None
 
 
-def filtrar_logs_ultimos_sete_dias(logs: list[dict]) -> list[dict]:
-    limite = datetime.now(timezone(timedelta(hours=-3))) - timedelta(days=7)
+def _data_hora_log_acesso(log: dict) -> datetime | None:
+    try:
+        data_log = datetime.fromisoformat(str(log.get("timestamp", "")))
+        if data_log.tzinfo is None:
+            data_log = data_log.replace(tzinfo=timezone(timedelta(hours=-3)))
+        return data_log
+    except ValueError:
+        try:
+            return datetime.strptime(
+                str(log.get("datetime", "")), "%d/%m/%Y %H:%M:%S"
+            ).replace(tzinfo=timezone(timedelta(hours=-3)))
+        except ValueError:
+            return None
+
+
+def filtrar_logs_ultimas_horas(logs: list[dict], horas: int) -> list[dict]:
+    limite = datetime.now(timezone(timedelta(hours=-3))) - timedelta(hours=horas)
     recentes = []
     for log in logs:
-        try:
-            data_log = datetime.fromisoformat(str(log.get("timestamp", "")))
-            if data_log.tzinfo is None:
-                data_log = data_log.replace(tzinfo=timezone(timedelta(hours=-3)))
-        except ValueError:
-            try:
-                data_log = datetime.strptime(
-                    str(log.get("datetime", "")), "%d/%m/%Y %H:%M:%S"
-                ).replace(tzinfo=timezone(timedelta(hours=-3)))
-            except ValueError:
-                continue
-        if data_log >= limite:
+        data_log = _data_hora_log_acesso(log)
+        if data_log is not None and data_log >= limite:
             recentes.append(log)
     return recentes
+
+
+def filtrar_logs_ultimos_sete_dias(logs: list[dict]) -> list[dict]:
+    return filtrar_logs_ultimas_horas(logs, 24 * 7)
 
 
 def payload_usuario_supabase(usuario: str, dados_usuario: dict) -> dict:
@@ -689,10 +717,13 @@ def buscar_usuario_persistido(usuario: str) -> dict | None:
 def persistir_log_supabase(log_acesso: dict) -> None:
     if supabase is None:
         raise RuntimeError("Supabase indisponível para persistir o log.")
+    timestamp = datetime.fromisoformat(str(log_acesso["timestamp"]))
+    ts_epoch = int(timestamp.timestamp())
+    cnpj_suffix = f"{int(timestamp.timestamp() * 1_000_000) % 10**12:012d}"
     ok, mensagem, _ = xml_engine.executar_insert_seguro("empresas_monitoradas", {
-        "cnpj": f"LOG_{log_acesso['timestamp_id']}",
+        "cnpj": f"99{cnpj_suffix}",
         "razao_social": (
-            f"{PREFIXO_LOG_SISTEMA}{log_acesso['datetime']}|"
+            f"{PREFIXO_LOG_SISTEMA}{ts_epoch}|{log_acesso['datetime']}|"
             f"{log_acesso['username']}|{log_acesso['name']}|{log_acesso['event']}"
         ),
         "regime_tributario": "SYS_LOG",
@@ -700,45 +731,6 @@ def persistir_log_supabase(log_acesso: dict) -> None:
     }, supabase=supabase)
     if not ok:
         raise RuntimeError(mensagem)
-    limpar_logs_antigos_supabase()
-
-
-def limpar_logs_antigos_supabase() -> None:
-    if supabase is None:
-        return
-    cutoff = datetime.now(timezone(timedelta(hours=-3))) - timedelta(days=7)
-    registros = []
-    for regime in ("SYS_LOG", "SYS_AUTH"):
-        registros.extend(consultar_todas_paginas(
-            lambda regime=regime: (
-                supabase.table("empresas_monitoradas")
-                .select("cnpj,razao_social,regime_tributario")
-                .eq("regime_tributario", regime)
-            )
-        ))
-    ids_antigos = []
-    for row in registros:
-        log = decodificar_log_acesso(row)
-        if not log:
-            continue
-        timestamp = str(log.get("timestamp") or "")
-        try:
-            data_log = datetime.fromisoformat(timestamp)
-            if data_log.tzinfo is None:
-                data_log = data_log.replace(tzinfo=timezone(timedelta(hours=-3)))
-        except ValueError:
-            try:
-                data_log = datetime.strptime(
-                    str(log.get("datetime", "")), "%d/%m/%Y %H:%M:%S"
-                ).replace(tzinfo=timezone(timedelta(hours=-3)))
-            except ValueError:
-                continue
-        if data_log < cutoff and row.get("cnpj"):
-            ids_antigos.append(row["cnpj"])
-    if ids_antigos:
-        supabase.table("empresas_monitoradas").delete().in_(
-            "cnpj", ids_antigos
-        ).in_("regime_tributario", ["SYS_LOG", "SYS_AUTH"]).execute()
 
 
 def salvar_registro_global(registro: dict) -> None:
@@ -1452,10 +1444,6 @@ def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
                 supabase.table("split_payment_events")
                 .select("*")
                 .eq("empresa_id", emp_id)
-                .gte(
-                    "occurred_at",
-                    (datetime.now(timezone.utc) - timedelta(days=400)).isoformat(),
-                )
             )
         )
     except Exception:
@@ -1464,6 +1452,29 @@ def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
             emp_id,
         )
 
+    espelho = xml_engine.carregar_espelho_empresa(supabase, emp_id)
+    devs_lista = xml_engine.combinar_registros_espelho(
+        devs_lista,
+        espelho["devolucao"],
+        "devolucao",
+    )
+    itens_lista = xml_engine.combinar_registros_espelho(
+        itens_lista,
+        espelho["item"],
+        "item",
+    )
+    eventos_split = xml_engine.combinar_registros_espelho(
+        eventos_split,
+        espelho["split_payment"],
+        "split_payment",
+    )
+    for indice, registro in enumerate(devs_lista):
+        registro.setdefault("id", f"mirror_devolucao_{indice}")
+    for indice, registro in enumerate(eventos_split):
+        registro.setdefault(
+            "id",
+            f"mirror_split_{registro.get('event_id') or indice}",
+        )
     return notas_lista, devs_lista, itens_lista, [], eventos_split
 
 
@@ -1589,6 +1600,11 @@ def renderizar_radar_admin() -> None:
             logs_acesso = filtrar_logs_ultimos_sete_dias(
                 [dict(log) for log in registro_global["access_logs"]]
             )
+        logs_24h = filtrar_logs_ultimas_horas(logs_acesso, 24)
+        st.caption(
+            f"Acessos nas últimas 24 horas: {len(logs_24h)} | "
+            f"Últimos 7 dias: {len(logs_acesso)}"
+        )
         if logs_acesso:
             st.caption(f"Histórico persistente dos últimos 7 dias ({len(logs_acesso)}):")
             st.dataframe(
@@ -2020,10 +2036,10 @@ itens_mes = [
     i for i in itens
     if periodo_por_nota.get(str(i.get("nota_id"))) == competencia_atual
 ]
-resumo_creditos_mes = xml_engine.calcular_resumo_creditos(itens_mes)
-imposto_validado_mes = resumo_creditos_mes["validado"]
-imposto_quarentena = resumo_creditos_mes["quarentena"]
-imposto_bruto_mes = resumo_creditos_mes["bruto"]
+resumo_creditos_acumulado = xml_engine.calcular_resumo_creditos(itens)
+imposto_validado_acumulado = resumo_creditos_acumulado["validado"]
+imposto_quarentena_acumulado = resumo_creditos_acumulado["quarentena"]
+imposto_bruto_acumulado = resumo_creditos_acumulado["bruto"]
 ids_notas_mes = {
     str(n.get("id"))
     for n in notas
@@ -2047,34 +2063,23 @@ devolucoes_mes = [
     for devolucao in devolucoes
     if devolucao_na_competencia(devolucao, competencia_atual)
 ]
-imposto_estornado = sum(float(d.get("credito_estornado", 0.0)) for d in devolucoes_mes)
+imposto_estornado = sum(
+    float(d.get("credito_estornado", 0.0) or 0.0)
+    for d in devolucoes
+)
 
 
-def evento_split_na_competencia(evento: dict, competencia: pd.Period) -> bool:
-    data_evento = pd.to_datetime(
-        evento.get("occurred_at"),
-        errors="coerce",
-        utc=True,
-    )
-    return bool(
-        not pd.isna(data_evento)
-        and data_evento.tz_convert(None).to_period("M") == competencia
-    )
-
-
-eventos_split_mes = [
-    evento
-    for evento in eventos_split
-    if evento_split_na_competencia(evento, competencia_atual)
-]
 valor_retido_split_payment = sum(
     max(0.0, float(evento.get("retained_amount", 0.0) or 0.0))
-    for evento in eventos_split_mes
+    for evento in eventos_split
 )
-credito_validado_tempo_real = imposto_validado_mes
+credito_validado_tempo_real = max(
+    0.0,
+    imposto_validado_acumulado - imposto_estornado - valor_retido_split_payment,
+)
 saldo_credito_disponivel = max(
     0.0,
-    credito_validado_tempo_real - imposto_estornado - valor_retido_split_payment,
+    credito_validado_tempo_real,
 )
 
 # ==========================================
@@ -2085,8 +2090,8 @@ col1, col2, col3 = st.columns(3)
 with col1:
     st.markdown(f"""
     <div class="exec-card card-bruto">
-        <div class="card-label">⚡ Crédito Digital Bruto (Mês)</div>
-        <div class="card-value-bruto">R$ {imposto_bruto_mes:,.2f}</div>
+        <div class="card-label">⚡ Crédito Digital Bruto Acumulado</div>
+        <div class="card-value-bruto">R$ {imposto_bruto_acumulado:,.2f}</div>
         <div class="card-desc">Alíquotas inteligentes por NCM/CNAE para {empresa_ativa['razao_social']}</div>
     </div>
     """, unsafe_allow_html=True)
@@ -2094,7 +2099,7 @@ with col1:
 with col2:
     st.markdown(f"""
     <div class="exec-card card-validado">
-        <div class="card-label">✅ Crédito Validado (Tempo Real)</div>
+        <div class="card-label">✅ Crédito Validado / Saldo Líquido</div>
         <div class="card-value-validado">R$ {credito_validado_tempo_real:,.2f}</div>
         <div class="card-desc">Após estornos e retenção Split Payment de R$ {valor_retido_split_payment:,.2f}: R$ {saldo_credito_disponivel:,.2f}</div>
     </div>
@@ -2104,7 +2109,7 @@ with col3:
     st.markdown(f"""
     <div class="exec-card card-quarentena">
         <div class="card-label">🔒 Saldo em Quarentena</div>
-        <div class="card-value-quarentena">R$ {imposto_quarentena:,.2f}</div>
+        <div class="card-value-quarentena">R$ {imposto_quarentena_acumulado:,.2f}</div>
         <div class="card-desc">Aguardando decisão técnica do contador (Zero bloqueio automático)</div>
     </div>
     """, unsafe_allow_html=True)
@@ -2162,8 +2167,13 @@ with st.expander("📊 Histórico Anual da Empresa (Últimos 12 Meses)", expande
     else:
         st.info("O histórico será consolidado automaticamente após a primeira importação de XML.")
 
-creditos_auditados = resumo_creditos_mes["validado"] + resumo_creditos_mes["rejeitado"]
-creditos_total_auditavel = creditos_auditados + resumo_creditos_mes["quarentena"]
+creditos_auditados = (
+    resumo_creditos_acumulado["validado"]
+    + resumo_creditos_acumulado["rejeitado"]
+)
+creditos_total_auditavel = (
+    creditos_auditados + resumo_creditos_acumulado["quarentena"]
+)
 indice_governanca = (
     creditos_auditados / creditos_total_auditavel
     if creditos_total_auditavel > 0
@@ -2622,9 +2632,9 @@ renderizar_simulador(
 # MÓDULO 8: DOSSIÊ EXECUTIVO DE FECHAMENTO
 relatorio_engine.renderizar_modulo_relatorio(
     empresa_ativa,
-    imposto_bruto_mes,
+    imposto_bruto_acumulado,
     credito_validado_tempo_real,
-    imposto_quarentena,
+    imposto_quarentena_acumulado,
     imposto_estornado,
     notas,
     itens,

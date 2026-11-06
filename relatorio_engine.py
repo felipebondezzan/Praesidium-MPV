@@ -90,7 +90,8 @@ def montar_dataframe_relacional(notas: list, itens: list) -> pd.DataFrame:
     linhas = []
     notas_com_itens = set()
 
-    for item in (itens or []):
+    for item_bruto in (itens or []):
+        item = xml_engine.normalizar_item_credito(item_bruto)
         n_id = item.get("nota_id")
         notas_com_itens.add(n_id)
         nota_info = mapa_notas.get(n_id, {})

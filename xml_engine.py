@@ -325,6 +325,17 @@ def processar_webhook_split_payment(
         )
         dados = resultado.data or []
         if dados:
+            espelhado = persistir_espelho_empresa(
+                supabase,
+                empresa["id"],
+                "split_payment",
+                dados,
+            )
+            if not espelhado:
+                logging.getLogger(__name__).error(
+                    "Evento de Split Payment foi gravado na tabela primária, "
+                    "mas o espelho persistente falhou."
+                )
             limpar_caches_dados()
             return True, "Evento de retenção registrado.", dados[0]
         return False, "Não foi possível confirmar o evento de retenção.", {}
@@ -346,6 +357,12 @@ def processar_webhook_split_payment(
                     and str(registros[0].get("payload_sha256", ""))
                     == payload["payload_sha256"]
                 ):
+                    persistir_espelho_empresa(
+                        supabase,
+                        empresa["id"],
+                        "split_payment",
+                        registros,
+                    )
                     return True, "Evento já processado anteriormente.", registros[0]
             except Exception:
                 logging.getLogger(__name__).exception(
@@ -355,6 +372,14 @@ def processar_webhook_split_payment(
             "Falha ao persistir evento de Split Payment para empresa %s.",
             empresa_id,
         )
+        if persistir_espelho_empresa(
+            supabase,
+            empresa["id"],
+            "split_payment",
+            payload,
+        ):
+            limpar_caches_dados()
+            return True, "Evento de retenção registrado no espelho persistente.", payload
         return False, "Não foi possível registrar o evento de retenção.", {}
 
 
@@ -497,6 +522,143 @@ def _status_credito_persistido(classificacao: str) -> str:
     if classificacao in {"Rejeitado", "Rejeitado pelo Contador"}:
         return "Rejeitado"
     return classificacao or "N/A"
+
+
+_TIPOS_ESPELHO = {
+    "itens_nota_fiscal": "item",
+    "conciliacao_devolucoes": "devolucao",
+    "split_payment_events": "split_payment",
+}
+
+
+def _chave_registro_espelho(tipo: str, registro: dict) -> str:
+    if tipo == "item":
+        return str(registro.get("item_uid") or registro.get("id") or "")
+    if tipo == "devolucao":
+        return str(
+            registro.get("chave_nota_devolucao")
+            or registro.get("id")
+            or ""
+        )
+    if tipo == "split_payment":
+        return str(registro.get("event_id") or "")
+    return str(registro.get("id") or "")
+
+
+def persistir_espelho_empresa(
+    supabase,
+    empresa_id,
+    tipo: str,
+    registros: list[dict] | dict,
+) -> bool:
+    if supabase is None or not empresa_id or not tipo:
+        return False
+    entradas = registros if isinstance(registros, list) else [registros]
+    payload = []
+    for registro in entradas:
+        dado = dict(registro)
+        empresa_registro = dado.get("empresa_id", empresa_id)
+        if str(empresa_registro) != str(empresa_id):
+            logging.getLogger(__name__).error(
+                "Espelho recusou registro com empresa divergente."
+            )
+            return False
+        chave = _chave_registro_espelho(tipo, dado)
+        if not chave:
+            logging.getLogger(__name__).error(
+                "Espelho recusou registro sem chave idempotente (%s).",
+                tipo,
+            )
+            return False
+        payload.append({
+            "empresa_id": empresa_id,
+            "record_type": tipo,
+            "record_key": chave,
+            "payload": dado,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+    if not payload:
+        return True
+    try:
+        supabase.table("praesidium_empresa_mirror").upsert(
+            payload,
+            on_conflict="empresa_id,record_type,record_key",
+        ).execute()
+        return True
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao persistir o espelho %s da empresa %s.",
+            tipo,
+            empresa_id,
+        )
+        return False
+
+
+def carregar_espelho_empresa(supabase, empresa_id) -> dict[str, list[dict]]:
+    if supabase is None or not empresa_id:
+        return {"item": [], "devolucao": [], "split_payment": []}
+    try:
+        linhas = []
+        inicio = 0
+        while True:
+            resposta = (
+                supabase.table("praesidium_empresa_mirror")
+                .select("record_type,record_key,payload")
+                .eq("empresa_id", empresa_id)
+                .range(inicio, inicio + 999)
+                .execute()
+            )
+            pagina = resposta.data or []
+            linhas.extend(pagina)
+            if len(pagina) < 1000:
+                break
+            inicio += 1000
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao carregar o espelho persistente da empresa %s.",
+            empresa_id,
+        )
+        return {"item": [], "devolucao": [], "split_payment": []}
+
+    registros: dict[str, list[dict]] = {
+        "item": [],
+        "devolucao": [],
+        "split_payment": [],
+    }
+    for linha in linhas:
+        tipo = str(linha.get("record_type", ""))
+        dado = linha.get("payload")
+        if tipo not in registros or not isinstance(dado, dict):
+            continue
+        normalizado = dict(dado)
+        normalizado.setdefault("empresa_id", empresa_id)
+        if str(normalizado["empresa_id"]) != str(empresa_id):
+            continue
+        if tipo == "item":
+            normalizado = normalizar_item_credito(normalizado)
+            normalizado.setdefault(
+                "id",
+                f"mirror_{linha.get('record_key') or normalizado.get('item_uid', '')}",
+            )
+        registros[tipo].append(normalizado)
+    return registros
+
+
+def combinar_registros_espelho(
+    principais: list[dict],
+    espelho: list[dict],
+    tipo: str,
+) -> list[dict]:
+    combinados = {}
+    for registro in principais:
+        chave = _chave_registro_espelho(tipo, registro)
+        if chave:
+            combinados[chave] = dict(registro)
+    for registro in espelho:
+        chave = _chave_registro_espelho(tipo, registro)
+        if chave:
+            combinados[chave] = {**combinados.get(chave, {}), **registro}
+    return list(combinados.values())
 
 
 # ==========================================
@@ -807,7 +969,7 @@ def _guardar_fallback(tabela: str, payload, operacao: str = "insert", filtros: d
             "notas_fiscais_recebidas", "itens_nota_fiscal", "conciliacao_devolucoes"
         } else prefixo
         existentes = list(st.session_state.get(chave_sessao, []))
-        identificador = registro.get("id")
+        identificador = registro.get("item_uid") or registro.get("id")
         encontrado = False
         for indice, existente in enumerate(existentes):
             filtros_correspondem = all(
@@ -816,7 +978,9 @@ def _guardar_fallback(tabela: str, payload, operacao: str = "insert", filtros: d
             )
             mesmo_id = (
                 identificador is not None
-                and str(existente.get("id")) == str(identificador)
+                and str(
+                    existente.get("item_uid") or existente.get("id")
+                ) == str(identificador)
             )
             corresponde = (
                 (mesmo_id or filtros_correspondem)
@@ -849,6 +1013,25 @@ def _remover_coluna(payload, coluna: str) -> None:
         registro.pop(coluna, None)
 
 
+def _persistir_payload_no_espelho(supabase, tabela: str, registros: list[dict]) -> bool:
+    tipo = _TIPOS_ESPELHO.get(tabela)
+    if not tipo or not registros:
+        return False
+    empresa_ids = {str(registro.get("empresa_id", "")) for registro in registros}
+    if len(empresa_ids) != 1 or not next(iter(empresa_ids)):
+        logging.getLogger(__name__).error(
+            "Espelho recusou lote sem empresa única na tabela %s.",
+            tabela,
+        )
+        return False
+    return persistir_espelho_empresa(
+        supabase,
+        next(iter(empresa_ids)),
+        tipo,
+        registros,
+    )
+
+
 def executar_insert_seguro(
     tabela: str,
     payload,
@@ -877,11 +1060,25 @@ def executar_insert_seguro(
         )
 
     colunas_corrigidas = set()
+    conflito_item_uid = tabela == "itens_nota_fiscal"
     for _ in range(32):
         try:
             construtor = supabase.table(tabela)
-            construtor = construtor.upsert(dados) if operacao == "upsert" else construtor.insert(dados)
+            if operacao == "upsert" or tabela == "itens_nota_fiscal":
+                if conflito_item_uid and all(
+                    registro.get("item_uid") for registro in registros
+                ):
+                    construtor = construtor.upsert(
+                        dados,
+                        on_conflict="item_uid",
+                    )
+                else:
+                    construtor = construtor.upsert(dados)
+            else:
+                construtor = construtor.insert(dados)
             resultado = construtor.select("*").execute()
+            persistidos = resultado.data if resultado.data else registros
+            _persistir_payload_no_espelho(supabase, tabela, persistidos)
             return True, "OK", (resultado.data if resultado.data else [])
         except Exception as erro:
             codigo = _codigo_erro_supabase(erro)
@@ -934,26 +1131,43 @@ def executar_insert_seguro(
                 return False, "Não foi possível vincular os dados à empresa ativa.", []
             if codigo == "PGRST204" and coluna and coluna in colunas_presentes:
                 _remover_coluna(dados, coluna)
+                if coluna == "item_uid":
+                    conflito_item_uid = False
                 continue
             if isinstance(dados, list) and len(dados) > 1:
                 registros_salvos = []
+                falha_individual = False
                 for registro in dados:
                     try:
-                        resposta_item = (
-                            supabase.table(tabela)
-                            .insert(registro)
-                            .select("*")
-                            .execute()
-                        )
+                        construtor_item = supabase.table(tabela)
+                        if tabela == "itens_nota_fiscal":
+                            if conflito_item_uid and registro.get("item_uid"):
+                                construtor_item = construtor_item.upsert(
+                                    registro,
+                                    on_conflict="item_uid",
+                                )
+                            else:
+                                construtor_item = construtor_item.upsert(registro)
+                        else:
+                            construtor_item = construtor_item.insert(registro)
+                        resposta_item = construtor_item.select("*").execute()
                         registros_salvos.extend(resposta_item.data or [])
                     except Exception:
+                        falha_individual = True
                         logging.getLogger(__name__).exception(
                             "Falha no fallback individual da tabela %s.",
                             tabela,
                         )
-                        registros_salvos.extend(_guardar_fallback(tabela, registro))
-                if len(registros_salvos) == len(dados):
+                if not falha_individual and len(registros_salvos) == len(dados):
+                    _persistir_payload_no_espelho(
+                        supabase,
+                        tabela,
+                        registros_salvos or registros,
+                    )
                     return True, "Lote persistido com fallback individual.", registros_salvos
+            if _persistir_payload_no_espelho(supabase, tabela, registros):
+                limpar_caches_dados()
+                return True, "Espelho Supabase persistido.", registros
             logging.getLogger(__name__).exception(
                 "Falha ao gravar na tabela %s; usando armazenamento temporário da sessão.",
                 tabela,
@@ -965,6 +1179,9 @@ def executar_insert_seguro(
     logging.getLogger(__name__).error(
         "A recuperação de schema excedeu o limite de tentativas na tabela %s.", tabela
     )
+    if _persistir_payload_no_espelho(supabase, tabela, registros):
+        limpar_caches_dados()
+        return True, "Espelho Supabase persistido.", registros
     local = _guardar_fallback(tabela, dados)
     if local or tabela not in {"notas_fiscais_recebidas", "itens_nota_fiscal"}:
         return True, "Mantido temporariamente nesta sessão.", local
@@ -990,7 +1207,48 @@ def executar_update_seguro(
                 consulta = consulta.eq(coluna, valor)
             resultado = consulta.select("*").execute()
             if resultado.data:
+                if tabela in _TIPOS_ESPELHO:
+                    espelhados = []
+                    for registro in resultado.data:
+                        atualizado = {
+                            **(fallback_record or {}),
+                            **registro,
+                            **dados,
+                        }
+                        if atualizado.get("status_credito"):
+                            status_normalizado = normalizar_item_credito({
+                                "status_credito": atualizado["status_credito"],
+                            }).get("classificacao_item")
+                            if status_normalizado:
+                                atualizado["classificacao_item"] = status_normalizado
+                        espelhados.append(atualizado)
+                    _persistir_payload_no_espelho(
+                        supabase,
+                        tabela,
+                        espelhados,
+                    )
                 return True, "OK", resultado.data
+            if (
+                tabela in _TIPOS_ESPELHO
+                and fallback_record
+                and str(fallback_record.get("id", "")).startswith(
+                    ("mirror_", "local_")
+                )
+                and all(
+                    str(fallback_record.get(chave)) == str(valor)
+                    for chave, valor in filtros_ativos.items()
+                    if chave not in {"empresa_id", "nota_id", "id"}
+                )
+            ):
+                atualizado = {**fallback_record, **dados}
+                if _persistir_payload_no_espelho(
+                    supabase,
+                    tabela,
+                    [atualizado],
+                ):
+                    _guardar_fallback(tabela, atualizado, "update", filtros_ativos)
+                    limpar_caches_dados()
+                    return True, "Espelho Supabase atualizado.", [atualizado]
             return False, "A decisão já foi processada ou o item não está mais pendente.", []
         except Exception as erro:
             codigo = _codigo_erro_supabase(erro)
@@ -1021,6 +1279,27 @@ def executar_update_seguro(
                 dados.pop(coluna, None)
                 if dados:
                     continue
+            if (
+                tabela in _TIPOS_ESPELHO
+                and fallback_record
+                and str(fallback_record.get("id", "")).startswith(
+                    ("mirror_", "local_")
+                )
+                and all(
+                    str(fallback_record.get(chave)) == str(valor)
+                    for chave, valor in filtros_ativos.items()
+                    if chave not in {"empresa_id", "nota_id", "id"}
+                )
+            ):
+                atualizado = {**fallback_record, **dados}
+                if _persistir_payload_no_espelho(
+                    supabase,
+                    tabela,
+                    [atualizado],
+                ):
+                    _guardar_fallback(tabela, atualizado, "update", filtros_ativos)
+                    limpar_caches_dados()
+                    return True, "Espelho Supabase atualizado.", [atualizado]
             logging.getLogger(__name__).exception(
                 "Falha ao atualizar a tabela %s; tentando manter a alteração na sessão.",
                 tabela,
@@ -1289,10 +1568,27 @@ def gerar_xml_devolucao_nfe(
 def _xml_filhos(elemento, nome: str):
     if elemento is None:
         return []
-    return [
-        filho for filho in list(elemento)
-        if filho.tag.rsplit("}", 1)[-1] == nome
-    ]
+    candidatos = (
+        list(elemento.findall(nome))
+        + list(elemento.findall(f"{{*}}{nome}"))
+        + [
+            filho
+            for filho in list(elemento)
+            if filho.tag.rsplit("}", 1)[-1] == nome
+        ]
+    )
+    encontrados = []
+    vistos = set()
+    for filho in candidatos:
+        if id(filho) not in vistos:
+            vistos.add(id(filho))
+            encontrados.append(filho)
+    return encontrados
+
+
+def _gerar_item_uid(empresa_id, chave_acesso: str, numero_item: str) -> str:
+    identidade = f"{empresa_id}|{chave_acesso}|{numero_item}"
+    return hashlib.sha256(identidade.encode("utf-8")).hexdigest()
 
 
 def _xml_filho(elemento, nome: str):
@@ -1430,7 +1726,12 @@ def _preparar_xml_nfe(
     hashes_lote.add(hash_sha256)
     chaves_lote.add(chave_raw)
     itens = []
-    for det in _xml_filhos(inf_nfe, "det"):
+    numeros_itens = set()
+    for ordinal, det in enumerate(_xml_filhos(inf_nfe, "det"), start=1):
+        numero_item = str(det.attrib.get("nItem") or ordinal).strip()
+        if not numero_item.isdigit() or numero_item in numeros_itens:
+            numero_item = str(ordinal)
+        numeros_itens.add(numero_item)
         prod = _xml_filho(det, "prod")
         xprod = _xml_texto(prod, "xProd", "Item NF-e")
         ncm = _xml_texto(prod, "NCM", "00000000")
@@ -1439,6 +1740,12 @@ def _preparar_xml_nfe(
         vprod = _float_seguro(_xml_texto(prod, "vProd", "0"), 0.0)
         itens.append({
             "empresa_id": empresa_id_ativo,
+            "item_uid": _gerar_item_uid(
+                empresa_id_ativo,
+                chave_raw,
+                numero_item,
+            ),
+            "nitem": int(numero_item),
             "descricao": xprod,
             "ncm": ncm,
             "cfop": cfop,
@@ -1853,7 +2160,7 @@ def processar_xml_lote_bytes(
         dados_sucesso.append((indice, nome_arquivo, nota_payload, itens_da_nota))
 
     if itens_lote:
-        ok_itens, _, _ = inserir_seguro_supabase(
+        ok_itens, mensagem_itens, _ = inserir_seguro_supabase(
             supabase, "itens_nota_fiscal", itens_lote
         )
         if not ok_itens:
@@ -1887,8 +2194,18 @@ def processar_xml_lote_bytes(
         )
     if mensagem_notas != "OK":
         st.toast(
-            "Notas mantidas nesta sessão; sincronize novamente quando o banco estiver disponível.",
-            icon="ℹ️",
+            "Conexão indisponível: as notas foram mantidas temporariamente nesta sessão.",
+            icon="⚠️",
+        )
+    if itens_lote and mensagem_itens == "Espelho Supabase persistido.":
+        st.toast(
+            "Itens protegidos no espelho persistente do Supabase.",
+            icon="✅",
+        )
+    elif itens_lote and "temporariamente nesta sessão" in mensagem_itens:
+        st.toast(
+            "Banco indisponível: os itens estão na sessão e aguardam sincronização.",
+            icon="⚠️",
         )
     if dados_sucesso:
         st.toast(
@@ -2001,7 +2318,10 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 n_id = data_nf[0]["id"]
 
                 novos_itens = []
-                for desc, ncm, cfop, qcom, vprod in itens_sim:
+                for nitem, (desc, ncm, cfop, qcom, vprod) in enumerate(
+                    itens_sim,
+                    start=1,
+                ):
                     status_it, aliq, cred = classificar_item_inteligente(
                         ncm,
                         cfop,
@@ -2017,6 +2337,12 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                     novos_itens.append({
                         "empresa_id": empresa_id_ativo,
                         "nota_id": n_id,
+                        "item_uid": _gerar_item_uid(
+                            empresa_id_ativo,
+                            chave_sim,
+                            str(nitem),
+                        ),
+                        "nitem": nitem,
                         "descricao": desc,
                         "ncm": ncm,
                         "cfop": cfop,
@@ -2054,11 +2380,19 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 )
                 st.toast("Lote SEFAZ sincronizado e classificado com sucesso.", icon="✅")
                 if msg_nf != "OK":
-                    st.toast("Conexão temporária: o lote está disponível nesta sessão.", icon="ℹ️")
-                if msg_it != "OK":
                     st.toast(
-                        "Itens disponíveis nesta sessão; sincronização com o banco pendente.",
-                        icon="ℹ️",
+                        "Banco indisponível: a nota está mantida temporariamente nesta sessão.",
+                        icon="⚠️",
+                    )
+                if msg_it == "Espelho Supabase persistido.":
+                    st.toast(
+                        "Itens protegidos no espelho persistente do Supabase.",
+                        icon="✅",
+                    )
+                elif "temporariamente nesta sessão" in msg_it:
+                    st.toast(
+                        "Banco indisponível: os itens estão na sessão e aguardam sincronização.",
+                        icon="⚠️",
                     )
                 st.session_state["modulo_ativo"] = "xml"
                 st.rerun()
