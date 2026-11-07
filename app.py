@@ -1570,14 +1570,17 @@ def combinar_registros_com_sessao(
 
 
 def hidratar_dados_empresa_supabase(empresa_id: int | str) -> dict[str, list[dict]]:
-    if supabase is None:
-        raise RuntimeError("Supabase indisponível; os saldos não podem ser calculados.")
     if str(empresa_ativa.get("id", "")) != str(empresa_id):
         raise ValueError("A empresa ativa não corresponde à seleção atual.")
-    dados = xml_engine.hidratar_dados_empresa_supabase(
+    cache_hidratacao = st.session_state.setdefault(
+        "_dados_hidratados_por_empresa",
+        {},
+    )
+    dados = xml_engine.hidratar_dados_empresa_com_cache(
         supabase,
         empresa_id,
         empresa_ativa,
+        cache_hidratacao,
     )
     for nome in (
         "fallback_notas",
@@ -2025,22 +2028,28 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
     st.markdown("<hr style='border:0; border-top:1px solid #374151; margin:8px 0;'>", unsafe_allow_html=True)
     if st.button("🗑️ Excluir Cliente Ativo", use_container_width=True, key=f"btn_del_cli_{empresa_id_ativo}"):
         try:
-            nfs_cli = supabase.table("notas_fiscais_recebidas").select("id").eq("empresa_id", empresa_id_ativo).execute()
-            ids_nf = [n["id"] for n in (nfs_cli.data or [])]
-            if ids_nf:
-                try:
-                    supabase.table("conciliacao_devolucoes").delete().in_("nota_original_id", ids_nf).select("id").execute()
-                except Exception:
-                    pass
-                supabase.table("itens_nota_fiscal").delete().in_("nota_id", ids_nf).select("id").execute()
-                supabase.table("notas_fiscais_recebidas").delete().eq("empresa_id", empresa_id_ativo).select("id").execute()
-            resultado = supabase.table("empresas_monitoradas").delete().eq("id", empresa_id_ativo).select("id").execute()
-            if not resultado.data:
-                raise ValueError("Nenhum cliente foi excluído.")
+            xml_engine.excluir_empresa_supabase(supabase, empresa_id_ativo)
             st.session_state.pop(f"fallback_notas_{empresa_id_ativo}", None)
             st.session_state.pop(f"fallback_itens_{empresa_id_ativo}", None)
             st.session_state.pop(f"fallback_devolucoes_{empresa_id_ativo}", None)
+            st.session_state.get("_dados_hidratados_por_empresa", {}).pop(
+                str(empresa_id_ativo),
+                None,
+            )
             limpar_caches_dados()
+            proxima_empresa = next(
+                (
+                    empresa
+                    for empresa in lista_empresas
+                    if str(empresa.get("id")) != str(empresa_id_ativo)
+                ),
+                None,
+            )
+            st.session_state.pop(chave_empresa_selecao, None)
+            if proxima_empresa is None:
+                st.session_state.pop("empresa_id_ativa", None)
+            else:
+                st.session_state["empresa_id_ativa"] = proxima_empresa["id"]
             st.sidebar.success("Cliente excluído!")
             st.rerun()
         except Exception:
@@ -2063,15 +2072,7 @@ st.markdown(f"""
 # ==========================================
 # 7. CÁLCULO DOS DADOS DA EMPRESA SELECIONADA (COM SUPORTE A FALLBACK)
 # ==========================================
-try:
-    dados_empresa_hidratados = hidratar_dados_empresa_supabase(empresa_id_ativo)
-except (RuntimeError, ValueError):
-    logging.getLogger(__name__).exception("Falha ao carregar dados da empresa ativa.")
-    st.error(
-        "Não foi possível hidratar os dados fiscais do Supabase. "
-        "Os saldos não serão substituídos por zero ou por dados da sessão."
-    )
-    st.stop()
+dados_empresa_hidratados = hidratar_dados_empresa_supabase(empresa_id_ativo)
 
 notas = dados_empresa_hidratados["notas"]
 itens = [

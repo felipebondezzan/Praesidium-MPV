@@ -1526,6 +1526,61 @@ def _normalizar_item_hidratado(
     return normalizado
 
 
+def hidratar_dados_empresa_com_cache(
+    supabase,
+    empresa_id,
+    empresa_ativa: dict,
+    cache: dict[str, dict[str, list[dict]]],
+) -> dict[str, list[dict]]:
+    chave_cache = str(empresa_id)
+    try:
+        dados = hidratar_dados_empresa_supabase(
+            supabase,
+            empresa_id,
+            empresa_ativa,
+        )
+    except RuntimeError as erro:
+        logging.getLogger(__name__).warning(
+            "Falha temporária ao hidratar dados fiscais da empresa %s; "
+            "será usado o último snapshot válido. Motivo: %s",
+            empresa_id,
+            erro,
+        )
+        snapshot = cache.get(chave_cache)
+        if snapshot is not None:
+            return snapshot
+        return {
+            "notas": [],
+            "itens": [],
+            "devolucoes": [],
+            "eventos_split": [],
+        }
+    cache[chave_cache] = dados
+    return dados
+
+
+def excluir_empresa_supabase(supabase, empresa_id) -> dict:
+    if supabase is None:
+        raise RuntimeError("Supabase indisponível para excluir o cliente.")
+    if empresa_id is None or not str(empresa_id).strip():
+        raise ValueError("ID de cliente inválido.")
+
+    resposta = supabase.rpc(
+        "excluir_cliente_cascade",
+        {"p_empresa_id": str(empresa_id)},
+    ).execute()
+    resultado = resposta.data
+    if isinstance(resultado, list) and len(resultado) == 1:
+        resultado = resultado[0]
+    if (
+        not isinstance(resultado, dict)
+        or resultado.get("deleted") is not True
+        or str(resultado.get("empresa_id")) != str(empresa_id)
+    ):
+        raise RuntimeError("O Supabase não confirmou a exclusão do cliente.")
+    return resultado
+
+
 def hidratar_dados_empresa_supabase(
     supabase,
     empresa_id,
