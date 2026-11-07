@@ -7,6 +7,7 @@ import random
 import re
 import threading
 import time
+import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -416,29 +417,50 @@ def obter_data_referencia_nota(nota: dict):
     return None
 
 
+def _arredondar_dinheiro(valor) -> float:
+    try:
+        decimal = Decimal(str(valor or 0))
+    except (InvalidOperation, TypeError, ValueError):
+        return 0.0
+    if not decimal.is_finite():
+        return 0.0
+    return float(decimal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def obter_credito_quarentena(item: dict) -> float:
     """Calcula o crédito potencial com a alíquota persistida, compatível com dados legados."""
     item = normalizar_item_credito(item)
+    if item.get("credito_xml_informado"):
+        return _arredondar_dinheiro(
+            item.get("valor_credito_item", 0.0)
+        )
     credito = float(item.get("valor_credito_item", 0.0) or 0.0)
     if credito > 0:
         return credito
     aliquota = float(item.get("aliquota_aplicada", 0.0) or 0.0)
     if aliquota > 0:
-        return round(float(item.get("valor_item", 0.0) or 0.0) * aliquota, 2)
-    return round(
-        float(item.get("valor_item", 0.0) or 0.0)
-        * ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
-        2,
+        return _arredondar_dinheiro(
+            float(item.get("valor_item", 0.0) or 0.0) * aliquota
+        )
+    return _arredondar_dinheiro(
+        Decimal(str(item.get("valor_item", 0.0) or 0.0))
+        * Decimal(str(ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA))
     )
 
 
 def obter_credito_rejeitado(item: dict) -> float:
     item = normalizar_item_credito(item)
+    if item.get("credito_xml_informado"):
+        return _arredondar_dinheiro(
+            item.get("valor_credito_item", 0.0)
+        )
     credito = float(item.get("valor_credito_item", 0.0) or 0.0)
     if credito > 0:
         return credito
     aliquota = float(item.get("aliquota_aplicada", 0.0) or 0.0)
-    return round(float(item.get("valor_item", 0.0) or 0.0) * aliquota, 2)
+    return _arredondar_dinheiro(
+        float(item.get("valor_item", 0.0) or 0.0) * aliquota
+    )
 
 
 def obter_versao_regra_nota(nota: dict) -> str:
@@ -446,24 +468,27 @@ def obter_versao_regra_nota(nota: dict) -> str:
 
 
 def calcular_resumo_creditos(itens: list) -> dict[str, float]:
-    validados = 0.0
-    quarentena = 0.0
-    rejeitados = 0.0
+    validados = Decimal("0")
+    quarentena = Decimal("0")
+    rejeitados = Decimal("0")
     for registro in itens:
         item = normalizar_item_credito(registro)
         status = item.get("classificacao_item")
-        valor_credito = float(item.get("valor_credito_item", 0.0) or 0.0)
+        valor_credito = Decimal(str(item.get("valor_credito_item", 0.0) or 0.0))
         if status in {"Aprovado Revenda", "Aprovado Manualmente Contador"}:
             validados += valor_credito
         elif status == "Quarentena Uso/Consumo":
-            quarentena += obter_credito_quarentena(item)
+            quarentena += Decimal(str(obter_credito_quarentena(item)))
         elif status in {"Rejeitado", "Rejeitado pelo Contador"}:
-            rejeitados += obter_credito_rejeitado(item)
+            rejeitados += Decimal(str(obter_credito_rejeitado(item)))
+    validados = validados.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    quarentena = quarentena.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    rejeitados = rejeitados.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return {
-        "validado": validados,
-        "quarentena": quarentena,
-        "rejeitado": rejeitados,
-        "bruto": validados + quarentena,
+        "validado": float(validados),
+        "quarentena": float(quarentena),
+        "rejeitado": float(rejeitados),
+        "bruto": float(validados + quarentena),
     }
 
 
@@ -611,7 +636,7 @@ def carregar_espelho_empresa(supabase, empresa_id) -> dict[str, list[dict]]:
         while True:
             resposta = (
                 supabase.table("praesidium_empresa_mirror")
-                .select("record_type,record_key,payload")
+                .select("record_type,record_key,payload,updated_at")
                 .eq("empresa_id", empresa_id)
                 .range(inicio, inicio + 999)
                 .execute()
@@ -640,6 +665,7 @@ def carregar_espelho_empresa(supabase, empresa_id) -> dict[str, list[dict]]:
             continue
         normalizado = dict(dado)
         normalizado.setdefault("empresa_id", empresa_id)
+        normalizado["_mirror_updated_at"] = linha.get("updated_at")
         if str(normalizado["empresa_id"]) != str(empresa_id):
             continue
         if tipo == "item":
@@ -674,7 +700,7 @@ def combinar_registros_espelho(
     for registro in espelho:
         chave = _chave_registro_espelho(tipo, registro)
         if chave:
-            combinados[chave] = {**combinados.get(chave, {}), **registro}
+            combinados[chave] = {**registro, **combinados.get(chave, {})}
         elif tipo != "item" and registro.get("id") is not None:
             chave = str(registro["id"])
             combinados[chave] = {**combinados.get(chave, {}), **registro}
@@ -1074,6 +1100,13 @@ def executar_insert_seguro(
         return False, "Não foi possível vincular os itens à empresa e à nota.", []
 
     if supabase is None:
+        if tabela in {
+            "notas_fiscais_recebidas",
+            "itens_nota_fiscal",
+            "conciliacao_devolucoes",
+            "split_payment_events",
+        }:
+            return False, "Supabase indisponível; dados fiscais não foram persistidos.", []
         local = _guardar_fallback(tabela, dados)
         return (
             (True, "Mantido temporariamente nesta sessão.", local)
@@ -1164,13 +1197,10 @@ def executar_insert_seguro(
                 continue
             if codigo == "PGRST204" and coluna in {"empresa_id", "nota_id"}:
                 logging.getLogger(__name__).error(
-                    "Schema sem vínculo obrigatório (%s) na tabela %s; preservando o isolamento local.",
+                    "Schema sem vínculo obrigatório (%s) na tabela %s.",
                     coluna,
                     tabela,
                 )
-                local = _guardar_fallback(tabela, dados)
-                if local:
-                    return True, "Mantido temporariamente nesta sessão.", local
                 return False, "Não foi possível vincular os dados à empresa ativa.", []
             if codigo == "PGRST204" and coluna and coluna in colunas_presentes:
                 _remover_coluna(dados, coluna)
@@ -1216,11 +1246,25 @@ def executar_insert_seguro(
                 limpar_caches_dados()
                 return True, "Espelho Supabase persistido.", registros
             logging.getLogger(__name__).exception(
-                "Falha ao gravar na tabela %s; usando armazenamento temporário da sessão.",
+                "Falha ao gravar na tabela %s e no espelho persistente.",
                 tabela,
             )
-            local = _guardar_fallback(tabela, dados)
-            if local or tabela not in {"notas_fiscais_recebidas", "itens_nota_fiscal"}:
+            local = (
+                []
+                if tabela in {
+                    "notas_fiscais_recebidas",
+                    "itens_nota_fiscal",
+                    "conciliacao_devolucoes",
+                    "split_payment_events",
+                }
+                else _guardar_fallback(tabela, dados)
+            )
+            if local or tabela not in {
+                "notas_fiscais_recebidas",
+                "itens_nota_fiscal",
+                "conciliacao_devolucoes",
+                "split_payment_events",
+            }:
                 return True, "Mantido temporariamente nesta sessão.", local
             return False, "Não foi possível registrar os dados. Tente novamente.", []
     logging.getLogger(__name__).error(
@@ -1229,8 +1273,22 @@ def executar_insert_seguro(
     if _persistir_payload_no_espelho(supabase, tabela, registros):
         limpar_caches_dados()
         return True, "Espelho Supabase persistido.", registros
-    local = _guardar_fallback(tabela, dados)
-    if local or tabela not in {"notas_fiscais_recebidas", "itens_nota_fiscal"}:
+    local = (
+        []
+        if tabela in {
+            "notas_fiscais_recebidas",
+            "itens_nota_fiscal",
+            "conciliacao_devolucoes",
+            "split_payment_events",
+        }
+        else _guardar_fallback(tabela, dados)
+    )
+    if local or tabela not in {
+        "notas_fiscais_recebidas",
+        "itens_nota_fiscal",
+        "conciliacao_devolucoes",
+        "split_payment_events",
+    }:
         return True, "Mantido temporariamente nesta sessão.", local
     return False, "Não foi possível registrar os dados. Tente novamente.", []
 
@@ -1245,6 +1303,13 @@ def executar_update_seguro(
     dados = sanitizar_payload_supabase(tabela, payload, parcial=True)
     if not dados:
         return False, "Não há alterações disponíveis para salvar.", []
+    if supabase is None and tabela in {
+        "notas_fiscais_recebidas",
+        "itens_nota_fiscal",
+        "conciliacao_devolucoes",
+        "split_payment_events",
+    }:
+        return False, "Supabase indisponível; dados fiscais não foram persistidos.", []
     filtros_ativos = dict(filtros)
     colunas_corrigidas = set()
     for _ in range(32):
@@ -1278,8 +1343,14 @@ def executar_update_seguro(
             if (
                 tabela in _TIPOS_ESPELHO
                 and fallback_record
-                and str(fallback_record.get("id", "")).startswith(
-                    ("mirror_", "local_")
+                and (
+                    str(fallback_record.get("id", "")).startswith(
+                        ("mirror_", "local_")
+                    )
+                    or (
+                        tabela == "itens_nota_fiscal"
+                        and fallback_record.get("item_uid")
+                    )
                 )
                 and all(
                     str(fallback_record.get(chave)) == str(valor)
@@ -1293,7 +1364,18 @@ def executar_update_seguro(
                     tabela,
                     [atualizado],
                 ):
-                    _guardar_fallback(tabela, atualizado, "update", filtros_ativos)
+                    if tabela not in {
+                        "notas_fiscais_recebidas",
+                        "itens_nota_fiscal",
+                        "conciliacao_devolucoes",
+                        "split_payment_events",
+                    }:
+                        _guardar_fallback(
+                            tabela,
+                            atualizado,
+                            "update",
+                            filtros_ativos,
+                        )
                     limpar_caches_dados()
                     return True, "Espelho Supabase atualizado.", [atualizado]
             return False, "A decisão já foi processada ou o item não está mais pendente.", []
@@ -1329,8 +1411,14 @@ def executar_update_seguro(
             if (
                 tabela in _TIPOS_ESPELHO
                 and fallback_record
-                and str(fallback_record.get("id", "")).startswith(
-                    ("mirror_", "local_")
+                and (
+                    str(fallback_record.get("id", "")).startswith(
+                        ("mirror_", "local_")
+                    )
+                    or (
+                        tabela == "itens_nota_fiscal"
+                        and fallback_record.get("item_uid")
+                    )
                 )
                 and all(
                     str(fallback_record.get(chave)) == str(valor)
@@ -1344,14 +1432,33 @@ def executar_update_seguro(
                     tabela,
                     [atualizado],
                 ):
-                    _guardar_fallback(tabela, atualizado, "update", filtros_ativos)
+                    if tabela not in {
+                        "notas_fiscais_recebidas",
+                        "itens_nota_fiscal",
+                        "conciliacao_devolucoes",
+                        "split_payment_events",
+                    }:
+                        _guardar_fallback(
+                            tabela,
+                            atualizado,
+                            "update",
+                            filtros_ativos,
+                        )
                     limpar_caches_dados()
                     return True, "Espelho Supabase atualizado.", [atualizado]
             logging.getLogger(__name__).exception(
-                "Falha ao atualizar a tabela %s; tentando manter a alteração na sessão.",
+                "Falha ao atualizar a tabela %s; tentando atualizar o espelho persistente.",
                 tabela,
             )
             break
+
+    if tabela in {
+        "notas_fiscais_recebidas",
+        "itens_nota_fiscal",
+        "conciliacao_devolucoes",
+        "split_payment_events",
+    }:
+        return False, "Não foi possível persistir a alteração no Supabase.", []
 
     fallback = dict(fallback_record or {})
     fallback.update(filtros)
@@ -1364,6 +1471,304 @@ def executar_update_seguro(
 
 def inserir_seguro_supabase(supabase, tabela: str, payload) -> tuple[bool, str, list]:
     return executar_insert_seguro(tabela, payload, supabase=supabase)
+
+
+def _consultar_registros_empresa(supabase, tabela: str, empresa_id) -> list[dict]:
+    registros = []
+    inicio = 0
+    while True:
+        resposta = (
+            supabase.table(tabela)
+            .select("*")
+            .eq("empresa_id", empresa_id)
+            .range(inicio, inicio + 999)
+            .execute()
+        )
+        pagina = resposta.data or []
+        registros.extend(pagina)
+        if len(pagina) < 1000:
+            return registros
+        inicio += 1000
+
+
+def _normalizar_item_hidratado(
+    item: dict,
+    notas_por_id: dict[str, dict],
+    ordinais_por_nota: dict[str, int],
+) -> dict:
+    normalizado = normalizar_item_credito(item)
+    nota_id = str(normalizado.get("nota_id") or "")
+    nota = notas_por_id.get(nota_id, {})
+    chave_acesso = str(nota.get("chave_acesso") or "")
+    numero = normalizado.get("nitem")
+    item_uid = str(normalizado.get("item_uid") or "")
+
+    if numero is None:
+        correspondencia = re.search(r"(?:::ITEM::|_ITEM_)(\d+)$", item_uid)
+        if correspondencia:
+            numero = int(correspondencia.group(1))
+    if numero is None and nota_id:
+        ordinais_por_nota[nota_id] = ordinais_por_nota.get(nota_id, 0) + 1
+        numero = ordinais_por_nota[nota_id]
+    if numero is not None:
+        try:
+            numero = int(numero)
+        except (TypeError, ValueError):
+            numero = None
+    if chave_acesso and numero is not None:
+        normalizado["nitem"] = numero
+        item_uid_canonico = _gerar_item_uid(chave_acesso, numero)
+        normalizado["_uid_legacy"] = item_uid != item_uid_canonico
+        normalizado["item_uid"] = item_uid_canonico
+    elif item_uid:
+        normalizado["_uid_legacy"] = False
+        normalizado["item_uid"] = item_uid
+    return normalizado
+
+
+def hidratar_dados_empresa_supabase(
+    supabase,
+    empresa_id,
+    empresa_ativa: dict,
+) -> dict[str, list[dict]]:
+    """Rebuild the active company's working set exclusively from Supabase."""
+    if supabase is None:
+        raise RuntimeError("Supabase indisponível para hidratar os dados fiscais.")
+    if (
+        empresa_id is None
+        or str(empresa_ativa.get("id", "")) != str(empresa_id)
+    ):
+        raise ValueError("A empresa ativa não corresponde ao ID da hidratação.")
+
+    try:
+        notas = _consultar_registros_empresa(
+            supabase,
+            "notas_fiscais_recebidas",
+            empresa_id,
+        )
+    except Exception as erro:
+        logging.getLogger(__name__).exception(
+            "Falha ao carregar notas da empresa %s durante a hidratação.",
+            empresa_id,
+        )
+        raise RuntimeError("Não foi possível hidratar as notas fiscais do Supabase.") from erro
+
+    tabelas_primarias = {}
+    falhas_leitura = set()
+    for tabela in (
+        "itens_nota_fiscal",
+        "conciliacao_devolucoes",
+        "split_payment_events",
+    ):
+        try:
+            tabelas_primarias[tabela] = _consultar_registros_empresa(
+                supabase,
+                tabela,
+                empresa_id,
+            )
+        except Exception:
+            falhas_leitura.add(tabela)
+            tabelas_primarias[tabela] = []
+            logging.getLogger(__name__).exception(
+                "Falha ao ler %s da empresa %s durante a hidratação.",
+                tabela,
+                empresa_id,
+            )
+
+    try:
+        linhas_espelho = []
+        inicio = 0
+        while True:
+            resposta = (
+                supabase.table("praesidium_empresa_mirror")
+                .select("record_type,record_key,payload,updated_at")
+                .eq("empresa_id", empresa_id)
+                .range(inicio, inicio + 999)
+                .execute()
+            )
+            pagina = resposta.data or []
+            linhas_espelho.extend(pagina)
+            if len(pagina) < 1000:
+                break
+            inicio += 1000
+        espelho_disponivel = True
+    except Exception:
+        linhas_espelho = []
+        espelho_disponivel = False
+        logging.getLogger(__name__).exception(
+            "Falha ao ler o espelho persistente da empresa %s durante a hidratação.",
+            empresa_id,
+        )
+
+    if falhas_leitura and not espelho_disponivel:
+        raise RuntimeError(
+            "Nem todas as fontes fiscais do Supabase puderam ser lidas."
+        )
+
+    espelho: dict[str, list[dict]] = {
+        "item": [],
+        "devolucao": [],
+        "split_payment": [],
+    }
+    for linha in linhas_espelho:
+        tipo = str(linha.get("record_type", ""))
+        payload = linha.get("payload")
+        if tipo not in espelho or not isinstance(payload, dict):
+            continue
+        registro = dict(payload)
+        if str(registro.get("empresa_id", empresa_id)) != str(empresa_id):
+            continue
+        registro.setdefault("empresa_id", empresa_id)
+        registro["_mirror_updated_at"] = linha.get("updated_at")
+        if tipo == "item":
+            chave = str(linha.get("record_key") or "")
+            registro.setdefault("item_uid", chave)
+            registro.setdefault("id", f"mirror_{chave}")
+        espelho[tipo].append(registro)
+
+    notas_por_id = {
+        str(nota.get("id")): nota
+        for nota in notas
+        if nota.get("id") is not None
+    }
+    itens_primarios = sorted(
+        tabelas_primarias["itens_nota_fiscal"],
+        key=lambda item: (
+            str(item.get("nota_id", "")),
+            _float_seguro(item.get("nitem"), 0.0),
+            str(item.get("id", "")),
+        ),
+    )
+    itens_espelho = sorted(
+        espelho["item"],
+        key=lambda item: (
+            str(item.get("nota_id", "")),
+            _float_seguro(item.get("nitem"), 0.0),
+            str(item.get("item_uid", "")),
+        ),
+    )
+    itens_por_uid = {}
+    ordinais_por_nota = {}
+    for item in itens_primarios + itens_espelho:
+        normalizado = _normalizar_item_hidratado(
+            item,
+            notas_por_id,
+            ordinais_por_nota,
+        )
+        item_uid = str(normalizado.get("item_uid") or "")
+        if not item_uid:
+            continue
+        existente = itens_por_uid.get(item_uid)
+        if (
+            existente is None
+            or (
+                existente.get("_uid_legacy", False)
+                and not normalizado.get("_uid_legacy", False)
+            )
+        ):
+            itens_por_uid[item_uid] = normalizado
+        elif str(normalizado.get("id", "")).startswith("mirror_"):
+            itens_por_uid[item_uid] = {
+                **normalizado,
+                **{
+                    chave: valor
+                    for chave, valor in existente.items()
+                    if valor is not None
+                },
+            }
+
+    ids_notas_com_itens = {
+        str(item.get("nota_id"))
+        for item in itens_por_uid.values()
+        if item.get("nota_id") is not None
+    }
+    for nota in notas:
+        nota_id = nota.get("id")
+        chave = str(nota.get("chave_acesso") or "")
+        if (
+            nota_id is None
+            or not chave
+            or str(nota_id) in ids_notas_com_itens
+        ):
+            continue
+        valor_nota = _float_seguro(
+            nota.get("valor_total_nf"),
+            0.0,
+        )
+        credito = float(
+            (
+                Decimal(str(valor_nota))
+                * Decimal(str(ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA))
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        )
+        item_legado = {
+            "empresa_id": empresa_id,
+            "nota_id": nota_id,
+            "item_uid": _gerar_item_uid(chave, 1),
+            "nitem": 1,
+            "descricao": "NF-e legada sem detalhamento XML original (quarentena)",
+            "ncm": "",
+            "cfop": "",
+            "quantidade_comercial": 1.0,
+            "valor_item": round(valor_nota, 2),
+            "aliquota_aplicada": ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
+            "aliquota_ibs_aplicada": 0.177,
+            "aliquota_cbs_aplicada": 0.088,
+            "valor_credito_item": credito,
+            "credito_ibs_gerado": _arredondar_dinheiro(valor_nota * 0.177),
+            "credito_cbs_gerado": _arredondar_dinheiro(valor_nota * 0.088),
+            "classificacao_item": "Quarentena Uso/Consumo",
+            "status_credito": "Quarentena",
+            "justificativa_motor": (
+                "NF-e legada sem XML original; crédito potencial mantido em "
+                "quarentena até a reconstituição documental."
+            ),
+        }
+        ok, mensagem, persistidos = inserir_seguro_supabase(
+            supabase,
+            "itens_nota_fiscal",
+            item_legado,
+        )
+        if not ok:
+            raise RuntimeError(
+                f"Não foi possível persistir o item legado da nota {chave}: {mensagem}"
+            )
+        persistido = dict(persistidos[0]) if persistidos else item_legado
+        persistido.setdefault("id", f"mirror_{item_legado['item_uid']}")
+        itens_por_uid[item_legado["item_uid"]] = persistido
+
+    devolucoes = combinar_registros_espelho(
+        tabelas_primarias["conciliacao_devolucoes"],
+        espelho["devolucao"],
+        "devolucao",
+    )
+    eventos_split = combinar_registros_espelho(
+        tabelas_primarias["split_payment_events"],
+        espelho["split_payment"],
+        "split_payment",
+    )
+    for indice, registro in enumerate(devolucoes):
+        registro.pop("_mirror_updated_at", None)
+        registro.setdefault("id", f"mirror_devolucao_{indice}")
+    for indice, registro in enumerate(eventos_split):
+        registro.pop("_mirror_updated_at", None)
+        registro.setdefault(
+            "id",
+            f"mirror_split_{registro.get('event_id') or indice}",
+        )
+    itens_hidratados = sorted(
+        itens_por_uid.values(),
+        key=lambda item: str(item.get("item_uid", "")),
+    )
+    for item in itens_hidratados:
+        item.pop("_mirror_updated_at", None)
+        item.pop("_uid_legacy", None)
+    return {
+        "notas": notas,
+        "itens": itens_hidratados,
+        "devolucoes": devolucoes,
+        "eventos_split": eventos_split,
+    }
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -1407,6 +1812,11 @@ def classificar_item_inteligente(
 ) -> tuple[str, float, float]:
     ncm_limpo = "".join(filter(str.isdigit, str(ncm))).ljust(8, "0")[:8]
     cfop_limpo = "".join(filter(str.isdigit, str(cfop)))
+    lista_cnaes = [
+        "".join(filter(str.isdigit, c))
+        for c in str(cnaes_cliente_str).split(",")
+        if "".join(filter(str.isdigit, c))
+    ]
 
     if ncm_limpo in NCM_CESTA_BASICA_ZERO:
         aliquota_base = 0.0
@@ -1426,13 +1836,45 @@ def classificar_item_inteligente(
     if DESCRICAO_USO_INTERNO_PATTERN.search(str(descricao)):
         return "Quarentena Uso/Consumo", 0.0, 0.0
 
-    lista_cnaes = [
-        "".join(filter(str.isdigit, c))
-        for c in str(cnaes_cliente_str).split(",")
-        if "".join(filter(str.isdigit, c))
-    ]
     if not lista_cnaes:
         lista_cnaes = ["4711302"]
+
+    if "9602501" in lista_cnaes:
+        prefixos_salao = (
+            "3304", "3305", "3307", "8214", "9603", "851631", "8510",
+        )
+        descricao_normalizada = unicodedata.normalize(
+            "NFKD",
+            str(descricao),
+        ).encode("ascii", "ignore").decode("ascii").casefold()
+        termos_salao = (
+            "shampoo", "condicionador", "mascara capilar", "coloracao",
+            "agua oxigenada", "po descolorante", "progressiva", "ampola",
+            "spray fixador", "oleo reparador", "escova termica", "pente",
+            "alicate", "esmalte", "creme esfoliante", "tonico", "matizador",
+            "leave-in", "leave in", "pomada", "locao pos-barba",
+        )
+        item_de_salao = ncm_limpo.startswith(prefixos_salao) or any(
+            termo in descricao_normalizada for termo in termos_salao
+        )
+        if item_de_salao:
+            return "Aprovado Revenda", 0.265, _arredondar_dinheiro(vprod * 0.265)
+        cnaes_alternativos = [
+            cnae_cod for cnae_cod in lista_cnaes
+            if cnae_cod != "9602501"
+        ]
+        if not any(
+            any(
+                ncm_limpo.startswith(prefixo)
+                for prefixo in MAPA_CNAE_NCM_PERMITIDOS.get(cnae_cod[:4], [])
+            )
+            for cnae_cod in cnaes_alternativos
+        ):
+            return (
+                "Quarentena Uso/Consumo",
+                0.265,
+                _arredondar_dinheiro(vprod * 0.265),
+            )
 
     compativel_cnae = False
     for cnae_cod in lista_cnaes:
@@ -1444,14 +1886,14 @@ def classificar_item_inteligente(
 
     if ncm_limpo in NCM_SENSIVEIS_USO_CONSUMO:
         if compativel_cnae and qcom >= 6:
-            credito = round(vprod * aliquota_base, 2)
+            credito = _arredondar_dinheiro(vprod * aliquota_base)
             return "Aprovado Revenda", aliquota_base, credito
         return "Quarentena Uso/Consumo", 0.0, 0.0
 
     if compativel_cnae:
         if qcom <= 1 and vprod > 1500.0:
             return "Quarentena Uso/Consumo", 0.0, 0.0
-        credito = round(vprod * aliquota_base, 2)
+        credito = _arredondar_dinheiro(vprod * aliquota_base)
         return "Aprovado Revenda", aliquota_base, credito
 
     return "Quarentena Uso/Consumo", 0.0, 0.0
@@ -1623,7 +2065,7 @@ def _xml_filhos(elemento, nome: str):
 
 
 def _gerar_item_uid(chave_acesso: str, numero_item: int | str) -> str:
-    return f"{chave_acesso}_ITEM_{int(numero_item):04d}"
+    return f"{chave_acesso}::ITEM::{int(numero_item):04d}"
 
 
 def _xml_filho(elemento, nome: str):
@@ -1651,24 +2093,128 @@ def _carregar_notas_existentes(
     if supabase is None:
         return {}
     try:
-        resposta = (
-            supabase.table("notas_fiscais_recebidas")
-            .select("id,chave_acesso")
-            .eq("empresa_id", empresa_id_ativo)
-            .execute()
-        )
-        linhas = resposta.data or []
+        linhas = []
+        inicio = 0
+        while True:
+            resposta = (
+                supabase.table("notas_fiscais_recebidas")
+                .select("id,chave_acesso")
+                .eq("empresa_id", empresa_id_ativo)
+                .range(inicio, inicio + 999)
+                .execute()
+            )
+            pagina = resposta.data or []
+            linhas.extend(pagina)
+            if len(pagina) < 1000:
+                break
+            inicio += 1000
         return {
             str(n.get("chave_acesso")): n
             for n in linhas
             if n.get("chave_acesso") and n.get("id") is not None
         }
-    except Exception:
+    except Exception as erro:
         logging.getLogger(__name__).exception(
             "Falha ao carregar índice de duplicidade para empresa %s.",
             empresa_id_ativo,
         )
-        return {}
+        raise RuntimeError(
+            "Não foi possível verificar as notas existentes no Supabase."
+        ) from erro
+
+
+def _carregar_itens_existentes_empresa(
+    supabase,
+    empresa_id,
+    notas_existentes: dict[str, dict],
+) -> dict[str, dict]:
+    try:
+        itens_primarios = _consultar_registros_empresa(
+            supabase,
+            "itens_nota_fiscal",
+            empresa_id,
+        )
+        leitura_primaria_ok = True
+    except Exception:
+        itens_primarios = []
+        leitura_primaria_ok = False
+        logging.getLogger(__name__).exception(
+            "Falha ao ler itens atuais da empresa %s antes do reprocessamento.",
+            empresa_id,
+        )
+    try:
+        linhas_espelho = []
+        inicio = 0
+        while True:
+            resposta = (
+                supabase.table("praesidium_empresa_mirror")
+                .select("record_key,payload")
+                .eq("empresa_id", empresa_id)
+                .eq("record_type", "item")
+                .range(inicio, inicio + 999)
+                .execute()
+            )
+            pagina = resposta.data or []
+            linhas_espelho.extend(pagina)
+            if len(pagina) < 1000:
+                break
+            inicio += 1000
+        leitura_espelho_ok = True
+    except Exception:
+        linhas_espelho = []
+        leitura_espelho_ok = False
+        logging.getLogger(__name__).exception(
+            "Falha ao ler o espelho de itens da empresa %s antes do reprocessamento.",
+            empresa_id,
+        )
+    if not leitura_primaria_ok and not leitura_espelho_ok:
+        raise RuntimeError("Não foi possível preservar as decisões de auditoria existentes.")
+
+    notas_por_id = {
+        str(nota.get("id")): nota
+        for nota in notas_existentes.values()
+        if nota.get("id") is not None
+    }
+    itens_por_uid = {}
+    ordinais_por_nota = {}
+    for item in itens_primarios:
+        normalizado = _normalizar_item_hidratado(
+            item,
+            notas_por_id,
+            ordinais_por_nota,
+        )
+        uid = str(normalizado.get("item_uid") or "")
+        existente = itens_por_uid.get(uid)
+        if uid and (
+            existente is None
+            or (
+                existente.get("_uid_legacy", False)
+                and not normalizado.get("_uid_legacy", False)
+            )
+        ):
+            itens_por_uid[uid] = normalizado
+    for linha in linhas_espelho:
+        payload = linha.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        registro = dict(payload)
+        registro.setdefault("item_uid", linha.get("record_key"))
+        normalizado = _normalizar_item_hidratado(
+            registro,
+            notas_por_id,
+            ordinais_por_nota,
+        )
+        uid = str(normalizado.get("item_uid") or "")
+        existente = itens_por_uid.get(uid)
+        if uid and (
+            existente is None
+            or (
+                existente.get("_uid_legacy", False)
+                and not normalizado.get("_uid_legacy", False)
+            )
+        ):
+            itens_por_uid[uid] = normalizado
+    return itens_por_uid
 
 
 def _preparar_xml_nfe(
@@ -1759,29 +2305,59 @@ def _preparar_xml_nfe(
     chaves_lote.add(chave_raw)
     itens = []
     numeros_itens = set()
-    for ordinal, det in enumerate(_xml_filhos(inf_nfe, "det"), start=1):
-        numero_item = str(det.attrib.get("nItem") or ordinal).strip()
-        if not numero_item.isdigit() or numero_item in numeros_itens:
-            numero_item = str(ordinal)
-            while numero_item in numeros_itens:
-                numero_item = str(int(numero_item) + 1)
+    detalhes = [
+        elemento
+        for elemento in raiz.iter()
+        if elemento.tag.split("}")[-1] == "det"
+    ]
+    for ordinal, det in enumerate(detalhes, start=1):
+        numero_bruto = str(det.attrib.get("nItem") or ordinal).strip()
+        numero_item = int(numero_bruto) if numero_bruto.isdigit() else ordinal
+        while numero_item in numeros_itens:
+            numero_item += 1
         numeros_itens.add(numero_item)
         prod = _xml_filho(det, "prod")
+        imposto = _xml_filho(det, "imposto")
         xprod = _xml_texto(prod, "xProd", "Item NF-e")
         ncm = _xml_texto(prod, "NCM", "00000000")
         cfop = _xml_texto(prod, "CFOP", "5102")
         qcom = _float_seguro(_xml_texto(prod, "qCom", "1"), 1.0)
         vprod = _float_seguro(_xml_texto(prod, "vProd", "0"), 0.0)
-        itens.append({
+        valores_ibs = [
+            elemento
+            for elemento in (imposto.iter() if imposto is not None else [])
+            if elemento.tag.split("}")[-1] == "vIBS"
+        ]
+        valores_cbs = [
+            elemento
+            for elemento in (imposto.iter() if imposto is not None else [])
+            if elemento.tag.split("}")[-1] == "vCBS"
+        ]
+        item = {
             "empresa_id": empresa_id_ativo,
             "item_uid": _gerar_item_uid(chave_raw, numero_item),
-            "nitem": int(numero_item),
+            "nitem": numero_item,
             "descricao": xprod,
             "ncm": ncm,
             "cfop": cfop,
             "quantidade_comercial": qcom,
-            "valor_item": round(vprod, 2),
-        })
+            "valor_item": _arredondar_dinheiro(vprod),
+        }
+        if valores_ibs or valores_cbs:
+            item["credito_xml_informado"] = True
+            item["_tributos_xml_presentes"] = True
+            item["_credito_ibs_xml"] = sum(
+                _float_seguro(elemento.text, 0.0)
+                for elemento in valores_ibs
+            )
+            item["_credito_cbs_xml"] = sum(
+                _float_seguro(elemento.text, 0.0)
+                for elemento in valores_cbs
+            )
+            item["_credito_xml"] = _arredondar_dinheiro(
+                item["_credito_ibs_xml"] + item["_credito_cbs_xml"],
+            )
+        itens.append(item)
 
     return payload_nf, itens, ""
 
@@ -1865,6 +2441,8 @@ def processar_devolucao_nfe_xml(
     empresa_ativa: dict,
     cnpjs_autorizados: set[str] | None = None,
 ) -> tuple[bool, str]:
+    if supabase is None:
+        return False, "Supabase indisponível; a devolução não pode ser persistida."
     try:
         raiz = ET.fromstring(xml_bytes)
     except ET.ParseError:
@@ -1933,19 +2511,6 @@ def processar_devolucao_nfe_xml(
                 empresa_id_ativo,
             )
 
-    notas_fallback = st.session_state.get(
-        f"fallback_notas_{empresa_id_ativo}",
-        [],
-    )
-    if nota_original is None:
-        nota_original = next(
-            (
-                nota for nota in notas_fallback
-                if str(nota.get("chave_acesso", "")) == chave_original
-                and str(nota.get("empresa_id", "")) == str(empresa_id_ativo)
-            ),
-            None,
-        )
     if nota_original is None:
         return False, "Devolução bloqueada: a nota original não está registrada para esta empresa."
 
@@ -1965,13 +2530,16 @@ def processar_devolucao_nfe_xml(
                 "Falha ao localizar itens da nota original %s.",
                 nota_original_id,
             )
-    if not itens_originais:
-        itens_originais = [
-            item
-            for item in st.session_state.get(f"fallback_itens_{empresa_id_ativo}", [])
-            if str(item.get("nota_id", "")) == str(nota_original_id)
-            and str(item.get("empresa_id", "")) == str(empresa_id_ativo)
-        ]
+        if not itens_originais:
+            espelho_empresa = carregar_espelho_empresa(
+                supabase,
+                empresa_id_ativo,
+            )
+            itens_originais = [
+                item
+                for item in espelho_empresa["item"]
+                if str(item.get("nota_id", "")) == str(nota_original_id)
+            ]
     if not itens_originais:
         return False, "Devolução bloqueada: não há itens auditados na nota original."
 
@@ -1991,16 +2559,15 @@ def processar_devolucao_nfe_xml(
             logging.getLogger(__name__).exception(
                 "Falha ao verificar duplicidade da chave de devolução."
             )
-    if any(
-        str(devolucao.get("chave_nota_devolucao", "")) == id_nfe
-        and str(devolucao.get("empresa_id", "")) == str(empresa_id_ativo)
-        for devolucao in st.session_state.get(
-            f"fallback_devolucoes_{empresa_id_ativo}",
-            [],
-        )
-    ):
-        return True, "Esta devolução já foi processada anteriormente."
-
+        devolucoes_espelho = carregar_espelho_empresa(
+            supabase,
+            empresa_id_ativo,
+        )["devolucao"]
+        if any(
+            str(devolucao.get("chave_nota_devolucao", "")) == id_nfe
+            for devolucao in devolucoes_espelho
+        ):
+            return True, "Esta devolução já foi processada anteriormente."
     total_original = _float_seguro(nota_original.get("valor_total_nf"), 0.0)
     if total_original <= 0:
         total_original = sum(
@@ -2096,15 +2663,21 @@ def processar_devolucao_nfe_xml(
             logging.getLogger(__name__).exception(
                 "Falha ao calcular o saldo estornável das devoluções anteriores."
             )
-    if not devolucoes_existentes:
-        devolucoes_existentes = [
-            devolucao
-            for devolucao in st.session_state.get(
-                f"fallback_devolucoes_{empresa_id_ativo}",
-                [],
-            )
-            if str(devolucao.get("nota_original_id", "")) == str(nota_original_id)
-        ]
+        devolucoes_espelho = carregar_espelho_empresa(
+            supabase,
+            empresa_id_ativo,
+        )["devolucao"]
+        espelho_por_chave = {
+            str(item.get("chave_nota_devolucao", "")): item
+            for item in devolucoes_existentes
+        }
+        for devolucao in devolucoes_espelho:
+            if str(devolucao.get("nota_original_id", "")) == str(nota_original_id):
+                espelho_por_chave.setdefault(
+                    str(devolucao.get("chave_nota_devolucao", "")),
+                    devolucao,
+                )
+        devolucoes_existentes = list(espelho_por_chave.values())
     valor_ja_devolvido = sum(
         max(0.0, _float_seguro(item.get("valor_mercadoria_devolvida"), 0.0))
         for item in devolucoes_existentes
@@ -2158,19 +2731,22 @@ def processar_xml_lote_bytes(
     empresa_ativa: dict,
     cnpjs_adicionais_autorizados: list[str] | None = None,
 ) -> list[tuple[bool, str]]:
-    notas_existentes = _carregar_notas_existentes(supabase, empresa_id_ativo)
-    notas_locais = st.session_state.get(
-        f"fallback_notas_{empresa_id_ativo}",
-        [],
-    )
-    for nota_local in notas_locais:
-        chave_local = str(nota_local.get("chave_acesso") or "")
-        if chave_local and nota_local.get("id") is not None:
-            notas_existentes.setdefault(chave_local, nota_local)
+    resultados = [(False, "Não foi possível processar o XML.") for _ in arquivos]
+    if supabase is None:
+        return [
+            (False, "Supabase indisponível; o XML não foi persistido.")
+            for _ in arquivos
+        ]
+    try:
+        notas_existentes = _carregar_notas_existentes(
+            supabase,
+            empresa_id_ativo,
+        )
+    except RuntimeError as erro:
+        return [(False, str(erro)) for _ in arquivos]
     hashes_lote: set[str] = set()
     chaves_lote: set[str] = set()
     preparados = []
-    resultados = [(False, "Não foi possível processar o XML.") for _ in arquivos]
     cnpjs_autorizados = obter_cnpjs_autorizados_empresa(
         empresa_ativa,
         cnpjs_adicionais_autorizados,
@@ -2221,6 +2797,21 @@ def processar_xml_lote_bytes(
             notas_para_atualizar.append((item_preparado, nota_existente))
         else:
             novas_notas.append(item_preparado)
+
+    try:
+        itens_existentes = _carregar_itens_existentes_empresa(
+            supabase,
+            empresa_id_ativo,
+            notas_existentes,
+        )
+    except RuntimeError:
+        itens_existentes = None
+        for item_preparado, _ in notas_para_atualizar:
+            resultados[item_preparado[0]] = (
+                False,
+                "Não foi possível carregar as decisões existentes para reprocessar a nota.",
+            )
+        notas_para_atualizar = []
 
     mensagem_notas = "OK"
     for item_preparado, nota_existente in notas_para_atualizar:
@@ -2301,20 +2892,82 @@ def processar_xml_lote_bytes(
                 em_contingencia=em_contingencia,
                 descricao=str(item.get("descricao", "")),
             )
-            if status == "Quarentena Uso/Consumo":
-                aliquota = ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
-                credito = 0.0
-            itens_da_nota.append({
+            valor_item = _float_seguro(item.get("valor_item"), 0.0)
+            if item.get("_tributos_xml_presentes"):
+                credito = item.get("_credito_xml", 0.0)
+                credito_ibs = item.get("_credito_ibs_xml", 0.0)
+                credito_cbs = item.get("_credito_cbs_xml", 0.0)
+            else:
+                credito = _arredondar_dinheiro(
+                    Decimal(str(valor_item)) * Decimal("0.265")
+                )
+                credito_ibs = _arredondar_dinheiro(
+                    Decimal(str(valor_item)) * Decimal("0.177")
+                )
+                credito_cbs = _arredondar_dinheiro(
+                    Decimal(str(valor_item)) * Decimal("0.088")
+                )
+            aliquota = 0.265
+            uid = str(item.get("item_uid") or "")
+            item_persistido = {
                 **item,
                 "nota_id": nota_id,
+                "aliquota_ibs_aplicada": 0.177,
+                "aliquota_cbs_aplicada": 0.088,
+                "credito_ibs_gerado": _arredondar_dinheiro(credito_ibs),
+                "credito_cbs_gerado": _arredondar_dinheiro(credito_cbs),
                 "aliquota_aplicada": aliquota,
-                "valor_credito_item": round(credito, 2),
+                "valor_credito_item": _arredondar_dinheiro(credito),
                 "classificacao_item": status,
+                "status_credito": _status_credito_persistido(status),
                 "justificativa_motor": _justificativa_classificacao_item(
                     str(item.get("descricao", "")),
                     status,
                 ),
-            })
+            }
+            for campo_interno in (
+                "_tributos_xml_presentes",
+                "_credito_xml",
+                "_credito_ibs_xml",
+                "_credito_cbs_xml",
+            ):
+                item_persistido.pop(campo_interno, None)
+
+            anterior = (itens_existentes or {}).get(uid)
+            classificacao_anterior = str(
+                (anterior or {}).get("classificacao_item", "")
+            )
+            mesma_mercadoria = bool(anterior) and (
+                str(anterior.get("ncm", "")) == str(item.get("ncm", ""))
+                and str(anterior.get("descricao", "")) == str(item.get("descricao", ""))
+                and round(
+                    _float_seguro(
+                        anterior.get("valor_item", anterior.get("valor_total_bruto")),
+                        0.0,
+                    ),
+                    2,
+                ) == round(valor_item, 2)
+            )
+            if mesma_mercadoria and classificacao_anterior in {
+                "Aprovado Manualmente Contador",
+                "Rejeitado pelo Contador",
+            }:
+                item_persistido.update({
+                    campo: anterior[campo]
+                    for campo in (
+                        "classificacao_item",
+                        "status_credito",
+                        "aliquota_aplicada",
+                        "aliquota_ibs_aplicada",
+                        "aliquota_cbs_aplicada",
+                        "valor_credito_item",
+                        "credito_ibs_gerado",
+                        "credito_cbs_gerado",
+                        "justificativa_motor",
+                    )
+                    if campo in anterior
+                })
+            itens_da_nota.append(item_persistido)
         itens_lote.extend(itens_da_nota)
         dados_sucesso.append((indice, nome_arquivo, nota_payload, itens_da_nota))
         if str(nota_payload["chave_acesso"]) in {
@@ -2348,22 +3001,17 @@ def processar_xml_lote_bytes(
                 if espelho_ok:
                     mensagem_lote = "Espelho Supabase persistido."
                 else:
-                    mensagem_lote = "Mantido temporariamente nesta sessão."
+                    mensagem_lote = "Não foi possível persistir no Supabase."
             mensagens_itens.append(mensagem_lote)
-            itens_em_memoria = _guardar_fallback(
-                "itens_nota_fiscal",
-                lote_itens,
-                operacao="upsert",
-            )
-            if not itens_em_memoria and not ok_itens:
+            if not ok_itens and mensagem_lote != "Espelho Supabase persistido.":
                 persistencia_completa = False
 
         mensagem_itens = (
             "Espelho Supabase persistido."
             if "Espelho Supabase persistido." in mensagens_itens
             else (
-                "Mantido temporariamente nesta sessão."
-                if "Mantido temporariamente nesta sessão." in mensagens_itens
+                "Não foi possível persistir no Supabase."
+                if "Não foi possível persistir no Supabase." in mensagens_itens
                 else "OK"
             )
         )
@@ -2396,19 +3044,14 @@ def processar_xml_lote_bytes(
             f"NF-e {str(nota['chave_acesso'])[:10]}... auditada com sucesso "
             f"({len(itens)} itens processados; crédito bruto R$ {credito_bruto:,.2f}).",
         )
-    if mensagem_notas != "OK":
-        st.toast(
-            "Conexão indisponível: as notas foram mantidas temporariamente nesta sessão.",
-            icon="⚠️",
-        )
     if itens_lote and mensagem_itens == "Espelho Supabase persistido.":
         st.toast(
             "Itens protegidos no espelho persistente do Supabase.",
             icon="✅",
         )
-    elif itens_lote and "temporariamente nesta sessão" in mensagem_itens:
+    elif itens_lote and "Não foi possível persistir" in mensagem_itens:
         st.toast(
-            "Banco indisponível: os itens estão na sessão e aguardam sincronização.",
+            "Não foi possível confirmar a persistência dos itens no Supabase.",
             icon="⚠️",
         )
     if dados_sucesso:
@@ -2579,20 +3222,15 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                     icon="💰",
                 )
                 st.toast("Lote SEFAZ sincronizado e classificado com sucesso.", icon="✅")
-                if msg_nf != "OK":
+                if msg_nf == "Espelho Supabase persistido.":
                     st.toast(
-                        "Banco indisponível: a nota está mantida temporariamente nesta sessão.",
-                        icon="⚠️",
+                        "Nota protegida no espelho persistente do Supabase.",
+                        icon="✅",
                     )
                 if msg_it == "Espelho Supabase persistido.":
                     st.toast(
                         "Itens protegidos no espelho persistente do Supabase.",
                         icon="✅",
-                    )
-                elif "temporariamente nesta sessão" in msg_it:
-                    st.toast(
-                        "Banco indisponível: os itens estão na sessão e aguardam sincronização.",
-                        icon="⚠️",
                     )
                 st.session_state["modulo_ativo"] = "xml"
                 st.rerun()
@@ -2666,8 +3304,14 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
             return
 
         opcoes_itens = {
-            f"{i.get('descricao', 'Item')} (NCM: {i.get('ncm', '')} | Valor: R$ {float(i.get('valor_item', 0.0)):,.2f} | Crédito: R$ {float(i.get('valor_credito_item', 0.0)):,.2f})": i
-            for i in itens_da_nota
+            (
+                f"{item.get('descricao', 'Item')} (NCM: {item.get('ncm', '')} "
+                f"| Valor: R$ {float(item.get('valor_item', 0.0)):,.2f} "
+                f"| Crédito: R$ {float(item.get('valor_credito_item', 0.0)):,.2f} "
+                f"| Item {item.get('nitem') or indice + 1} "
+                f"| {item.get('item_uid') or indice})"
+            ): item
+            for indice, item in enumerate(itens_da_nota)
         }
         item_escolhido_label = st.selectbox(
             "2. Selecione a Mercadoria com Avaria / Divergência:",
@@ -2740,7 +3384,7 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
                 "data_devolucao": datetime.now().astimezone().isoformat(),
                 "motivo_ajuste": motivo_formatado
             }
-            ok_dev, msg_dev, dados_dev = inserir_seguro_supabase(
+            ok_dev, _, _ = inserir_seguro_supabase(
                 supabase, "conciliacao_devolucoes", payload_dev
             )
 
@@ -2759,28 +3403,14 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
             )
             st.session_state[f"ultimo_xml_dev_{empresa_ativa['id']}"] = (chave_dev, xml_dev_str)
             if ok_dev:
-                registro_dev = dados_dev[0] if dados_dev else payload_dev
-                devolucoes_key = f"fallback_devolucoes_{empresa_ativa['id']}"
-                devolucoes_sessao = st.session_state.get(devolucoes_key, [])
-                if registro_dev.get("id") is not None and all(
-                    str(registro.get("id")) != str(registro_dev.get("id"))
-                    for registro in devolucoes_sessao
-                ):
-                    devolucoes_sessao.append(registro_dev)
-                st.session_state[devolucoes_key] = devolucoes_sessao
                 limpar_caches_dados()
                 st.toast(
                     f"↩️ Devolução registrada; R$ {credito_a_estornar:,.2f} de crédito serão estornados.",
                     icon="🛡️",
                 )
-                if msg_dev == "Mantido temporariamente nesta sessão.":
-                    st.toast(
-                        "Registro da devolução mantido nesta sessão; sincronização pendente.",
-                        icon="ℹ️",
-                    )
                 st.session_state["modulo_ativo"] = "devolucao"
                 st.success("✅ Devolução registrada e crédito estornado em tempo real!")
-                rerun_fragment()
+                st.rerun()
             else:
                 st.toast("O XML foi gerado, mas não foi possível registrar a devolução.", icon="⚠️")
 

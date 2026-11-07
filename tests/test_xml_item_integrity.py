@@ -81,7 +81,7 @@ itens_salao = _ler_e_classificar(
 assert len(itens_salao) == 5
 assert len({item["item_uid"] for item in itens_salao}) == 5
 assert all(
-    item["item_uid"] == f'{"1" * 44}_ITEM_{item["nitem"]:04d}'
+    item["item_uid"] == f'{"1" * 44}::ITEM::{item["nitem"]:04d}'
     for item in itens_salao
 )
 assert sum(item["status_credito"] == "Validado" for item in itens_salao) == 3
@@ -98,6 +98,33 @@ credito_quarentena = sum(
 )
 assert round(credito_validado, 2) == 196.10
 assert round(credito_quarentena, 2) == 1033.50
+
+xml_com_tributos = _criar_xml(
+    [("Serviço fiscal", "33051000", 100.00)],
+    "4" * 44,
+).decode("utf-8").replace(
+    "</prod></det>",
+    "</prod><imposto><IBSCBS><vIBS>4.32</vIBS><vCBS>2.18</vCBS>"
+    "</IBSCBS></imposto></det>",
+).encode("utf-8")
+nota_com_tributos, itens_com_tributos, erro_xml = xml_engine._preparar_xml_nfe(
+    xml_com_tributos,
+    EMPRESA["id"],
+    EMPRESA,
+    set(),
+    set(),
+    {EMPRESA["cnpj"]},
+)
+assert nota_com_tributos is not None, erro_xml
+assert len(itens_com_tributos) == 1
+assert itens_com_tributos[0]["_tributos_xml_presentes"]
+assert itens_com_tributos[0]["_credito_xml"] == 6.50
+assert xml_engine.obter_credito_quarentena({
+    "valor_item": 100.00,
+    "valor_credito_item": 0.00,
+    "credito_xml_informado": True,
+    "classificacao_item": "Quarentena Uso/Consumo",
+}) == 0.00
 
 itens_stress = _ler_e_classificar(
     [

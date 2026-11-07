@@ -10,7 +10,7 @@ def injetar_css_blindado_relatorio():
     st.markdown("""
     <style>
         .stApp, [data-testid="stHeader"], [data-testid="stToolbar"] {
-            background-color: #0b0f19 !important;
+            background-color: #0e1117 !important;
         }
         [data-testid="stHeader"] {
             background: transparent !important;
@@ -45,7 +45,7 @@ def injetar_css_blindado_relatorio():
         div[data-baseweb="input"] > div,
         div[data-baseweb="base-input"],
         div[data-testid="stTextInput"] input {
-            background-color: #0b0f19 !important;
+            background-color: #0e1117 !important;
             color: #ffffff !important;
             border: 1.5px solid #d4af37 !important;
             border-radius: 8px !important;
@@ -218,7 +218,7 @@ def gerar_html_dossie_analitico(
 <meta charset="UTF-8">
 <title>Dossiê Analítico - {empresa_ativa['razao_social']}</title>
 <style>
-    body {{ font-family: 'Segoe UI', Arial, sans-serif; background-color: #0b0f19; color: #f3f4f6; padding: 30px; margin: 0; font-variant-numeric: tabular-nums; }}
+    body {{ font-family: 'Segoe UI', Arial, sans-serif; background-color: #0e1117; color: #f3f4f6; padding: 30px; margin: 0; font-variant-numeric: tabular-nums; }}
     .container {{ max-width: 1080px; margin: auto; background: #111827; border: 1px solid #374151; border-top: 5px solid #d4af37; border-radius: 12px; padding: 35px; }}
     .header-top {{ display: flex; justify-content: space-between; align-items: flex-start; border-bottom: 1px solid #374151; padding-bottom: 18px; margin-bottom: 24px; }}
     h1 {{ color: #ffffff; margin: 0 0 6px 0; font-size: 22px; }}

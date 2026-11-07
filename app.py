@@ -64,7 +64,7 @@ CSS_DARK_LUXURY = """
 <style>
     :root, html, body, .stApp {
         color-scheme: dark !important;
-        background-color: #0b0f19 !important;
+        background-color: #0e1117 !important;
         color: #ffffff !important;
         font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
@@ -719,8 +719,11 @@ def persistir_log_supabase(log_acesso: dict) -> None:
         raise RuntimeError("Supabase indisponível para persistir o log.")
     timestamp = datetime.fromisoformat(str(log_acesso["timestamp"]))
     ts_epoch = int(timestamp.timestamp())
-    cnpj_suffix = f"{int(timestamp.timestamp() * 1_000_000) % 10**12:012d}"
-    ok, mensagem, _ = xml_engine.executar_insert_seguro("empresas_monitoradas", {
+    identificador_log = str(log_acesso.get("log_id") or timestamp.isoformat())
+    cnpj_suffix = (
+        f"{int.from_bytes(hashlib.sha256(identificador_log.encode()).digest()[:8], 'big') % 10**12:012d}"
+    )
+    registro = {
         "cnpj": f"99{cnpj_suffix}",
         "razao_social": (
             f"{PREFIXO_LOG_SISTEMA}{ts_epoch}|{log_acesso['datetime']}|"
@@ -728,9 +731,19 @@ def persistir_log_supabase(log_acesso: dict) -> None:
         ),
         "regime_tributario": "SYS_LOG",
         "cnae_principal": "0000000",
-    }, supabase=supabase)
-    if not ok:
-        raise RuntimeError(mensagem)
+    }
+    resposta = (
+        supabase.table("empresas_monitoradas")
+        .insert(registro)
+        .select("cnpj,regime_tributario")
+        .execute()
+    )
+    if not any(
+        str(linha.get("cnpj")) == registro["cnpj"]
+        and linha.get("regime_tributario") == "SYS_LOG"
+        for linha in (resposta.data or [])
+    ):
+        raise RuntimeError("O Supabase não confirmou a persistência do log de acesso.")
 
 
 def salvar_registro_global(registro: dict) -> None:
@@ -979,13 +992,21 @@ def registrar_e_notificar_acesso(usuario: str, nome: str, evento: str) -> None:
             )
     atualizar_espelho_sessao()
     try:
+        persistir_log_supabase(log_acesso)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao persistir o registro de acesso no Supabase."
+        )
+    try:
         threading.Thread(
-                target=persistir_acesso_em_background,
+            target=enviar_alerta_acesso,
             args=(log_acesso,),
             daemon=True,
         ).start()
     except Exception:
-        logging.getLogger(__name__).exception("Falha ao iniciar o envio assíncrono do alerta de acesso.")
+        logging.getLogger(__name__).exception(
+            "Falha ao iniciar o envio assíncrono do alerta de acesso."
+        )
 
 
 def criar_token_sessao(usuario: str, conectado: bool = True) -> str | None:
@@ -1548,6 +1569,26 @@ def combinar_registros_com_sessao(
     return list(combinados.values())
 
 
+def hidratar_dados_empresa_supabase(empresa_id: int | str) -> dict[str, list[dict]]:
+    if supabase is None:
+        raise RuntimeError("Supabase indisponível; os saldos não podem ser calculados.")
+    if str(empresa_ativa.get("id", "")) != str(empresa_id):
+        raise ValueError("A empresa ativa não corresponde à seleção atual.")
+    dados = xml_engine.hidratar_dados_empresa_supabase(
+        supabase,
+        empresa_id,
+        empresa_ativa,
+    )
+    for nome in (
+        "fallback_notas",
+        "fallback_itens",
+        "fallback_devolucoes",
+        "fallback_split_payment",
+    ):
+        st.session_state.pop(f"{nome}_{empresa_id}", None)
+    return dados
+
+
 TAG_TENANT_RE = re.compile(r"\s*\[T:([^\]]+)\]", re.IGNORECASE)
 
 
@@ -2023,31 +2064,22 @@ st.markdown(f"""
 # 7. CÁLCULO DOS DADOS DA EMPRESA SELECIONADA (COM SUPORTE A FALLBACK)
 # ==========================================
 try:
-    notas_db, devolucoes, itens_db, _, eventos_split_db = carregar_dados_empresa_db(
-        empresa_id_ativo,
-        str(empresa_ativa.get("cnpj", "")),
-    )
-except RuntimeError:
+    dados_empresa_hidratados = hidratar_dados_empresa_supabase(empresa_id_ativo)
+except (RuntimeError, ValueError):
     logging.getLogger(__name__).exception("Falha ao carregar dados da empresa ativa.")
-    st.toast("Os dados estão temporariamente indisponíveis. Atualize a tela e tente novamente.", icon="⚠️")
+    st.error(
+        "Não foi possível hidratar os dados fiscais do Supabase. "
+        "Os saldos não serão substituídos por zero ou por dados da sessão."
+    )
     st.stop()
 
-notas_mem = st.session_state.get(f"fallback_notas_{empresa_id_ativo}", [])
-itens_mem = st.session_state.get(f"fallback_itens_{empresa_id_ativo}", [])
-
-notas = combinar_registros_com_sessao(notas_db, notas_mem)
+notas = dados_empresa_hidratados["notas"]
 itens = [
     xml_engine.normalizar_item_credito(item)
-    for item in combinar_registros_com_sessao(itens_db, itens_mem, tipo="item")
+    for item in dados_empresa_hidratados["itens"]
 ]
-devolucoes = combinar_registros_com_sessao(
-    devolucoes,
-    st.session_state.get(f"fallback_devolucoes_{empresa_id_ativo}", []),
-)
-eventos_split = combinar_registros_com_sessao(
-    eventos_split_db,
-    st.session_state.get(f"fallback_split_payment_{empresa_id_ativo}", []),
-)
+devolucoes = dados_empresa_hidratados["devolucoes"]
+eventos_split = dados_empresa_hidratados["eventos_split"]
 
 if not notas:
     renderizar_onboarding_vazio()
@@ -2089,19 +2121,19 @@ devolucoes_mes = [
     for devolucao in devolucoes
     if devolucao_na_competencia(devolucao, competencia_atual)
 ]
-imposto_estornado = sum(
+imposto_estornado = round(sum(
     float(d.get("credito_estornado", 0.0) or 0.0)
     for d in devolucoes
-)
+), 2)
 
 
-valor_retido_split_payment = sum(
+valor_retido_split_payment = round(sum(
     max(0.0, float(evento.get("retained_amount", 0.0) or 0.0))
     for evento in eventos_split
-)
-credito_validado_tempo_real = max(
-    0.0,
+), 2)
+credito_validado_tempo_real = round(
     imposto_validado_acumulado - imposto_estornado - valor_retido_split_payment,
+    2,
 )
 saldo_credito_disponivel = max(
     0.0,
@@ -2266,12 +2298,7 @@ def renderizar_fila_quarentena(
                 if status == "Aprovado Manualmente Contador"
                 else "Rejeitado"
             ),
-            "aliquota_aplicada": xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
-            "aliquota_ibs_aplicada": xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
-            "aliquota_cbs_aplicada": 0.0,
             "valor_credito_item": round(credito, 2),
-            "credito_ibs_gerado": round(credito, 2),
-            "credito_cbs_gerado": 0.0,
             "justificativa_motor": justificativa,
         }
         ok, mensagem, resultado = xml_engine.executar_update_seguro(
@@ -2297,9 +2324,48 @@ def renderizar_fila_quarentena(
     ):
         if pendentes:
             st.markdown("#### ⏳ Itens Aguardando Decisão Técnica do Contador")
-            for idx, item in enumerate(pendentes):
+            filtro_itens = st.text_input(
+                "Buscar na quarentena",
+                placeholder="Descrição, NCM ou CFOP",
+                key=f"busca_quarentena_{empresa_id}",
+            ).strip().casefold()
+            itens_filtrados = [
+                item for item in pendentes
+                if not filtro_itens
+                or filtro_itens in " ".join(
+                    str(item.get(campo, ""))
+                    for campo in ("descricao", "ncm", "cfop")
+                ).casefold()
+            ]
+            limite_pagina = st.selectbox(
+                "Itens por página",
+                [10, 20, 40],
+                index=1,
+                key=f"limite_quarentena_{empresa_id}",
+            )
+            total_paginas = max(
+                1,
+                (len(itens_filtrados) + limite_pagina - 1) // limite_pagina,
+            )
+            pagina = st.selectbox(
+                f"Página ({len(pendentes)} pendentes no total)",
+                list(range(1, total_paginas + 1)),
+                key=f"pagina_quarentena_{empresa_id}",
+            )
+            inicio_pagina = (pagina - 1) * limite_pagina
+            itens_pagina = itens_filtrados[
+                inicio_pagina:inicio_pagina + limite_pagina
+            ]
+            st.caption(
+                f"Exibindo {len(itens_pagina)} de {len(itens_filtrados)} "
+                f"itens filtrados; {len(pendentes)} pendentes no total."
+            )
+            for idx, item in enumerate(itens_pagina, start=inicio_pagina):
                 credito = xml_engine.obter_credito_quarentena(item)
-                item_id = item.get("id", f"mem_{idx}")
+                item_id = item.get(
+                    "id",
+                    item.get("item_uid", f"item_{idx}"),
+                )
                 st.markdown(
                     f"<div style='background:#07090e;border:1px solid #374151;"
                     f"border-radius:8px;padding:15px;margin-bottom:10px;'>"
@@ -2329,8 +2395,8 @@ def renderizar_fila_quarentena(
                         st.toast("A aprovação não foi confirmada. Tente novamente.", icon="⚠️")
                     else:
                         item["classificacao_item"] = "Aprovado Manualmente Contador"
-                        item["aliquota_aplicada"] = xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
                         item["valor_credito_item"] = round(credito, 2)
+                        item["status_credito"] = "Validado"
                         pendentes[:] = [pendente for pendente in pendentes if pendente is not item]
                         if all(str(a.get("id")) != str(item.get("id")) for a in auditados):
                             auditados.append(item)
@@ -2357,8 +2423,8 @@ def renderizar_fila_quarentena(
                         st.toast("A rejeição não foi confirmada. Tente novamente.", icon="⚠️")
                     else:
                         item["classificacao_item"] = "Rejeitado"
-                        item["aliquota_aplicada"] = xml_engine.ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
                         item["valor_credito_item"] = round(credito, 2)
+                        item["status_credito"] = "Rejeitado"
                         pendentes[:] = [pendente for pendente in pendentes if pendente is not item]
                         if all(str(a.get("id")) != str(item.get("id")) for a in auditados):
                             auditados.append(item)
