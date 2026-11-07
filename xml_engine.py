@@ -801,6 +801,15 @@ _COLUNAS_NUMERICAS = {
     "valor_total_nf", "valor_item", "valor_total_bruto", "quantidade_comercial",
     "qcom", "aliquota_aplicada", "aliquota_ibs_aplicada", "aliquota_cbs_aplicada",
     "valor_credito_item", "credito_ibs_gerado", "credito_cbs_gerado",
+    "valor_unitario",
+}
+_COLUNAS_ITENS_NFE = {
+    "empresa_id", "nota_id", "item_uid", "nitem", "codigo", "descricao",
+    "descricao_produto", "ncm", "cfop", "quantidade_comercial", "qcom",
+    "valor_unitario", "valor_item", "valor_total_bruto", "aliquota_aplicada",
+    "aliquota_ibs_aplicada", "aliquota_cbs_aplicada", "valor_credito_item",
+    "credito_ibs_gerado", "credito_cbs_gerado", "classificacao_item",
+    "status_credito", "justificativa_motor",
 }
 
 
@@ -925,6 +934,22 @@ def sanitizar_payload_supabase(tabela: str, payload, parcial: bool = False):
             atual.setdefault("hash_sha256_xml", "")
             atual.setdefault("status_manifestacao", atual["manifestacao_status"])
         elif tabela == "itens_nota_fiscal" and not parcial:
+            aliases_numericos = {
+                "valor_item": ("vProd",),
+                "credito_ibs_gerado": ("vIBS",),
+                "credito_cbs_gerado": ("vCBS",),
+                "valor_credito_item": ("credito_calculado",),
+            }
+            for coluna, aliases in aliases_numericos.items():
+                if registro.get(coluna) is None:
+                    atual[coluna] = next(
+                        (
+                            registro[alias]
+                            for alias in aliases
+                            if registro.get(alias) is not None
+                        ),
+                        0.0,
+                    )
             aliases = {
                 "descricao_produto": atual.get("descricao", "N/A"),
                 "quantidade_comercial": atual.get("qcom", 0.0),
@@ -950,6 +975,19 @@ def sanitizar_payload_supabase(tabela: str, payload, parcial: bool = False):
             for coluna in obrigatorios:
                 if atual.get(coluna) is None:
                     atual[coluna] = _valor_padrao_coluna(tabela, coluna, atual)
+            for coluna in _COLUNAS_NUMERICAS:
+                if coluna in atual:
+                    atual[coluna] = _float_seguro(atual[coluna], 0.0)
+            if "id" in atual:
+                try:
+                    uuid.UUID(str(atual["id"]))
+                except (ValueError, TypeError, AttributeError):
+                    atual.pop("id", None)
+            atual = {
+                coluna: valor
+                for coluna, valor in atual.items()
+                if coluna in _COLUNAS_ITENS_NFE
+            }
         elif tabela == "split_payment_events" and not parcial:
             obrigatorios_split = {
                 "empresa_id": "",
@@ -1240,38 +1278,31 @@ def executar_insert_seguro(
             if (
                 isinstance(dados, list)
                 and len(dados) > 1
-                and tabela != "itens_nota_fiscal"
             ):
                 registros_salvos = []
                 falha_individual = False
                 for registro in dados:
-                    try:
-                        construtor_item = supabase.table(tabela)
-                        if tabela == "itens_nota_fiscal":
-                            if conflito_item_uid and registro.get("item_uid"):
-                                construtor_item = construtor_item.upsert(
-                                    registro,
-                                    on_conflict="empresa_id,item_uid",
-                                )
-                            else:
-                                construtor_item = construtor_item.upsert(registro)
-                        else:
-                            construtor_item = construtor_item.insert(registro)
-                        resposta_item = construtor_item.select("*").execute()
-                        registros_salvos.extend(resposta_item.data or [])
-                    except Exception:
+                    ok_item, mensagem_item, resultado_item = executar_insert_seguro(
+                        tabela,
+                        registro,
+                        supabase=supabase,
+                        operacao="upsert" if tabela == "itens_nota_fiscal" else "insert",
+                    )
+                    if ok_item:
+                        registros_salvos.extend(resultado_item or [registro])
+                    else:
                         falha_individual = True
-                        logging.getLogger(__name__).exception(
-                            "Falha no fallback individual da tabela %s.",
+                        logging.getLogger(__name__).error(
+                            "Falha no fallback individual da tabela %s: %s",
                             tabela,
+                            mensagem_item,
                         )
                 if not falha_individual and len(registros_salvos) == len(dados):
-                    _persistir_payload_no_espelho(
-                        supabase,
-                        tabela,
-                        registros_salvos or registros,
+                    return (
+                        True,
+                        "Lote persistido com fallback individual.",
+                        registros_salvos,
                     )
-                    return True, "Lote persistido com fallback individual.", registros_salvos
             if _persistir_payload_no_espelho(supabase, tabela, registros):
                 limpar_caches_dados()
                 return True, "Espelho Supabase persistido.", registros
@@ -1674,20 +1705,82 @@ def excluir_empresa_supabase(supabase, empresa_id) -> dict:
     if empresa_id is None or not str(empresa_id).strip():
         raise ValueError("ID de cliente inválido.")
 
-    resposta = supabase.rpc(
-        "excluir_cliente_cascade",
-        {"p_empresa_id": str(empresa_id)},
-    ).execute()
-    resultado = resposta.data
-    if isinstance(resultado, list) and len(resultado) == 1:
-        resultado = resultado[0]
-    if (
-        not isinstance(resultado, dict)
-        or resultado.get("deleted") is not True
-        or str(resultado.get("empresa_id")) != str(empresa_id)
-    ):
-        raise RuntimeError("O Supabase não confirmou a exclusão do cliente.")
-    return resultado
+    try:
+        resposta = supabase.rpc(
+            "excluir_cliente_cascade",
+            {"p_empresa_id": str(empresa_id)},
+        ).execute()
+        resultado = resposta.data
+        if isinstance(resultado, list) and len(resultado) == 1:
+            resultado = resultado[0]
+        if (
+            isinstance(resultado, dict)
+            and resultado.get("deleted") is True
+            and str(resultado.get("empresa_id")) == str(empresa_id)
+        ):
+            return resultado
+        raise RuntimeError("O Supabase não confirmou a exclusão transacional.")
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Exclusão transacional indisponível para a empresa %s; "
+            "tentando a sequência direta de exclusão.",
+            empresa_id,
+            exc_info=True,
+        )
+
+    try:
+        supabase.table("itens_nota_fiscal").delete().eq(
+            "empresa_id", empresa_id
+        ).execute()
+        supabase.table("notas_fiscais_recebidas").delete().eq(
+            "empresa_id", empresa_id
+        ).execute()
+        supabase.table("praesidium_ledger_fiscal").delete().eq(
+            "empresa_id", empresa_id
+        ).execute()
+        for tabela in (
+            "conciliacao_devolucoes",
+            "praesidium_empresa_mirror",
+            "split_payment_events",
+            "empresa_cnpjs_autorizados",
+        ):
+            try:
+                supabase.table(tabela).delete().eq(
+                    "empresa_id", empresa_id
+                ).execute()
+            except Exception as erro_tabela:
+                if _codigo_erro_supabase(erro_tabela) not in {
+                    "42P01",
+                    "PGRST205",
+                }:
+                    raise
+                logging.getLogger(__name__).info(
+                    "Tabela opcional %s ausente durante exclusão da empresa %s.",
+                    tabela,
+                    empresa_id,
+                )
+        resultado_exclusao = (
+            supabase.table("empresas_monitoradas")
+            .delete()
+            .eq("id", empresa_id)
+            .select("id")
+            .execute()
+        )
+        if not resultado_exclusao.data:
+            raise RuntimeError("O Supabase não confirmou a exclusão do cliente.")
+        return {
+            "deleted": True,
+            "empresa_id": str(empresa_id),
+            "fallback": True,
+        }
+    except Exception as erro_direto:
+        logging.getLogger(__name__).exception(
+            "Falha na sequência direta de exclusão da empresa %s.",
+            empresa_id,
+        )
+        raise RuntimeError(
+            "Não foi possível concluir a exclusão do cliente."
+        ) from erro_direto
 
 
 def hidratar_dados_empresa_supabase(
@@ -2578,6 +2671,7 @@ def _limpar_itens_anteriores(
     supabase,
     empresa_id,
     nota_ids: set[str],
+    chaves_acesso: set[str] | None = None,
 ) -> bool:
     if not nota_ids:
         return True
@@ -2603,7 +2697,15 @@ def _limpar_itens_anteriores(
             str(linha.get("record_key"))
             for linha in (espelho_resposta.data or [])
             if isinstance(linha.get("payload"), dict)
-            and str(linha["payload"].get("nota_id")) in nota_ids
+            and (
+                str(linha["payload"].get("nota_id")) in nota_ids
+                or any(
+                    str(linha.get("record_key", "")).startswith(
+                        f"{chave}::ITEM::"
+                    )
+                    for chave in (chaves_acesso or set())
+                )
+            )
             and linha.get("record_key")
         ]
         if chaves_espelho:
@@ -2616,27 +2718,50 @@ def _limpar_itens_anteriores(
                 .execute()
             )
     except Exception:
-            logging.getLogger(__name__).exception(
-                "Falha ao limpar itens do espelho antes do reprocessamento da empresa %s.",
-                empresa_id,
-            )
-            limpeza_completa = False
+        logging.getLogger(__name__).exception(
+            "Falha ao limpar itens do espelho antes do reprocessamento da empresa %s.",
+            empresa_id,
+        )
+        limpeza_completa = False
 
     try:
-            (
-                supabase.table("itens_nota_fiscal")
-                .delete()
-                .eq("empresa_id", empresa_id)
-                .in_("nota_id", list(nota_ids))
-                .execute()
-            )
+        supabase.table("itens_nota_fiscal").delete().eq(
+            "empresa_id", empresa_id
+        ).in_("nota_id", list(nota_ids)).execute()
     except Exception:
-            logging.getLogger(__name__).exception(
-                "Falha ao limpar itens da tabela antes do reprocessamento da empresa %s; "
-                "a sincronização continuará via upsert.",
-                empresa_id,
+        logging.getLogger(__name__).exception(
+            "Falha ao limpar itens da tabela antes do reprocessamento da empresa %s; "
+            "a sincronização continuará via upsert.",
+            empresa_id,
+        )
+        limpeza_completa = False
+
+    try:
+        resposta_ledger = (
+            supabase.table("praesidium_ledger_fiscal")
+            .select("item_uid")
+            .eq("empresa_id", empresa_id)
+            .execute()
+        )
+        uids_ledger = [
+            str(registro.get("item_uid"))
+            for registro in (resposta_ledger.data or [])
+            if registro.get("item_uid")
+            and any(
+                str(registro["item_uid"]).startswith(f"{chave}::ITEM::")
+                for chave in (chaves_acesso or set())
             )
-            limpeza_completa = False
+        ]
+        if uids_ledger:
+            supabase.table("praesidium_ledger_fiscal").delete().eq(
+                "empresa_id", empresa_id
+            ).in_("item_uid", uids_ledger).execute()
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao limpar o ledger fiscal antes do reprocessamento da empresa %s.",
+            empresa_id,
+        )
+        limpeza_completa = False
 
     st.session_state[chave_sessao] = [
             item
@@ -3079,7 +3204,6 @@ def processar_xml_lote_bytes(
 
     itens_lote = []
     dados_sucesso = []
-    notas_reprocessadas_ids = set()
     for indice, nome_arquivo, nota_payload, itens in preparados:
         if not resultados[indice][0] and resultados[indice][1] != "Não foi possível processar o XML.":
             continue
@@ -3182,17 +3306,22 @@ def processar_xml_lote_bytes(
             itens_da_nota.append(item_persistido)
         itens_lote.extend(itens_da_nota)
         dados_sucesso.append((indice, nome_arquivo, nota_payload, itens_da_nota))
-        if str(nota_payload["chave_acesso"]) in {
-            str(nota["chave_acesso"])
-            for _, nota in notas_para_atualizar
-        }:
-            notas_reprocessadas_ids.add(str(nota_id))
 
     if itens_lote:
+        notas_para_limpar = {
+            str(notas_por_chave[str(nota_payload["chave_acesso"])]["id"])
+            for _, _, nota_payload, _ in dados_sucesso
+            if str(nota_payload["chave_acesso"]) in notas_por_chave
+        }
+        chaves_para_limpar = {
+            str(nota_payload["chave_acesso"])
+            for _, _, nota_payload, _ in dados_sucesso
+        }
         _limpar_itens_anteriores(
             supabase,
             empresa_id_ativo,
-            notas_reprocessadas_ids,
+            notas_para_limpar,
+            chaves_para_limpar,
         )
         mensagens_itens = []
         persistencia_completa = True

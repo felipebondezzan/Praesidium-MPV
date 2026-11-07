@@ -26,6 +26,39 @@ class FakeSupabase:
         return FakeRpc(name, params, self.response)
 
 
+class FakeDeleteQuery:
+    def __init__(self, database, table):
+        self.database = database
+        self.table = table
+        self.filters = []
+
+    def delete(self):
+        return self
+
+    def eq(self, column, value):
+        self.filters.append((column, value))
+        return self
+
+    def select(self, columns):
+        return self
+
+    def execute(self):
+        self.database.delete_order.append(self.table)
+        data = [{"id": company_id}] if self.table == "empresas_monitoradas" else []
+        return FakeResponse(data)
+
+
+class FakeDirectSupabase:
+    def __init__(self):
+        self.delete_order = []
+
+    def rpc(self, name, params):
+        raise RuntimeError("RPC indisponível")
+
+    def table(self, name):
+        return FakeDeleteQuery(self, name)
+
+
 company_id = "88"
 supabase = FakeSupabase({
     "deleted": True,
@@ -48,6 +81,19 @@ except RuntimeError:
     pass
 else:
     raise AssertionError("A exclusão não confirmada deveria falhar.")
+
+supabase_direto = FakeDirectSupabase()
+resultado_direto = xml_engine.excluir_empresa_supabase(
+    supabase_direto,
+    company_id,
+)
+assert resultado_direto["fallback"] is True
+assert supabase_direto.delete_order[:3] == [
+    "itens_nota_fiscal",
+    "notas_fiscais_recebidas",
+    "praesidium_ledger_fiscal",
+]
+assert supabase_direto.delete_order[-1] == "empresas_monitoradas"
 
 empresa = {"id": 88}
 cache = {}

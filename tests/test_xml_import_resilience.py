@@ -292,6 +292,23 @@ def _xml_100_items():
     ).encode("utf-8")
 
 
+def _xml_20_items():
+    detalhes = "".join(
+        f'<det nItem="{indice}"><prod><xProd>Produto {indice}</xProd>'
+        f"<NCM>33051000</NCM><CFOP>5102</CFOP><qCom>1</qCom>"
+        "<vProd>10.00</vProd></prod></det>"
+        for indice in range(1, 21)
+    )
+    return (
+        '<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe"><NFe>'
+        f'<infNFe Id="NFe{CHAVE}"><ide><dhEmi>2026-11-06T10:00:00-03:00</dhEmi></ide>'
+        f'<emit><CNPJ>{EMPRESA["cnpj"]}</CNPJ><xNome>Fornecedor</xNome><CRT>3</CRT></emit>'
+        f'<dest><CNPJ>{EMPRESA["cnpj"]}</CNPJ></dest>{detalhes}'
+        "<total><ICMSTot><vNF>200.00</vNF></ICMSTot></total>"
+        "</infNFe></NFe></nfeProc>"
+    ).encode("utf-8")
+
+
 logging.disable(logging.CRITICAL)
 xml_engine.st = SimpleNamespace(
     session_state={},
@@ -333,6 +350,61 @@ assert sum(item["classificacao_item"] == "Quarentena Uso/Consumo" for item in it
 assert resumo["bruto"] == 16379.65, resumo
 assert resumo["validado"] == 3507.54, resumo
 assert resumo["quarentena"] == 12872.11, resumo
+
+supabase_20 = FakeSupabase()
+xml_engine.st.session_state.clear()
+resultado_20 = xml_engine.processar_xml_lote_bytes(
+    [("nfe_teste_salao_20_itens.xml", _xml_20_items())],
+    supabase_20,
+    EMPRESA["id"],
+    EMPRESA,
+)
+assert resultado_20[0][0], resultado_20[0][1]
+itens_espelho_20 = [
+    linha
+    for linha in supabase_20.mirror
+    if linha.get("record_type") == "item"
+]
+ledger_20 = supabase_20.tables["praesidium_ledger_fiscal"]
+assert len(itens_espelho_20) == 20
+assert len(ledger_20) == 20
+assert len({linha["record_key"] for linha in itens_espelho_20}) == 20
+assert all(
+    isinstance(linha["payload"].get(campo), float)
+    for linha in ledger_20
+    for campo in (
+        "valor_item",
+        "credito_ibs_gerado",
+        "credito_cbs_gerado",
+        "valor_credito_item",
+    )
+)
+payload_limpo = xml_engine.sanitizar_payload_supabase(
+    "itens_nota_fiscal",
+    {
+        "empresa_id": EMPRESA["id"],
+        "nota_id": "note_1",
+        "item_uid": f"{CHAVE}::ITEM::0001",
+        "nitem": 1,
+        "descricao": "Produto",
+        "ncm": "33051000",
+        "cfop": "5102",
+        "vProd": "10.5",
+        "vIBS": "1.25",
+        "vCBS": None,
+        "credito_calculado": "2.75",
+        "id": "not-a-uuid",
+        "coluna_inexistente": "remover",
+    },
+)
+assert payload_limpo["valor_item"] == 10.5
+assert payload_limpo["credito_ibs_gerado"] == 1.25
+assert payload_limpo["credito_cbs_gerado"] == 0.0
+assert payload_limpo["valor_credito_item"] == 2.75
+assert "id" not in payload_limpo
+assert "coluna_inexistente" not in payload_limpo
+print("PASS: 20-item note uploaded and ledger persisted with numeric values.")
+xml_engine.st.session_state.clear()
 
 item_aprovado = next(
     item for item in itens

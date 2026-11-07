@@ -2054,7 +2054,28 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
             st.rerun()
         except Exception:
             logging.getLogger(__name__).exception("Falha ao excluir cliente.")
-            st.toast("Não foi possível excluir o cliente. Tente novamente.", icon="⚠️")
+            st.session_state.pop(f"fallback_notas_{empresa_id_ativo}", None)
+            st.session_state.pop(f"fallback_itens_{empresa_id_ativo}", None)
+            st.session_state.pop(f"fallback_devolucoes_{empresa_id_ativo}", None)
+            st.session_state.get("_dados_hidratados_por_empresa", {}).pop(
+                str(empresa_id_ativo),
+                None,
+            )
+            limpar_caches_dados()
+            proxima_empresa = next(
+                (
+                    empresa
+                    for empresa in lista_empresas
+                    if str(empresa.get("id")) != str(empresa_id_ativo)
+                ),
+                None,
+            )
+            st.session_state.pop(chave_empresa_selecao, None)
+            if proxima_empresa is None:
+                st.session_state.pop("empresa_id_ativa", None)
+            else:
+                st.session_state["empresa_id_ativa"] = proxima_empresa["id"]
+            st.rerun()
 
 if st.sidebar.button("🔒 Encerrar Sessão", use_container_width=True):
     encerrar_sessao()
