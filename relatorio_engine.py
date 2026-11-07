@@ -1,9 +1,317 @@
+import base64
+import io
+import json
 from datetime import datetime, date
 
 import pandas as pd
 import streamlit as st
 
 import xml_engine
+
+
+def _payload_danfe(nota: dict, itens: list[dict], empresa: dict) -> dict:
+    payload = {
+        "chave_acesso": str(nota.get("chave_acesso", "")),
+        "cnpj_emitente": str(nota.get("cnpj_emitente", "")),
+        "nome_emitente": str(
+            nota.get("razao_social_emitente")
+            or nota.get("nome_emitente")
+            or "Emitente não informado"
+        ),
+        "cnpj_destinatario": str(empresa.get("cnpj", "")),
+        "nome_destinatario": str(empresa.get("razao_social", "")),
+        "numero": str(nota.get("numero") or nota.get("nNF") or "1"),
+        "serie": str(nota.get("serie") or "1"),
+        "data_emissao": str(nota.get("data_emissao") or date.today().isoformat()),
+        "valor_total_nf": float(nota.get("valor_total_nf", 0.0) or 0.0),
+        "itens": [
+            {
+                "numero": int(xml_engine._float_seguro(item.get("nitem"), indice)),
+                "codigo": str(item.get("codigo") or item.get("cProd") or f"ITEM-{indice:03d}"),
+                "descricao": str(item.get("descricao") or item.get("descricao_produto") or "Item"),
+                "ncm": str(item.get("ncm", "")),
+                "cfop": str(item.get("cfop", "")),
+                "quantidade": float(
+                    item.get("quantidade_comercial")
+                    or item.get("qcom")
+                    or 0.0
+                ),
+                "valor_unitario": float(
+                    item.get("valor_unitario")
+                    or (
+                        float(item.get("valor_item") or item.get("valor_total_bruto") or 0.0)
+                        / max(
+                            float(item.get("quantidade_comercial") or item.get("qcom") or 1.0),
+                            0.0001,
+                        )
+                    )
+                ),
+                "valor_total": float(
+                    item.get("valor_item")
+                    or item.get("valor_total_bruto")
+                    or 0.0
+                ),
+                "ibs": float(item.get("credito_ibs_gerado") or 0.0),
+                "cbs": float(item.get("credito_cbs_gerado") or 0.0),
+                "status": str(
+                    item.get("classificacao_item")
+                    or item.get("status_credito")
+                    or "Não classificado"
+                ),
+                "credito": float(item.get("valor_credito_item") or 0.0),
+            }
+            for indice, item in enumerate(itens or [], start=1)
+        ],
+    }
+    payload["total_ibs"] = round(
+        sum(item["ibs"] for item in payload["itens"]),
+        2,
+    )
+    payload["total_cbs"] = round(
+        sum(item["cbs"] for item in payload["itens"]),
+        2,
+    )
+    payload["total_credito"] = round(
+        sum(item["credito"] for item in payload["itens"]),
+        2,
+    )
+    return payload
+
+
+def _pdf_nativo_danfe(payload: dict) -> bytes:
+    linhas = [
+        "DANFE - ESPELHO DE CONFERENCIA - SEM VALIDADE FISCAL",
+        f"EMITENTE: {payload['nome_emitente']} | CNPJ: {payload['cnpj_emitente']}",
+        f"DESTINATARIO: {payload['nome_destinatario']} | CNPJ: {payload['cnpj_destinatario']}",
+        f"NUMERO: {payload['numero']} | SERIE: {payload['serie']} | DATA: {payload['data_emissao']}",
+        f"CHAVE DE ACESSO: {payload['chave_acesso']}",
+        f"VALOR TOTAL DA NOTA: R$ {payload['valor_total_nf']:.2f}",
+        f"IBS: R$ {payload['total_ibs']:.2f} | CBS: R$ {payload['total_cbs']:.2f} | "
+        f"Crédito Split Payment: R$ {payload['total_credito']:.2f}",
+        "Documento de auditoria. Nao substitui DANFE autorizado pela SEFAZ.",
+        "CODIGO | DESCRICAO | NCM | CFOP | QTD | V.UNIT | V.TOTAL | IBS | CBS | CREDITO | STATUS",
+    ]
+    for item in payload["itens"]:
+        linhas.append(
+            f"{item['codigo']} | {item['descricao']} | {item['ncm']} | "
+            f"{item['cfop']} | {item['quantidade']:.4f} | "
+            f"{item['valor_unitario']:.2f} | {item['valor_total']:.2f} | "
+            f"{item['ibs']:.2f} | {item['cbs']:.2f} | "
+            f"{item['credito']:.2f} | {item['status']}"
+        )
+    paginas = [linhas[indice:indice + 45] for indice in range(0, len(linhas), 45)]
+    if not paginas:
+        paginas = [[]]
+    dados = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    objetos: list[bytes] = []
+    objetos.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    paginas_refs = " ".join(
+        f"{4 + indice * 2} 0 R" for indice in range(len(paginas))
+    )
+    objetos.append(
+        f"<< /Type /Pages /Kids [{paginas_refs}] /Count {len(paginas)} >>".encode("ascii")
+    )
+    objetos.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    for indice, linhas_pagina in enumerate(paginas):
+        page_id = 4 + indice * 2
+        stream_id = page_id + 1
+        comandos = ["BT /F1 8 Tf 28 560 Td"]
+        for linha in linhas_pagina:
+            seguro = str(linha).encode("cp1252", errors="replace").decode("latin-1")
+            seguro = seguro.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+            comandos.append(f"({seguro}) Tj 0 -12 Td")
+        comandos.append("ET")
+        stream = "\n".join(comandos).encode("latin-1")
+        objetos.append(
+            (
+                f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 842 595] "
+                f"/Resources << /Font << /F1 3 0 R >> >> /Contents {stream_id} 0 R >>"
+            ).encode("ascii")
+        )
+        objetos.append(
+            b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n"
+            + stream + b"\nendstream"
+        )
+    info_id = len(objetos) + 1
+    objetos.append(
+        f"<< /Title (DANFE Praesidium) /PraesidiumPayload ({dados}) >>".encode("ascii")
+    )
+    buffer = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for indice, objeto in enumerate(objetos, start=1):
+        offsets.append(len(buffer))
+        buffer.extend(f"{indice} 0 obj\n".encode("ascii"))
+        buffer.extend(objeto)
+        buffer.extend(b"\nendobj\n")
+    xref_offset = len(buffer)
+    buffer.extend(f"xref\n0 {len(objetos) + 1}\n".encode("ascii"))
+    buffer.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        buffer.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    buffer.extend(
+        f"trailer\n<< /Size {len(objetos) + 1} /Root 1 0 R /Info {info_id} 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF".encode("ascii")
+    )
+    return bytes(buffer)
+
+
+def gerar_danfe_pdf(nota: dict, itens: list[dict], empresa: dict) -> bytes:
+    payload = _payload_danfe(nota, itens, empresa)
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+        from reportlab.pdfgen import canvas
+        from reportlab.graphics.barcode import code128
+    except ImportError:
+        return _pdf_nativo_danfe(payload)
+
+    buffer = io.BytesIO()
+    pagina_largura, pagina_altura = landscape(A4)
+    pdf = canvas.Canvas(buffer, pagesize=(pagina_largura, pagina_altura))
+    pdf.setTitle("Espelho DANFE para conferência - Praesidium")
+    pdf.setAuthor("Praesidium")
+    metadata = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    pdf.setKeywords(f"PraesidiumPayload:{metadata}")
+    margem = 28
+    largura_util = pagina_largura - 2 * margem
+
+    def desenhar_cabecalho(numero_pagina: int, total_paginas: int) -> float:
+        topo = pagina_altura - margem
+        pdf.setStrokeColor(colors.HexColor("#111827"))
+        pdf.setLineWidth(1)
+        pdf.rect(margem, topo - 104, largura_util, 104)
+        pdf.setFont("Helvetica-Bold", 15)
+        pdf.drawString(margem + 10, topo - 22, "DANFE")
+        pdf.setFont("Helvetica", 7)
+        pdf.drawString(margem + 10, topo - 35, "Espelho de conferência — sem validade fiscal")
+        pdf.setFont("Helvetica-Bold", 9)
+        pdf.drawString(
+            margem + 190,
+            topo - 22,
+            payload["nome_emitente"][:65],
+        )
+        pdf.setFont("Helvetica", 8)
+        pdf.drawString(
+            margem + 190,
+            topo - 37,
+            f"CNPJ Emitente: {payload['cnpj_emitente']} | Destinatário: "
+            f"{payload['nome_destinatario'][:48]}",
+        )
+        pdf.drawString(
+            margem + 190,
+            topo - 51,
+            f"CNPJ Destinatário: {payload['cnpj_destinatario']}",
+        )
+        pdf.setFont("Helvetica-Bold", 9)
+        pdf.drawString(
+            pagina_largura - margem - 150,
+            topo - 22,
+            f"Nº {payload['numero']} | Série {payload['serie']}",
+        )
+        pdf.setFont("Helvetica", 7)
+        pdf.drawString(
+            pagina_largura - margem - 150,
+            topo - 36,
+            f"Página {numero_pagina} de {total_paginas}",
+        )
+        chave = payload["chave_acesso"]
+        pdf.drawString(margem + 10, topo - 70, "CHAVE DE ACESSO")
+        pdf.setFont("Courier-Bold", 9)
+        pdf.drawString(
+            margem + 10,
+            topo - 85,
+            " ".join(chave[indice:indice + 4] for indice in range(0, len(chave), 4)),
+        )
+        try:
+            barcode = code128.Code128(chave, barHeight=24, barWidth=0.55, humanReadable=False)
+            barcode.drawOn(pdf, pagina_largura - margem - barcode.width - 12, topo - 91)
+        except Exception:
+            pdf.setFont("Courier", 6)
+            pdf.drawString(pagina_largura - margem - 190, topo - 84, chave)
+        return topo - 122
+
+    itens_por_pagina = 22
+    paginas_itens = [
+        payload["itens"][indice:indice + itens_por_pagina]
+        for indice in range(0, len(payload["itens"]), itens_por_pagina)
+    ] or [[]]
+    total_paginas = len(paginas_itens)
+    for numero_pagina, pagina_itens in enumerate(paginas_itens, start=1):
+        y = desenhar_cabecalho(numero_pagina, total_paginas)
+        pdf.setFont("Helvetica-Bold", 8)
+        pdf.drawString(margem, y, "DESTINATÁRIO")
+        pdf.drawString(margem + 260, y, "CÁLCULO DO IMPOSTO")
+        y -= 13
+        pdf.setFont("Helvetica", 8)
+        pdf.drawString(
+            margem,
+            y,
+            f"{payload['nome_destinatario'][:48]} | CNPJ {payload['cnpj_destinatario']}",
+        )
+        pdf.drawString(
+            margem + 260,
+            y,
+            f"Base R$ {payload['valor_total_nf']:,.2f} | IBS R$ {payload['total_ibs']:,.2f} | "
+            f"CBS R$ {payload['total_cbs']:,.2f} | Crédito R$ {payload['total_credito']:,.2f}",
+        )
+        y -= 22
+        pdf.setFillColor(colors.HexColor("#e5e7eb"))
+        pdf.rect(margem, y - 3, largura_util, 16, fill=1, stroke=0)
+        pdf.setFillColor(colors.black)
+        pdf.setFont("Helvetica-Bold", 6.8)
+        colunas = [
+            (margem + 3, "CÓDIGO"),
+            (margem + 58, "DESCRIÇÃO"),
+            (margem + 310, "NCM"),
+            (margem + 365, "CFOP"),
+            (margem + 405, "QTD"),
+            (margem + 455, "V.UNIT"),
+            (margem + 510, "V.TOTAL"),
+            (margem + 590, "CRÉDITO"),
+            (margem + 660, "STATUS"),
+        ]
+        for x, label in colunas:
+            pdf.drawString(x, y + 2, label)
+        y -= 14
+        pdf.setFont("Helvetica", 6.4)
+        for item in pagina_itens:
+            descricao = item["descricao"].replace("\n", " ")[:48]
+            campos = [
+                (margem + 3, item["codigo"][:12]),
+                (margem + 58, descricao),
+                (margem + 310, item["ncm"][:8]),
+                (margem + 365, item["cfop"][:4]),
+                (margem + 405, f"{item['quantidade']:.3f}"),
+                (margem + 455, f"{item['valor_unitario']:,.2f}"),
+                (margem + 510, f"{item['valor_total']:,.2f}"),
+                (margem + 590, f"{item['credito']:,.2f}"),
+                (margem + 660, item["status"][:18]),
+            ]
+            for x, valor in campos:
+                largura_texto = max(1.0, largura_util - (x - margem) - 3)
+                texto = str(valor)
+                while texto and stringWidth(texto, "Helvetica", 6.4) > largura_texto:
+                    texto = texto[:-1]
+                pdf.drawString(x, y, texto)
+            pdf.setStrokeColor(colors.HexColor("#d1d5db"))
+            pdf.line(margem, y - 3, pagina_largura - margem, y - 3)
+            y -= 15
+        pdf.setFont("Helvetica", 7)
+        pdf.drawString(
+            margem,
+            margem,
+            f"Data de emissão: {payload['data_emissao']} | "
+            f"Crédito IBS/CBS calculado por item: LC 214/2025 | "
+            f"Espelho de auditoria; não substitui DANFE autorizado pela SEFAZ.",
+        )
+        pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
 
 
 def injetar_css_blindado_relatorio():

@@ -1,7 +1,11 @@
+import io
 import logging
+import sys
 from types import SimpleNamespace
 
 import xml_engine
+import relatorio_engine
+from reportlab.pdfgen import canvas
 
 
 EMPRESA = {
@@ -15,6 +19,61 @@ CHAVE = "3" * 44
 class FakeResponse:
     def __init__(self, data):
         self.data = data
+
+
+class FakeRpc:
+    def __init__(self, database, name, params):
+        self.database = database
+        self.name = name
+        self.params = params
+
+    def execute(self):
+        if self.name != "decidir_itens_quarentena_lote":
+            raise AssertionError(f"Unexpected RPC: {self.name}")
+        empresa_id = str(self.params["p_empresa_id"])
+        ledger = self.database.tables.setdefault("praesidium_ledger_fiscal", [])
+        espelho = self.database.tables["praesidium_empresa_mirror"]
+        decisoes = self.params["p_decisoes"]
+        pendentes = {}
+        for decisao in decisoes:
+            uid = decisao["item_uid"]
+            for registro in ledger:
+                if (
+                    str(registro.get("empresa_id")) == empresa_id
+                    and registro.get("item_uid") == uid
+                ):
+                    pendentes[uid] = dict(registro["payload"])
+            for registro in espelho:
+                if (
+                    str(registro.get("empresa_id")) == empresa_id
+                    and registro.get("record_type") == "item"
+                    and registro.get("record_key") == uid
+                ):
+                    pendentes[uid] = dict(registro["payload"])
+        if any(
+            uid not in pendentes
+            or pendentes[uid].get("classificacao_item") != "Quarentena Uso/Consumo"
+            for uid in (decisao["item_uid"] for decisao in decisoes)
+        ):
+            raise RuntimeError("Item pendente não encontrado no teste.")
+
+        decisoes_por_uid = {
+            decisao["item_uid"]: decisao
+            for decisao in decisoes
+        }
+        for registro in ledger:
+            decisao = decisoes_por_uid.get(registro.get("item_uid"))
+            if str(registro.get("empresa_id")) == empresa_id and decisao:
+                registro["payload"] = {**registro["payload"], **decisao}
+        for registro in espelho:
+            decisao = decisoes_por_uid.get(registro.get("record_key"))
+            if (
+                str(registro.get("empresa_id")) == empresa_id
+                and registro.get("record_type") == "item"
+                and decisao
+            ):
+                registro["payload"] = {**registro["payload"], **decisao}
+        return FakeResponse({"empresa_id": empresa_id, "updated": len(decisoes)})
 
 
 class FakeQuery:
@@ -181,6 +240,9 @@ class FakeSupabase:
 
     def table(self, name):
         return FakeQuery(self, name)
+
+    def rpc(self, name, params):
+        return FakeRpc(self, name, params)
 
 
 def _xml_100_items():
@@ -375,4 +437,243 @@ print(
 print(
     "PASS: approval and R$ 100.00 split-payment retention survived subsequent "
     "session_state clears and Supabase re-hydration."
+)
+
+chave_pdf = "2" * 44
+nota_pdf = {
+    "id": "pdf_note_1",
+    "chave_acesso": chave_pdf,
+    "numero": "1050",
+    "serie": "1",
+    "cnpj_emitente": "60746948000112",
+    "razao_social_emitente": "Fornecedor DANFE Teste",
+    "valor_total_nf": 5000.00,
+    "data_emissao": "2026-11-07T10:00:00-03:00",
+}
+itens_pdf = []
+for indice in range(1, 51):
+    salao = indice <= 25
+    itens_pdf.append({
+        "nitem": indice,
+        "codigo": f"PROD-{indice:03d}",
+        "descricao": "Shampoo profissional" if salao else "Pneu automotivo",
+        "ncm": "33051000" if salao else "40111000",
+        "cfop": "5102",
+        "quantidade_comercial": 1.0,
+        "valor_unitario": 100.00,
+        "valor_item": 100.00,
+        "credito_ibs_gerado": 17.70,
+        "credito_cbs_gerado": 8.80,
+        "valor_credito_item": 26.50,
+        "classificacao_item": "Aprovado Revenda" if salao else "Quarentena Uso/Consumo",
+    })
+pdf_danfe = relatorio_engine.gerar_danfe_pdf(
+    nota_pdf,
+    itens_pdf,
+    {**EMPRESA, "razao_social": "Salão Teste"},
+)
+assert pdf_danfe.startswith(b"%PDF")
+xml_reconstruido = xml_engine.converter_danfe_pdf_para_xml(
+    pdf_danfe,
+    EMPRESA["cnpj"],
+    "Salão Teste",
+)
+raiz_pdf = xml_engine.ET.fromstring(xml_reconstruido)
+assert len([
+    elemento for elemento in raiz_pdf.iter()
+    if elemento.tag.split("}")[-1] == "det"
+]) == 50
+resultado_pdf = xml_engine.processar_xml_bytes(
+    xml_reconstruido,
+    supabase,
+    EMPRESA["id"],
+    EMPRESA,
+)
+assert resultado_pdf[0], resultado_pdf[1]
+xml_engine.st.session_state.clear()
+dados_pdf_reboot = xml_engine.hidratar_dados_empresa_supabase(
+    supabase,
+    EMPRESA["id"],
+    EMPRESA,
+)
+nota_persistida_pdf = next(
+    nota for nota in dados_pdf_reboot["notas"]
+    if nota.get("chave_acesso") == chave_pdf
+)
+itens_pdf_persistidos = [
+    item for item in dados_pdf_reboot["itens"]
+    if str(item.get("nota_id")) == str(nota_persistida_pdf["id"])
+]
+assert len(itens_pdf_persistidos) == 50
+assert sum(
+    item["classificacao_item"] == "Aprovado Revenda"
+    for item in itens_pdf_persistidos
+) == 25
+assert sum(
+    item["classificacao_item"] == "Quarentena Uso/Consumo"
+    for item in itens_pdf_persistidos
+) == 25
+assert xml_engine.calcular_resumo_creditos(itens_pdf_persistidos) == {
+    "bruto": 1325.0,
+    "validado": 662.5,
+    "quarentena": 662.5,
+    "rejeitado": 0.0,
+}
+assert nota_persistida_pdf["xml_reconstruido"].encode("utf-8") == xml_reconstruido
+
+pendentes_lote = [
+    item for item in itens_pdf_persistidos
+    if item["classificacao_item"] == "Quarentena Uso/Consumo"
+]
+selecionados_aprovar = pendentes_lote[:2]
+selecionados_rejeitar = pendentes_lote[2:5]
+assert xml_engine.decidir_itens_quarentena_lote(
+    supabase,
+    EMPRESA["id"],
+    selecionados_aprovar,
+    "aprovar",
+) == 2
+assert xml_engine.decidir_itens_quarentena_lote(
+    supabase,
+    EMPRESA["id"],
+    selecionados_rejeitar,
+    "rejeitar",
+) == 3
+try:
+    xml_engine.decidir_itens_quarentena_lote(
+        supabase,
+        EMPRESA["id"],
+        [
+            pendentes_lote[5],
+            {"empresa_id": EMPRESA["id"], "item_uid": "uid-ausente"},
+        ],
+        "aprovar",
+    )
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("A decisão parcial deveria ser revertida.")
+xml_engine.st.session_state.clear()
+dados_lote_reboot = xml_engine.hidratar_dados_empresa_supabase(
+    supabase,
+    EMPRESA["id"],
+    EMPRESA,
+)
+itens_pdf_pos_lote = [
+    item for item in dados_lote_reboot["itens"]
+    if str(item.get("nota_id")) == str(nota_persistida_pdf["id"])
+]
+assert sum(
+    item["classificacao_item"] == "Aprovado Manualmente Contador"
+    for item in itens_pdf_pos_lote
+) == 2
+assert sum(
+    item["classificacao_item"] == "Rejeitado pelo Contador"
+    for item in itens_pdf_pos_lote
+) == 3
+assert sum(
+    item["classificacao_item"] == "Quarentena Uso/Consumo"
+    for item in itens_pdf_pos_lote
+) == 20
+assert xml_engine.calcular_resumo_creditos(itens_pdf_pos_lote) == {
+    "bruto": 1245.5,
+    "validado": 715.5,
+    "quarentena": 530.0,
+    "rejeitado": 79.5,
+}
+pdf_nativo = relatorio_engine._pdf_nativo_danfe(
+    relatorio_engine._payload_danfe(
+        nota_pdf,
+        itens_pdf[:2],
+        {**EMPRESA, "razao_social": "Salão Teste"},
+    )
+)
+xml_nativo = xml_engine.converter_danfe_pdf_para_xml(
+    pdf_nativo,
+    EMPRESA["cnpj"],
+    "Salão Teste",
+)
+assert sum(
+    elemento.tag.split("}")[-1] == "det"
+    for elemento in xml_engine.ET.fromstring(xml_nativo).iter()
+) == 2
+modulo_pypdf_original = sys.modules.get("pypdf")
+sys.modules["pypdf"] = None
+try:
+    xml_nativo_sem_pypdf = xml_engine.converter_danfe_pdf_para_xml(
+        pdf_nativo,
+        EMPRESA["cnpj"],
+        "Salão Teste",
+    )
+finally:
+    if modulo_pypdf_original is None:
+        sys.modules.pop("pypdf", None)
+    else:
+        sys.modules["pypdf"] = modulo_pypdf_original
+assert xml_nativo_sem_pypdf == xml_nativo
+
+pdf_externo_buffer = io.BytesIO()
+pdf_externo_canvas = canvas.Canvas(pdf_externo_buffer)
+linhas_pdf_externo = [
+    "DANFE - Documento Auxiliar da Nota Fiscal Eletronica",
+    "Razao Social: Fornecedor Externo Ltda",
+    "CNPJ Emitente: 60.746.948/0001-12",
+    "CNPJ Destinatario: 12.345.678/0001-95",
+    f"Chave de acesso: {'3' * 44}",
+    "NF-e Nº: 2091 Serie: 1",
+    "05/11/2026",
+    "CODIGO DESCRICAO NCM CST CFOP UN QTD V.UNIT V.TOTAL",
+    "SH001 Shampoo profissional 33051000 000 5102 UN 1,0000 100,00 100,00",
+    "PN001 Pneu automotivo 40111000 000 5102 UN 1,0000 200,00 200,00",
+]
+for indice, linha in enumerate(linhas_pdf_externo):
+    pdf_externo_canvas.drawString(30, 800 - indice * 18, linha)
+pdf_externo_canvas.save()
+xml_externo = xml_engine.converter_danfe_pdf_para_xml(
+    pdf_externo_buffer.getvalue(),
+    EMPRESA["cnpj"],
+    "Salão Teste",
+)
+itens_externos = [
+    elemento for elemento in xml_engine.ET.fromstring(xml_externo).iter()
+    if elemento.tag.split("}")[-1] == "det"
+]
+assert len(itens_externos) == 2
+assert [
+    next(
+        filho.text for filho in detalhe.iter()
+        if filho.tag.split("}")[-1] == "NCM"
+    )
+    for detalhe in itens_externos
+] == ["33051000", "40111000"]
+nota_externa, itens_externos_preparados, erro_externo = xml_engine._preparar_xml_nfe(
+    xml_externo,
+    EMPRESA["id"],
+    EMPRESA,
+    set(),
+    set(),
+    {EMPRESA["cnpj"]},
+)
+assert nota_externa is not None, erro_externo
+assert len(itens_externos_preparados) == 2
+assert [
+    xml_engine.classificar_item_inteligente(
+        item["ncm"],
+        item["cfop"],
+        item["quantidade_comercial"],
+        item["valor_item"],
+        nota_externa["crt_emitente"],
+        EMPRESA["cnae_principal"],
+        False,
+        item["descricao"],
+    )[0]
+    for item in itens_externos_preparados
+] == ["Aprovado Revenda", "Quarentena Uso/Consumo"]
+print(
+    "PASS: 50-item DANFE PDF round-trip recovered every item, ran CNAE audit, "
+    "persisted XML and passed reboot checks."
+)
+print(
+    "PASS: mass approval and rejection were atomic in the RPC contract and "
+    "survived Supabase hydration."
 )

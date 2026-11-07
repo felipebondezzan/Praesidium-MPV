@@ -2284,39 +2284,47 @@ def renderizar_fila_quarentena(
     auditados: list[dict],
     empresa_id: int | str,
 ) -> None:
+    prefixo_selecao = f"quarentena_selecionar_{empresa_id}_"
+    chave_selecionar_todos = f"quarentena_todos_{empresa_id}"
+    if st.session_state.pop(f"limpar_selecao_quarentena_{empresa_id}", False):
+        st.session_state.pop(chave_selecionar_todos, None)
+        chaves_widgets = st.session_state.pop(
+            f"quarentena_widgets_{empresa_id}",
+            set(),
+        )
+        for chave_widget in chaves_widgets:
+            st.session_state.pop(chave_widget, None)
+        for item in pendentes:
+            uid = str(item.get("item_uid") or "")
+            if uid:
+                st.session_state.pop(
+                    prefixo_selecao + hashlib.sha256(uid.encode()).hexdigest()[:20],
+                    None,
+                )
+
+    def chave_checkbox(item: dict) -> str:
+        uid = str(item.get("item_uid") or "")
+        return prefixo_selecao + hashlib.sha256(uid.encode()).hexdigest()[:20]
+
+    def alterar_selecao_global() -> None:
+        selecionado = bool(st.session_state.get(chave_selecionar_todos))
+        for item in pendentes:
+            if item.get("item_uid"):
+                st.session_state[chave_checkbox(item)] = selecionado
+
+    def alterar_selecao_individual() -> None:
+        st.session_state[chave_selecionar_todos] = False
+
     def persistir_decisao(item: dict, status: str, credito: float) -> None:
-        if item.get("id") is None or item.get("nota_id") is None:
-            raise RuntimeError("Vínculo do item indisponível.")
-        justificativa = (
-            "Art. 47/57: aprovação após revalidação documental manual pelo contador."
-            if status == "Aprovado Manualmente Contador"
-            else "Art. 57: crédito glosado após análise manual do contador."
-        )
-        atualizacao = {
-            "classificacao_item": status,
-            "status_credito": (
-                "Validado"
-                if status == "Aprovado Manualmente Contador"
-                else "Rejeitado"
-            ),
-            "valor_credito_item": round(credito, 2),
-            "justificativa_motor": justificativa,
-        }
-        ok, mensagem, resultado = xml_engine.executar_update_seguro(
+        decisao = "aprovar" if status == "Aprovado Manualmente Contador" else "rejeitar"
+        atualizado = xml_engine.decidir_itens_quarentena_lote(
             supabase,
-            "itens_nota_fiscal",
-            atualizacao,
-            {
-                "id": item["id"],
-                "nota_id": item["nota_id"],
-                "empresa_id": empresa_id,
-                "classificacao_item": "Quarentena Uso/Consumo",
-            },
-            fallback_record=item,
+            empresa_id,
+            [item],
+            decisao,
         )
-        if not ok or not resultado:
-            raise RuntimeError(mensagem)
-        item["justificativa_motor"] = justificativa
+        if atualizado != 1:
+            raise RuntimeError("A decisão do item não foi confirmada.")
 
     with st.expander(
         f"📁 4. Fila de Quarentena & Histórico de Auditoria "
@@ -2325,6 +2333,11 @@ def renderizar_fila_quarentena(
     ):
         if pendentes:
             st.markdown("#### ⏳ Itens Aguardando Decisão Técnica do Contador")
+            st.checkbox(
+                "☑️ Selecionar todos os itens pendentes",
+                key=chave_selecionar_todos,
+                on_change=alterar_selecao_global,
+            )
             filtro_itens = st.text_input(
                 "Buscar na quarentena",
                 placeholder="Descrição, NCM ou CFOP",
@@ -2377,6 +2390,19 @@ def renderizar_fila_quarentena(
                     f"<b style='color:#fbbf24;'>R$ {credito:,.2f}</b></span></div>",
                     unsafe_allow_html=True,
                 )
+                uid_item = str(item.get("item_uid") or "")
+                if uid_item:
+                    chave_item = chave_checkbox(item)
+                    chaves_widgets = st.session_state.setdefault(
+                        f"quarentena_widgets_{empresa_id}",
+                        set(),
+                    )
+                    chaves_widgets.add(chave_item)
+                    st.checkbox(
+                        "Selecionar para decisão em massa",
+                        key=chave_item,
+                        on_change=alterar_selecao_individual,
+                    )
                 aprovar, rejeitar = st.columns(2)
                 if aprovar.button(
                     "✅ Liberar Crédito (Aprovar)",
@@ -2407,6 +2433,9 @@ def renderizar_fila_quarentena(
                             f"✅ +R$ {credito:,.2f} liberados para o Crédito Validado!",
                             icon="💰",
                         )
+                        st.session_state[
+                            f"limpar_selecao_quarentena_{empresa_id}"
+                        ] = True
                         st.rerun()
                 if rejeitar.button(
                     "🚫 Bloquear Crédito (Uso/Consumo Definitivo)",
@@ -2435,8 +2464,86 @@ def renderizar_fila_quarentena(
                             f"🛡️ R$ {credito:,.2f} glosados (Art. 57) — risco fiscal eliminado!",
                             icon="🛡️",
                         )
+                        st.session_state[
+                            f"limpar_selecao_quarentena_{empresa_id}"
+                        ] = True
                         st.rerun()
                 st.markdown("---")
+            selecionados = [
+                item for item in pendentes
+                if item.get("item_uid")
+                and st.session_state.get(chave_checkbox(item), False)
+            ]
+            if selecionados:
+                st.markdown(
+                    f"<div style='padding:12px;border:1px solid #d4af37;"
+                    f"border-radius:8px;background:#111827;margin:8px 0;'>"
+                    f"<b>{len(selecionados)} item(ns) selecionado(s)</b></div>",
+                    unsafe_allow_html=True,
+                )
+                aprovar_lote, rejeitar_lote = st.columns(2)
+                if aprovar_lote.button(
+                    f"✅ Aprovar Itens Selecionados ({len(selecionados)})",
+                    key=f"quarentena_aprovar_lote_{empresa_id}",
+                    use_container_width=True,
+                ):
+                    try:
+                        xml_engine.decidir_itens_quarentena_lote(
+                            supabase,
+                            empresa_id,
+                            selecionados,
+                            "aprovar",
+                        )
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "Falha ao aprovar itens em lote para empresa %s.",
+                            empresa_id,
+                        )
+                        st.toast(
+                            "A aprovação em lote não foi confirmada. Nenhum item foi alterado.",
+                            icon="⚠️",
+                        )
+                    else:
+                        st.session_state[
+                            f"limpar_selecao_quarentena_{empresa_id}"
+                        ] = True
+                        st.session_state["modulo_ativo"] = "quarentena"
+                        st.toast(
+                            f"{len(selecionados)} item(ns) aprovado(s) com sucesso.",
+                            icon="✅",
+                        )
+                        st.rerun()
+                if rejeitar_lote.button(
+                    f"🛑 Rejeitar Itens Selecionados ({len(selecionados)})",
+                    key=f"quarentena_rejeitar_lote_{empresa_id}",
+                    use_container_width=True,
+                ):
+                    try:
+                        xml_engine.decidir_itens_quarentena_lote(
+                            supabase,
+                            empresa_id,
+                            selecionados,
+                            "rejeitar",
+                        )
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "Falha ao rejeitar itens em lote para empresa %s.",
+                            empresa_id,
+                        )
+                        st.toast(
+                            "A rejeição em lote não foi confirmada. Nenhum item foi alterado.",
+                            icon="⚠️",
+                        )
+                    else:
+                        st.session_state[
+                            f"limpar_selecao_quarentena_{empresa_id}"
+                        ] = True
+                        st.session_state["modulo_ativo"] = "quarentena"
+                        st.toast(
+                            f"{len(selecionados)} item(ns) rejeitado(s) e glosado(s) (Art. 57).",
+                            icon="🛡️",
+                        )
+                        st.rerun()
         else:
             st.success("🎉 Nenhum item pendente de análise na quarentena para este cliente.")
 
@@ -2461,7 +2568,11 @@ renderizar_fila_quarentena(itens_pendentes, itens_auditados, empresa_id_ativo)
 # MÓDULO 5: NOTAS FISCAIS RECEBIDAS (COM SELETOR DE DOWNLOAD NOTA POR NOTA DO CLIENTE)
 with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} notas acumuladas deste cliente)", expanded=False):
     if notas:
-        st.caption("Marque na primeira coluna (☑️ Baixar XML) as notas fiscais específicas deste cliente que deseja exportar:")
+        st.caption(
+            "Selecione uma nota abaixo para abrir seu DANFE, baixar o PDF ou "
+            "exportar o XML reconstruído. A seleção na primeira coluna também "
+            "permite gerar um pacote ZIP."
+        )
         df_exibir = pd.DataFrame([
             {
                 "Baixar XML": True,
@@ -2483,6 +2594,147 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
             key=f"editor_notas_acumuladas_{empresa_id_ativo}"
         )
 
+        notas_por_id = {
+            str(nota.get("id")): nota
+            for nota in notas
+            if nota.get("id") is not None
+        }
+        ids_notas_danfe = list(notas_por_id)
+        nota_id_danfe = st.selectbox(
+            "Visualizador DANFE — Espelho de Conferência",
+            ids_notas_danfe,
+            format_func=lambda nota_id: (
+                f"NF-e {notas_por_id[nota_id].get('chave_acesso', '')} | "
+                f"{notas_por_id[nota_id].get('razao_social_emitente', 'Emitente')} | "
+                f"R$ {float(notas_por_id[nota_id].get('valor_total_nf', 0.0)):,.2f}"
+            ),
+            key=f"visualizar_danfe_{empresa_id_ativo}",
+        )
+        nota_danfe = notas_por_id[nota_id_danfe]
+        itens_danfe = [
+            item for item in itens
+            if str(item.get("nota_id")) == str(nota_danfe.get("id"))
+        ]
+        credito_ibs_danfe = round(sum(
+            float(item.get("credito_ibs_gerado", 0.0) or 0.0)
+            for item in itens_danfe
+        ), 2)
+        credito_cbs_danfe = round(sum(
+            float(item.get("credito_cbs_gerado", 0.0) or 0.0)
+            for item in itens_danfe
+        ), 2)
+        credito_danfe = round(sum(
+            float(item.get("valor_credito_item", 0.0) or 0.0)
+            for item in itens_danfe
+        ), 2)
+        c_danfe, c_pdf, c_xml = st.columns([3, 1, 1])
+        with c_danfe:
+            st.markdown(
+                f"#### DANFE — {nota_danfe.get('razao_social_emitente', 'Emitente não informado')}"
+            )
+            st.caption(
+                "Espelho de conferência e auditoria. Não substitui o DANFE oficial "
+                "autorizado pela SEFAZ."
+            )
+            st.caption(
+                f"Emitente: CNPJ {nota_danfe.get('cnpj_emitente', '—')} | "
+                f"Destinatário: {empresa_ativa.get('razao_social', '')} "
+                f"(CNPJ {empresa_ativa.get('cnpj', '')})"
+            )
+            chave_acesso = str(nota_danfe.get("chave_acesso", ""))
+            st.code(
+                " ".join(
+                    chave_acesso[indice:indice + 4]
+                    for indice in range(0, len(chave_acesso), 4)
+                ),
+                language=None,
+            )
+        with c_pdf:
+            pdf_danfe = relatorio_engine.gerar_danfe_pdf(
+                nota_danfe,
+                itens_danfe,
+                empresa_ativa,
+            )
+            st.download_button(
+                "📄 Baixar Espelho DANFE (.PDF)",
+                data=pdf_danfe,
+                file_name=f"DANFE_{chave_acesso or nota_id_danfe}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key=f"baixar_danfe_pdf_{empresa_id_ativo}_{nota_id_danfe}",
+            )
+        with c_xml:
+            xml_danfe = str(nota_danfe.get("xml_reconstruido") or "").strip()
+            if not xml_danfe:
+                xml_danfe = xml_engine.gerar_xml_reconstruido_cliente(
+                    empresa_ativa,
+                    nota_danfe,
+                    itens_danfe,
+                )
+            st.download_button(
+                "📥 Baixar XML Reconstruído",
+                data=xml_danfe.encode("utf-8"),
+                file_name=f"NFe_{chave_acesso or nota_id_danfe}.xml",
+                mime="application/xml",
+                use_container_width=True,
+                key=f"baixar_xml_reconstruido_{empresa_id_ativo}_{nota_id_danfe}",
+            )
+
+        metricas_danfe = st.columns(5)
+        metricas_danfe[0].metric(
+            "Número / Série",
+            f"{nota_danfe.get('numero', '—')} / {nota_danfe.get('serie', '—')}",
+        )
+        metricas_danfe[1].metric(
+            "Base de Cálculo / Produtos",
+            f"R$ {float(nota_danfe.get('valor_total_nf', 0.0)):,.2f}",
+        )
+        metricas_danfe[2].metric("IBS apurado", f"R$ {credito_ibs_danfe:,.2f}")
+        metricas_danfe[3].metric("CBS apurado", f"R$ {credito_cbs_danfe:,.2f}")
+        metricas_danfe[4].metric(
+            "Crédito Split Payment LC 214/2025",
+            f"R$ {credito_danfe:,.2f}",
+        )
+        st.markdown("**Representação do código de barras / chave de acesso**")
+        st.code(
+            f"|||| ||| |||||| || |||| ||||||| ||| ||||| ||||\n{chave_acesso}",
+            language=None,
+        )
+        st.markdown("**Produtos e serviços auditados**")
+        if itens_danfe:
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Código": item.get("codigo") or item.get("cProd") or "—",
+                        "Descrição": item.get("descricao", ""),
+                        "NCM": item.get("ncm", ""),
+                        "CFOP": item.get("cfop", ""),
+                        "Quantidade": float(
+                            item.get("quantidade_comercial")
+                            or item.get("qcom")
+                            or 0.0
+                        ),
+                        "Valor Unitário (R$)": float(
+                            item.get("valor_unitario")
+                            or (
+                                float(item.get("valor_item", 0.0) or 0.0)
+                                / max(float(item.get("quantidade_comercial") or 1.0), 0.0001)
+                            )
+                        ),
+                        "Valor Total (R$)": float(item.get("valor_item", 0.0) or 0.0),
+                        "Status de Auditoria": item.get(
+                            "classificacao_item",
+                            item.get("status_credito", ""),
+                        ),
+                    }
+                    for item in itens_danfe
+                ]),
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.info("Esta nota não possui itens detalhados persistidos.")
+
         chaves_para_baixar = df_notas_marcadas[df_notas_marcadas["Baixar XML"] == True]["Chave de Acesso NF-e"].tolist()
         chave_pacote = f"pacote_xml_{empresa_id_ativo}"
         selecao_atual = tuple(sorted(chaves_para_baixar))
@@ -2496,7 +2748,13 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                 for n_obj in notas:
                     if str(n_obj.get("chave_acesso", "")) in chaves_para_baixar:
                         itens_desta_nf = [i for i in itens if i.get("nota_id") == n_obj.get("id")]
-                        xml_rec = xml_engine.gerar_xml_reconstruido_cliente(empresa_ativa, n_obj, itens_desta_nf)
+                        xml_rec = str(n_obj.get("xml_reconstruido") or "").strip()
+                        if not xml_rec:
+                            xml_rec = xml_engine.gerar_xml_reconstruido_cliente(
+                                empresa_ativa,
+                                n_obj,
+                                itens_desta_nf,
+                            )
                         zf_c.writestr(f"NFe_{n_obj.get('chave_acesso', '000')}.xml", xml_rec)
             st.session_state[chave_pacote] = (selecao_atual, buf_cli.getvalue())
         pacote_preparado = st.session_state.get(chave_pacote)

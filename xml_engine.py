@@ -1,5 +1,7 @@
+import base64
 import hashlib
 import hmac
+import io
 import json
 import logging
 import math
@@ -15,6 +17,7 @@ from datetime import timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlparse
+from xml.sax.saxutils import escape as escape_xml
 import requests
 import streamlit as st
 import pandas as pd
@@ -613,10 +616,25 @@ def persistir_espelho_empresa(
         return True
     for inicio in range(0, len(payload), 25):
         try:
+            lote = payload[inicio:inicio + 25]
             supabase.table("praesidium_empresa_mirror").upsert(
-                payload[inicio:inicio + 25],
+                lote,
                 on_conflict="empresa_id,record_type,record_key",
             ).execute()
+            if tipo == "item":
+                ledger = [
+                    {
+                        "empresa_id": entrada["empresa_id"],
+                        "item_uid": entrada["record_key"],
+                        "payload": entrada["payload"],
+                        "updated_at": entrada["updated_at"],
+                    }
+                    for entrada in lote
+                ]
+                supabase.table("praesidium_ledger_fiscal").upsert(
+                    ledger,
+                    on_conflict="empresa_id,item_uid",
+                ).execute()
         except Exception:
             logging.getLogger(__name__).exception(
                 "Falha ao persistir o espelho %s da empresa %s.",
@@ -1154,7 +1172,19 @@ def executar_insert_seguro(
                 construtor = construtor.insert(dados)
             resultado = construtor.select("*").execute()
             persistidos = resultado.data if resultado.data else registros
-            _persistir_payload_no_espelho(supabase, tabela, persistidos)
+            ledger_confirmado = _persistir_payload_no_espelho(
+                supabase,
+                tabela,
+                persistidos,
+            )
+            if tabela == "itens_nota_fiscal" and not ledger_confirmado:
+                limpar_caches_dados()
+                return (
+                    False,
+                    "Itens gravados na tabela principal, mas não foi possível "
+                    "confirmar o ledger fiscal.",
+                    resultado.data or [],
+                )
             return True, "OK", (resultado.data if resultado.data else [])
         except Exception as erro:
             codigo = _codigo_erro_supabase(erro)
@@ -1334,11 +1364,22 @@ def executar_update_seguro(
                             if status_normalizado:
                                 atualizado["classificacao_item"] = status_normalizado
                         espelhados.append(atualizado)
-                    _persistir_payload_no_espelho(
+                    ledger_confirmado = _persistir_payload_no_espelho(
                         supabase,
                         tabela,
                         espelhados,
                     )
+                    if (
+                        tabela == "itens_nota_fiscal"
+                        and not ledger_confirmado
+                    ):
+                        limpar_caches_dados()
+                        return (
+                            False,
+                            "Item atualizado, mas não foi possível confirmar "
+                            "o ledger fiscal.",
+                            resultado.data,
+                        )
                 return True, "OK", resultado.data
             if (
                 tabela in _TIPOS_ESPELHO
@@ -1559,6 +1600,74 @@ def hidratar_dados_empresa_com_cache(
     return dados
 
 
+def decidir_itens_quarentena_lote(
+    supabase,
+    empresa_id,
+    itens: list[dict],
+    decisao: str,
+) -> int:
+    if supabase is None:
+        raise RuntimeError("Supabase indisponível para registrar as decisões.")
+    if decisao not in {"aprovar", "rejeitar"}:
+        raise ValueError("Decisão de auditoria inválida.")
+    if not itens:
+        return 0
+
+    classificacao = (
+        "Aprovado Manualmente Contador"
+        if decisao == "aprovar"
+        else "Rejeitado pelo Contador"
+    )
+    status_credito = "Validado" if decisao == "aprovar" else "Rejeitado"
+    justificativa = (
+        "Art. 47/57: aprovação após revalidação documental manual pelo contador."
+        if decisao == "aprovar"
+        else "Art. 57: crédito glosado após análise manual do contador."
+    )
+    decisoes = []
+    uids = set()
+    for item in itens:
+        uid = str(item.get("item_uid") or "").strip()
+        if not uid or uid in uids:
+            raise ValueError("A seleção contém item sem UID ou duplicado.")
+        if str(item.get("empresa_id")) != str(empresa_id):
+            raise ValueError("A seleção contém item de outra empresa.")
+        uids.add(uid)
+        decisoes.append({
+            "item_uid": uid,
+            "classificacao_item": classificacao,
+            "status_credito": status_credito,
+            "valor_credito_item": round(obter_credito_quarentena(item), 2),
+            "justificativa_motor": justificativa,
+        })
+
+    resposta = supabase.rpc(
+        "decidir_itens_quarentena_lote",
+        {
+            "p_empresa_id": str(empresa_id),
+            "p_decisoes": decisoes,
+        },
+    ).execute()
+    resultado = resposta.data
+    if isinstance(resultado, list) and len(resultado) == 1:
+        resultado = resultado[0]
+    if not isinstance(resultado, dict):
+        raise RuntimeError("O Supabase não confirmou as decisões em lote.")
+    try:
+        atualizados = int(resultado.get("updated", 0))
+    except (TypeError, ValueError) as erro:
+        raise RuntimeError("O Supabase retornou uma confirmação inválida.") from erro
+    if (
+        str(resultado.get("empresa_id")) != str(empresa_id)
+        or atualizados != len(decisoes)
+    ):
+        raise RuntimeError(
+            "Nem todos os itens pendentes foram atualizados; nenhuma decisão foi aplicada."
+        )
+    limpar_caches_dados()
+    return atualizados
+
+
 def excluir_empresa_supabase(supabase, empresa_id) -> dict:
     if supabase is None:
         raise RuntimeError("Supabase indisponível para excluir o cliente.")
@@ -1612,6 +1721,7 @@ def hidratar_dados_empresa_supabase(
     falhas_leitura = set()
     for tabela in (
         "itens_nota_fiscal",
+        "praesidium_ledger_fiscal",
         "conciliacao_devolucoes",
         "split_payment_events",
     ):
@@ -1693,6 +1803,30 @@ def hidratar_dados_empresa_supabase(
             _float_seguro(item.get("nitem"), 0.0),
             str(item.get("id", "")),
         ),
+    )
+    ledger_por_uid = {}
+    for registro in sorted(
+        tabelas_primarias["praesidium_ledger_fiscal"],
+        key=lambda item: str(item.get("updated_at", "")),
+    ):
+        payload = registro.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        uid_ledger = str(
+            payload.get("item_uid")
+            or registro.get("item_uid")
+            or ""
+        )
+        if uid_ledger:
+            ledger_por_uid[uid_ledger] = dict(payload)
+    uids_primarios = {
+        str(item.get("item_uid") or "")
+        for item in itens_primarios
+        if item.get("item_uid")
+    }
+    itens_primarios.extend(
+        item for uid, item in ledger_por_uid.items()
+        if uid not in uids_primarios
     )
     itens_espelho = sorted(
         espelho["item"],
@@ -1982,28 +2116,42 @@ def gerar_xml_reconstruido_cliente(empresa_ativa: dict, nota: dict, itens_nota: 
 
     blocos_det = ""
     for idx, it in enumerate(itens_nota or [], start=1):
-        desc = str(it.get("descricao", "MERCADORIA AUDITADA")).replace("&", "E")
+        desc = escape_xml(str(it.get("descricao", "MERCADORIA AUDITADA")))
+        codigo = escape_xml(str(it.get("codigo") or f"ITEM-{idx:03d}"))
         ncm = str(it.get("ncm", "00000000"))
         cfop = str(it.get("cfop", "5102"))
         vl_it = float(it.get("valor_item", 0.0))
+        qcom = float(
+            it.get("quantidade_comercial")
+            or it.get("qcom")
+            or 1.0
+        )
+        vl_unitario = float(
+            it.get("valor_unitario")
+            or (vl_it / qcom if qcom else vl_it)
+        )
         vl_cred = float(it.get("valor_credito_item", 0.0))
+        credito_ibs = float(it.get("credito_ibs_gerado", 0.0) or 0.0)
+        credito_cbs = float(it.get("credito_cbs_gerado", 0.0) or 0.0)
         status_it = str(it.get("classificacao_item", "Auditado"))
 
         blocos_det += f"""
         <det nItem="{idx}">
             <prod>
-                <cProd>ITEM-{idx:03d}</cProd>
+                <cProd>{codigo}</cProd>
                 <xProd>{desc}</xProd>
                 <NCM>{ncm}</NCM>
                 <CFOP>{cfop}</CFOP>
                 <uCom>UN</uCom>
-                <qCom>1.0000</qCom>
-                <vUnCom>{vl_it:.2f}</vUnCom>
+                <qCom>{qcom:.4f}</qCom>
+                <vUnCom>{vl_unitario:.2f}</vUnCom>
                 <vProd>{vl_it:.2f}</vProd>
             </prod>
             <imposto>
                 <IBSCBS>
                     <vBC>{vl_it:.2f}</vBC>
+                    <vIBS>{credito_ibs:.2f}</vIBS>
+                    <vCBS>{credito_cbs:.2f}</vCBS>
                     <vCreditoIBSCBS>{vl_cred:.2f}</vCreditoIBSCBS>
                     <xStatusAuditoria>{status_it}</xStatusAuditoria>
                 </IBSCBS>
@@ -2016,6 +2164,8 @@ def gerar_xml_reconstruido_cliente(empresa_ativa: dict, nota: dict, itens_nota: 
         <infNFe Id="NFe{chave}" versao="4.00">
             <ide>
                 <mod>55</mod>
+                <serie>{escape_xml(str(nota.get('serie') or '1'))}</serie>
+                <nNF>{escape_xml(str(nota.get('numero') or '1'))}</nNF>
                 <finNFe>1</finNFe>
                 <dhEmi>{datetime.now().strftime('%Y-%m-%dT%H:%M:%S-03:00')}</dhEmi>
             </ide>
@@ -2343,6 +2493,8 @@ def _preparar_xml_nfe(
     payload_nf = {
         "empresa_id": empresa_id_ativo,
         "chave_acesso": chave_raw,
+        "numero": _xml_texto(ide, "nNF"),
+        "serie": _xml_texto(ide, "serie"),
         "cnpj_emitente": cnpj_emit,
         "razao_social_emitente": _xml_texto(emit, "xNome", _FORNECEDOR_PADRAO),
         "nome_emitente": _xml_texto(emit, "xFant", _xml_texto(emit, "xNome", _FORNECEDOR_PADRAO)),
@@ -2354,6 +2506,7 @@ def _preparar_xml_nfe(
         "regra_tributaria_version": VERSAO_REGRA_TRIBUTARIA,
         "versao_regra": VERSAO_REGRA_TRIBUTARIA,
         "data_emissao": str(data_emissao) if data_emissao else None,
+        "xml_reconstruido": xml_bytes.decode("utf-8-sig", errors="replace"),
     }
 
     hashes_lote.add(hash_sha256)
@@ -2392,10 +2545,14 @@ def _preparar_xml_nfe(
             "empresa_id": empresa_id_ativo,
             "item_uid": _gerar_item_uid(chave_raw, numero_item),
             "nitem": numero_item,
+            "codigo": _xml_texto(prod, "cProd", f"ITEM-{numero_item:03d}"),
             "descricao": xprod,
             "ncm": ncm,
             "cfop": cfop,
             "quantidade_comercial": qcom,
+            "valor_unitario": _arredondar_dinheiro(
+                _float_seguro(_xml_texto(prod, "vUnCom", "0"), 0.0)
+            ),
             "valor_item": _arredondar_dinheiro(vprod),
         }
         if valores_ibs or valores_cbs:
@@ -3133,6 +3290,270 @@ def processar_xml_bytes(
     )[0]
 
 
+def converter_danfe_pdf_para_xml(
+    pdf_bytes: bytes,
+    cnpj_cliente_ativo: str,
+    razao_cliente_ativo: str,
+) -> bytes:
+    if not isinstance(pdf_bytes, bytes) or not pdf_bytes.startswith(b"%PDF"):
+        raise ValueError("O arquivo não é um PDF válido.")
+    reader = None
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+        texto = "\n".join(pagina.extract_text() or "" for pagina in reader.pages)
+    except ImportError:
+        texto = ""
+    except Exception as erro:
+        raise ValueError("Não foi possível ler o conteúdo deste PDF.") from erro
+
+    metadados = reader.metadata or {} if reader is not None else {}
+    payload_pdf = None
+    try:
+        valor_metadado = metadados.get("/PraesidiumPayload")
+        keywords = metadados.get("/Keywords")
+        if not valor_metadado and keywords:
+            prefixo = "PraesidiumPayload:"
+            if str(keywords).startswith(prefixo):
+                valor_metadado = str(keywords)[len(prefixo):]
+        if valor_metadado:
+            texto_metadado = str(valor_metadado)
+            if texto_metadado.startswith("{"):
+                payload_pdf = json.loads(texto_metadado)
+            else:
+                payload_pdf = json.loads(
+                    base64.urlsafe_b64decode(texto_metadado.encode("ascii"))
+                )
+    except (TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        logging.getLogger(__name__).warning(
+            "Metadados fiscais do PDF não puderam ser interpretados; "
+            "tentando extração textual."
+        )
+    if reader is None and payload_pdf is None:
+        correspondencia_payload = re.search(
+            rb"/(?:PraesidiumPayload\s*\(|Keywords\s*\(PraesidiumPayload:)"
+            rb"([A-Za-z0-9_\-=]+)\)",
+            pdf_bytes,
+        )
+        if correspondencia_payload:
+            try:
+                payload_pdf = json.loads(
+                    base64.urlsafe_b64decode(correspondencia_payload.group(1))
+                )
+            except (ValueError, json.JSONDecodeError):
+                payload_pdf = None
+        if payload_pdf is None:
+            raise RuntimeError(
+                "Para importar DANFEs externos em PDF, instale a dependência pypdf."
+            )
+
+    cnpj_cliente = "".join(filter(str.isdigit, str(cnpj_cliente_ativo)))
+    if len(cnpj_cliente) != 14:
+        raise ValueError("O CNPJ da empresa ativa é inválido.")
+
+    def valor_monetario(valor: object) -> float:
+        texto_valor = str(valor or "0").strip().replace("R$", "").replace(" ", "")
+        if "," in texto_valor:
+            texto_valor = texto_valor.replace(".", "").replace(",", ".")
+        return _float_seguro(texto_valor, 0.0)
+
+    dados = payload_pdf if isinstance(payload_pdf, dict) else {}
+    if dados:
+        cnpj_destinatario = "".join(
+            filter(str.isdigit, str(dados.get("cnpj_destinatario", "")))
+        )
+        if cnpj_destinatario != cnpj_cliente:
+            raise ValueError(
+                "O DANFE pertence a outro destinatário e não pode ser importado."
+            )
+        chave = "".join(filter(str.isdigit, str(dados.get("chave_acesso", ""))))
+        cnpj_emitente = "".join(
+            filter(str.isdigit, str(dados.get("cnpj_emitente", "")))
+        )
+        nome_emitente = str(dados.get("nome_emitente") or "").strip()
+        numero = str(dados.get("numero") or "1")
+        serie = str(dados.get("serie") or "1")
+        data_emissao = str(dados.get("data_emissao") or datetime.now().astimezone().isoformat())
+        itens_pdf = dados.get("itens", [])
+    else:
+        correspondencia_chave = re.search(
+            r"(?<!\d)(?:\d[\s.\-/]?){44}(?!\d)",
+            texto,
+        )
+        chave = (
+            re.sub(r"\D", "", correspondencia_chave.group(0))
+            if correspondencia_chave
+            else ""
+        )
+        cnpjs_encontrados = []
+        for correspondencia in re.finditer(
+            r"(?<!\d)(?:\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})(?!\d)",
+            texto,
+        ):
+            cnpj_encontrado = re.sub(r"\D", "", correspondencia.group(0))
+            if len(cnpj_encontrado) == 14:
+                cnpjs_encontrados.append(cnpj_encontrado)
+        if cnpj_cliente not in cnpjs_encontrados:
+            raise ValueError(
+                "Não foi possível validar o CNPJ do destinatário no DANFE."
+            )
+        cnpj_destinatario = cnpj_cliente
+        cnpj_emitente = next(
+            (cnpj for cnpj in cnpjs_encontrados if cnpj != cnpj_cliente),
+            "",
+        )
+        if not cnpj_emitente:
+            raise ValueError("Não foi possível identificar o CNPJ do emitente.")
+
+        linhas = [linha.strip() for linha in texto.splitlines() if linha.strip()]
+        nome_emitente = ""
+        for indice, linha in enumerate(linhas):
+            if re.search(r"raz[aã]o social|nome\s*/?\s*raz[aã]o|emitente", linha, re.I):
+                nome_emitente = re.sub(
+                    r"(?i).*?(?:raz[aã]o social|nome\s*/?\s*raz[aã]o|emitente)\s*:?",
+                    "",
+                    linha,
+                ).strip(" :-")
+                if not nome_emitente and indice + 1 < len(linhas):
+                    nome_emitente = linhas[indice + 1]
+                if nome_emitente:
+                    break
+        if not nome_emitente:
+            nome_emitente = "Emitente identificado no DANFE"
+        numero_match = re.search(r"(?i)\bN[º°o]?\s*[:.]?\s*(\d{1,12})", texto)
+        serie_match = re.search(r"(?i)\bS[ée]rie\s*[:.]?\s*(\d{1,3})", texto)
+        numero = numero_match.group(1) if numero_match else "1"
+        serie = serie_match.group(1) if serie_match else "1"
+        data_match = re.search(
+            r"\b(\d{2}/\d{2}/\d{4})\b",
+            texto,
+        )
+        data_emissao = (
+            datetime.strptime(data_match.group(1), "%d/%m/%Y")
+            .replace(tzinfo=timezone.utc)
+            .isoformat()
+            if data_match
+            else datetime.now(timezone.utc).isoformat()
+        )
+        itens_pdf = []
+        for linha in linhas:
+            if linha.startswith("ITEM|"):
+                partes = linha.split("|")
+                if len(partes) >= 11:
+                    itens_pdf.append({
+                        "numero": partes[1],
+                        "codigo": partes[2],
+                        "descricao": partes[3],
+                        "ncm": partes[4],
+                        "cfop": partes[5],
+                        "quantidade": partes[6],
+                        "valor_unitario": partes[7],
+                        "valor_total": partes[8],
+                        "ibs": partes[9],
+                        "cbs": partes[10],
+                    })
+                continue
+            padrao_item = re.search(
+                r"(?P<codigo>\S+)\s+(?P<descricao>.*?)\s+"
+                r"(?P<ncm>\d{8})\s+(?:(?:\d{2,3})\s+)?(?P<cfop>\d{4})\s+"
+                r"\S+\s+(?P<qtd>[\d.,]+)\s+(?P<unit>[\d.,]+)\s+"
+                r"(?P<total>[\d.,]+)(?:\s|$)",
+                linha,
+            )
+            if padrao_item:
+                itens_pdf.append({
+                    "numero": str(len(itens_pdf) + 1),
+                    "codigo": padrao_item.group("codigo"),
+                    "descricao": padrao_item.group("descricao").strip(),
+                    "ncm": padrao_item.group("ncm"),
+                    "cfop": padrao_item.group("cfop"),
+                    "quantidade": padrao_item.group("qtd"),
+                    "valor_unitario": padrao_item.group("unit"),
+                    "valor_total": padrao_item.group("total"),
+                    "ibs": None,
+                    "cbs": None,
+                })
+
+        if not chave:
+            digest = hashlib.sha256(pdf_bytes).hexdigest()
+            chave = str(int(digest, 16)).zfill(44)[-44:]
+
+    if len(chave) != 44 or not chave.isdigit():
+        digest = hashlib.sha256(pdf_bytes).hexdigest()
+        chave = str(int(digest, 16)).zfill(44)[-44:]
+    if len(cnpj_emitente) != 14 or not cnpj_emitente.isdigit():
+        raise ValueError("O CNPJ do emitente extraído do PDF é inválido.")
+    if cnpj_destinatario != cnpj_cliente:
+        raise ValueError("O CNPJ do destinatário não corresponde à empresa ativa.")
+    if not isinstance(itens_pdf, list) or not itens_pdf:
+        raise ValueError(
+            "Não foi possível identificar itens na tabela do DANFE em PDF."
+        )
+
+    detalhes_xml = []
+    for indice, item in enumerate(itens_pdf, start=1):
+        if not isinstance(item, dict):
+            continue
+        numero_item = int(_float_seguro(item.get("numero"), indice))
+        codigo = escape_xml(str(item.get("codigo") or f"ITEM-{numero_item:03d}"))
+        descricao = escape_xml(str(item.get("descricao") or "Item extraído do DANFE"))
+        ncm = re.sub(r"\D", "", str(item.get("ncm") or ""))
+        cfop = re.sub(r"\D", "", str(item.get("cfop") or ""))
+        if len(ncm) != 8:
+            ncm = "00000000"
+        if len(cfop) != 4:
+            cfop = "5102"
+        quantidade = valor_monetario(item.get("quantidade"))
+        valor_unitario = valor_monetario(item.get("valor_unitario"))
+        valor_total = valor_monetario(item.get("valor_total"))
+        tem_ibs = item.get("ibs") is not None
+        tem_cbs = item.get("cbs") is not None
+        tags_tributos = ""
+        if tem_ibs or tem_cbs:
+            ibs = valor_monetario(item.get("ibs"))
+            cbs = valor_monetario(item.get("cbs"))
+            tags_tributos = (
+                f"<IBSCBS><vIBS>{ibs:.2f}</vIBS>"
+                f"<vCBS>{cbs:.2f}</vCBS></IBSCBS>"
+            )
+        detalhes_xml.append(
+            f'<det nItem="{numero_item}"><prod><cProd>{codigo}</cProd>'
+            f'<xProd>{descricao}</xProd><NCM>{ncm}</NCM><CFOP>{cfop}</CFOP>'
+            f'<uCom>UN</uCom><qCom>{quantidade:.4f}</qCom>'
+            f'<vUnCom>{valor_unitario:.2f}</vUnCom><vProd>{valor_total:.2f}</vProd>'
+            f'</prod><imposto>{tags_tributos}</imposto></det>'
+        )
+    if not detalhes_xml:
+        raise ValueError("Nenhum item válido foi reconstruído a partir do DANFE.")
+
+    total_produtos = sum(
+        valor_monetario(item.get("valor_total"))
+        for item in itens_pdf
+        if isinstance(item, dict)
+    )
+    chave_formatada = chave
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">'
+        '<NFe><infNFe Id="NFe' + chave_formatada + '" versao="4.00">'
+        f'<ide><cUF>{chave[:2]}</cUF><mod>55</mod><serie>{escape_xml(serie)}</serie>'
+        f'<nNF>{escape_xml(numero)}</nNF><dhEmi>{escape_xml(data_emissao)}</dhEmi>'
+        '<tpEmis>1</tpEmis><finNFe>1</finNFe></ide>'
+        f'<emit><CNPJ>{cnpj_emitente}</CNPJ><xNome>{escape_xml(nome_emitente)}</xNome>'
+        '<CRT>3</CRT></emit>'
+        f'<dest><CNPJ>{cnpj_cliente}</CNPJ>'
+        f'<xNome>{escape_xml(razao_cliente_ativo)}</xNome></dest>'
+        + "".join(detalhes_xml)
+        + f'<total><ICMSTot><vProd>{total_produtos:.2f}</vProd>'
+        f'<vNF>{total_produtos:.2f}</vNF></ICMSTot></total>'
+        '<infAdic><infCpl>DANFE PDF convertido para XML pelo Praesidium; '
+        'documento reconstruído para auditoria interna.</infCpl></infAdic>'
+        '</infNFe></NFe></nfeProc>'
+    )
+    return xml.encode("utf-8")
+
+
 # ==========================================
 # 4. INTERFACE: MÓDULO DE INGESTÃO XML & ROBÔ SEFAZ
 # ==========================================
@@ -3291,35 +3712,70 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 st.rerun()
 
         with c_up:
-            st.markdown("##### 📤 Upload Manual de Arquivos XML NF-e")
+            st.markdown("##### 📤 Upload de XML ou DANFE em PDF")
             st.caption(
                 "Cada NF-e será vinculada somente a um CNPJ autorizado desta empresa; "
-                "arquivos de terceiros são rejeitados."
+                "arquivos de terceiros são rejeitados. DANFEs em PDF são reconstruídos "
+                "em memória e passam pela mesma auditoria CNAE."
             )
             if "up_reset" not in st.session_state:
                 st.session_state["up_reset"] = 0
             arquivos_xml = st.file_uploader(
-                "Selecione um ou mais arquivos .XML de NF-e",
-                type=["xml"],
+                "Selecione um ou mais arquivos .XML ou .PDF (DANFE) de NF-e",
+                type=["xml", "pdf"],
                 accept_multiple_files=True,
                 key=f"xml_up_{empresa_id_ativo}_{st.session_state.get('up_reset', 0)}"
             )
             if arquivos_xml:
-                if st.button("⚡ Auditar e Importar XMLs Selecionados", use_container_width=True, key=f"btn_proc_xml_{empresa_id_ativo}"):
-                    lote_xml = [(arq.name, arq.getvalue()) for arq in arquivos_xml]
-                    resultados_lote = processar_xml_lote_bytes(
-                        lote_xml,
-                        supabase,
-                        empresa_id_ativo,
-                        empresa_ativa,
-                    )
-                    sucessos = sum(1 for ok, _ in resultados_lote if ok)
+                if st.button("⚡ Auditar e Importar Arquivos Selecionados", use_container_width=True, key=f"btn_proc_xml_{empresa_id_ativo}"):
+                    documentos_xml = []
+                    indices_documentos = []
+                    resultados_lote: list[tuple[bool, str] | None] = [
+                        None for _ in arquivos_xml
+                    ]
+                    for indice, arquivo in enumerate(arquivos_xml):
+                        conteudo = arquivo.getvalue()
+                        if str(arquivo.name).lower().endswith(".pdf"):
+                            try:
+                                conteudo = converter_danfe_pdf_para_xml(
+                                    conteudo,
+                                    str(empresa_ativa.get("cnpj", "")),
+                                    str(empresa_ativa.get("razao_social", "")),
+                                )
+                            except (RuntimeError, ValueError) as erro:
+                                resultados_lote[indice] = (False, str(erro))
+                                continue
+                        documentos_xml.append((arquivo.name, conteudo))
+                        indices_documentos.append(indice)
+                    if documentos_xml:
+                        resultados_processados = processar_xml_lote_bytes(
+                            documentos_xml,
+                            supabase,
+                            empresa_id_ativo,
+                            empresa_ativa,
+                        )
+                        for indice_original, resultado in zip(
+                            indices_documentos,
+                            resultados_processados,
+                        ):
+                            resultados_lote[indice_original] = resultado
+                    resultados_final = [
+                        resultado or (
+                            False,
+                            "Não foi possível processar o arquivo. Tente novamente.",
+                        )
+                        for resultado in resultados_lote
+                    ]
+                    sucessos = sum(1 for ok, _ in resultados_final if ok)
                     feedback_processamento = [
                         (
                             "success" if ok else "warning",
-                            f"{'✅' if ok else '⚠️'} {nome}: {mensagem}",
+                            f"{'✅' if ok else '⚠️'} {arquivo.name}: {mensagem}",
                         )
-                        for (nome, _), (ok, mensagem) in zip(lote_xml, resultados_lote)
+                        for arquivo, (ok, mensagem) in zip(
+                            arquivos_xml,
+                            resultados_final,
+                        )
                     ]
                     st.session_state["up_reset"] += 1
                     st.session_state[upload_feedback_key] = feedback_processamento
