@@ -50,7 +50,7 @@ class FakeDeleteQuery:
         self.filters.append(("neq", column, value))
         return self
 
-    def select(self, columns):
+    def select(self, _):
         return self
 
     def execute(self):
@@ -65,7 +65,7 @@ class FakeDirectSupabase:
         self.delete_order = []
         self.delete_filters = {}
 
-    def rpc(self, name, params):
+    def rpc(self, *args, **kwargs):  # type: ignore[unused-ignore]
         raise RuntimeError("RPC indisponível")
 
     def table(self, name):
@@ -170,7 +170,7 @@ snapshot = {
 hidrator_original = xml_engine.hidratar_dados_empresa_supabase
 try:
     xml_engine.hidratar_dados_empresa_supabase = (
-        lambda *_args: snapshot
+        lambda *_: snapshot
     )
     assert xml_engine.hidratar_dados_empresa_com_cache(
         object(),
@@ -179,7 +179,7 @@ try:
         cache,
     ) == snapshot
 
-    def falha_temporaria(*_args):
+    def falha_temporaria(*_):
         raise RuntimeError("erro de rede simulado")
 
     xml_engine.hidratar_dados_empresa_supabase = falha_temporaria

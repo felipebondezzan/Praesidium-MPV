@@ -2525,7 +2525,7 @@ def renderizar_fila_quarentena(
     def alterar_selecao_individual() -> None:
         st.session_state[chave_selecionar_todos] = False
 
-    def persistir_decisao(item: dict, status: str, credito: float) -> None:
+    def persistir_decisao(item: dict, status: str, _: float) -> None:
         decisao = "aprovar" if status == "Aprovado Manualmente Contador" else "rejeitar"
         atualizado = xml_engine.decidir_itens_quarentena_lote(
             supabase,

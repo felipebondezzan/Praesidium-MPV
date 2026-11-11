@@ -87,7 +87,7 @@ class FakeQuery:
         self.end = None
         self.limit_value = None
 
-    def select(self, columns=None, **options):
+    def select(self, *args, **kwargs):  # noqa: ARG002
         return self
 
     def insert(self, payload):
@@ -95,7 +95,7 @@ class FakeQuery:
         self.payload = payload
         return self
 
-    def upsert(self, payload, on_conflict=None, **options):
+    def upsert(self, payload, on_conflict=None, **_):
         self.action = "upsert"
         self.payload = payload
         self.on_conflict = on_conflict
