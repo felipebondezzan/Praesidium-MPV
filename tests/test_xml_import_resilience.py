@@ -114,6 +114,10 @@ class FakeQuery:
         self.filters.append((column, "eq", value))
         return self
 
+    def neq(self, column, value):
+        self.filters.append((column, "neq", value))
+        return self
+
     def in_(self, column, values):
         self.filters.append((column, "in", values))
         return self
@@ -130,6 +134,8 @@ class FakeQuery:
     def _matches(self, record):
         for column, operator, value in self.filters:
             if operator == "eq" and str(record.get(column)) != str(value):
+                return False
+            if operator == "neq" and str(record.get(column)) == str(value):
                 return False
             if operator == "in" and str(record.get(column)) not in {
                 str(item) for item in value
@@ -379,6 +385,38 @@ assert all(
         "valor_credito_item",
     )
 )
+
+supabase_perfil = FakeSupabase()
+supabase_perfil.tables["praesidium_ledger_fiscal"] = [{
+    "empresa_id": EMPRESA["id"],
+    "item_uid": "config:aliquota-ibs-cbs:v1",
+    "payload": {
+        "derivacao_setorial": (
+            "Derivação Redução 30% (Profissões Regulamentadas / Serviços) — "
+            "Alíquota Efetiva 18,55%"
+        ),
+    },
+}]
+xml_engine.st.session_state.clear()
+resultado_perfil = xml_engine.processar_xml_lote_bytes(
+    [("nfe_perfil_reduzido.xml", _xml_20_items())],
+    supabase_perfil,
+    EMPRESA["id"],
+    EMPRESA,
+)
+assert resultado_perfil[0][0], resultado_perfil[0][1]
+itens_perfil = [
+    linha["payload"]
+    for linha in supabase_perfil.tables["praesidium_ledger_fiscal"]
+    if linha.get("item_uid") != "config:aliquota-ibs-cbs:v1"
+]
+assert len(itens_perfil) == 20
+assert all(item["aliquota_aplicada"] == 0.1855 for item in itens_perfil)
+assert all(round(item["aliquota_ibs_aplicada"], 4) == 0.1239 for item in itens_perfil)
+assert all(round(item["aliquota_cbs_aplicada"], 4) == 0.0616 for item in itens_perfil)
+assert all(item["valor_credito_item"] == 1.86 for item in itens_perfil)
+print("PASS: the persisted 30% sector profile controls XML import rates.")
+
 payload_limpo = xml_engine.sanitizar_payload_supabase(
     "itens_nota_fiscal",
     {

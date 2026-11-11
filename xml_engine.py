@@ -24,6 +24,24 @@ import pandas as pd
 
 VERSAO_REGRA_TRIBUTARIA = "LC 214/2025 - Art. 47/57 v1.0"
 ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA = 0.265
+ALIQUOTAS_REFORMA_TRIBUTARIA = {
+    "Base Padrão Integral — 26,50% (Sem redutor)": {
+        "fator_reducao": 1.0,
+        "reducao_percentual": 0.0,
+    },
+    "Derivação Redução 30% (Profissões Regulamentadas / Serviços) — Alíquota Efetiva 18,55%": {
+        "fator_reducao": 0.7,
+        "reducao_percentual": 30.0,
+    },
+    "Derivação Redução 60% (Saúde, Educação, Insumos Agro/Higiene) — Alíquota Efetiva 10,60%": {
+        "fator_reducao": 0.4,
+        "reducao_percentual": 60.0,
+    },
+    "Regime Específico / Alíquota Zero — 0,00%": {
+        "fator_reducao": 0.0,
+        "reducao_percentual": 100.0,
+    },
+}
 TAG_TENANT_PATTERN = re.compile(r"\s*\[T:[^\]]+\]", re.IGNORECASE)
 CHAVE_ACESSO_PATTERN = re.compile(r"\d{44}")
 DESCRICAO_USO_INTERNO_PATTERN = re.compile(
@@ -428,6 +446,331 @@ def _arredondar_dinheiro(valor) -> float:
     if not decimal.is_finite():
         return 0.0
     return float(decimal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def calcular_memoria_aliquota(derivacao: str) -> dict[str, float | str]:
+    regra = ALIQUOTAS_REFORMA_TRIBUTARIA.get(
+        derivacao,
+        ALIQUOTAS_REFORMA_TRIBUTARIA[
+            "Base Padrão Integral — 26,50% (Sem redutor)"
+        ],
+    )
+    fator = float(regra["fator_reducao"])
+    return {
+        "derivacao_setorial": derivacao
+        if derivacao in ALIQUOTAS_REFORMA_TRIBUTARIA
+        else "Base Padrão Integral — 26,50% (Sem redutor)",
+        "aliquota_base": 26.5,
+        "fator_reducao": fator,
+        "reducao_percentual": float(regra["reducao_percentual"]),
+        "aliquota_ibs_base": 17.7,
+        "aliquota_cbs_base": 8.8,
+        "aliquota_ibs_efetiva": _arredondar_dinheiro(17.7 * fator),
+        "aliquota_cbs_efetiva": _arredondar_dinheiro(8.8 * fator),
+        "aliquota_efetiva": _arredondar_dinheiro(26.5 * fator),
+    }
+
+
+def calcular_id_operacao(
+    empresa_id,
+    nota: dict,
+    valor_base: float,
+    valor_ibs: float,
+    valor_cbs: float,
+) -> str:
+    data_referencia = pd.to_datetime(
+        nota.get("data_emissao") or nota.get("created_at"),
+        errors="coerce",
+        utc=True,
+    )
+    chave_acesso = str(nota.get("chave_acesso") or "")
+    if not pd.isna(data_referencia):
+        ano = str(data_referencia.year)
+    elif CHAVE_ACESSO_PATTERN.fullmatch(chave_acesso):
+        ano = f"20{chave_acesso[2:4]}"
+    else:
+        ano = str(datetime.now().year)
+    identificador = "|".join((
+        str(empresa_id),
+        str(chave_acesso or nota.get("numero") or nota.get("id") or ""),
+        f"{_arredondar_dinheiro(valor_base):.2f}",
+        f"{_arredondar_dinheiro(valor_ibs):.2f}",
+        f"{_arredondar_dinheiro(valor_cbs):.2f}",
+    ))
+    digest = hashlib.sha256(identificador.encode("utf-8")).hexdigest()[:8].upper()
+    return f"OP-SPLIT-{ano}-{digest}"
+
+
+def calcular_segregacao_liquidacao(
+    valor_total_nota: float,
+    valor_ibs_total: float,
+    valor_cbs_total: float,
+    valor_liquidado: float,
+    valor_ja_liquidado: float = 0.0,
+) -> dict[str, float]:
+    total = max(0.0, _arredondar_dinheiro(valor_total_nota))
+    anterior = min(total, max(0.0, _arredondar_dinheiro(valor_ja_liquidado)))
+    liquidacao = min(
+        max(0.0, _arredondar_dinheiro(valor_liquidado)),
+        max(0.0, total - anterior),
+    )
+    acumulado = min(total, anterior + liquidacao)
+
+    def segregacao(valor_tributo: float) -> tuple[float, float]:
+        tributo = max(0.0, _arredondar_dinheiro(valor_tributo))
+        antes = (
+            _arredondar_dinheiro(tributo * anterior / total)
+            if total
+            else 0.0
+        )
+        depois = (
+            _arredondar_dinheiro(tributo * acumulado / total)
+            if total
+            else 0.0
+        )
+        return _arredondar_dinheiro(depois - antes), _arredondar_dinheiro(
+            tributo - depois
+        )
+
+    ibs_atual, ibs_pendente = segregacao(valor_ibs_total)
+    cbs_atual, cbs_pendente = segregacao(valor_cbs_total)
+    return {
+        "valor_liquidado": liquidacao,
+        "valor_pago_acumulado": acumulado,
+        "saldo_em_aberto": _arredondar_dinheiro(total - acumulado),
+        "ibs_segregado_atual": ibs_atual,
+        "cbs_segregado_atual": cbs_atual,
+        "ibs_pendente": ibs_pendente,
+        "cbs_pendente": cbs_pendente,
+    }
+
+
+def resumir_eventos_liquidacao(eventos: list[dict]) -> dict[str, dict[str, float | int]]:
+    resumo: dict[str, dict[str, float | int]] = {}
+    for evento in sorted(
+        eventos or [],
+        key=lambda registro: str(registro.get("occurred_at") or ""),
+    ):
+        id_operacao = str(evento.get("id_op") or "").strip()
+        if not id_operacao:
+            continue
+        dados = resumo.setdefault(id_operacao, {
+            "valor_pago_acumulado": 0.0,
+            "credito_compensado": 0.0,
+            "credito_restituido": 0.0,
+            "valor_retido_caixa": 0.0,
+            "impacto_banco": 0.0,
+            "ibs_segregado": 0.0,
+            "cbs_segregado": 0.0,
+            "valor_negociado": 0.0,
+            "eventos": 0,
+        })
+        tipo = str(evento.get("event_type") or "")
+        valor_liquidado = _arredondar_dinheiro(
+            evento.get("valor_liquidado")
+        )
+        if tipo == "Liquidação Parcial/Integral":
+            dados["valor_pago_acumulado"] = _arredondar_dinheiro(
+                float(dados["valor_pago_acumulado"]) + valor_liquidado
+            )
+            dados["ibs_segregado"] = _arredondar_dinheiro(
+                float(dados["ibs_segregado"])
+                + _float_seguro(evento.get("ibs_segregado"), 0.0)
+            )
+            dados["cbs_segregado"] = _arredondar_dinheiro(
+                float(dados["cbs_segregado"])
+                + _float_seguro(evento.get("cbs_segregado"), 0.0)
+            )
+        elif tipo == "Estorno de Transação":
+            dados["valor_pago_acumulado"] = _arredondar_dinheiro(
+                float(dados["valor_pago_acumulado"]) - valor_liquidado
+            )
+            dados["ibs_segregado"] = _arredondar_dinheiro(
+                float(dados["ibs_segregado"])
+                - _float_seguro(evento.get("ibs_segregado"), 0.0)
+            )
+            dados["cbs_segregado"] = _arredondar_dinheiro(
+                float(dados["cbs_segregado"])
+                - _float_seguro(evento.get("cbs_segregado"), 0.0)
+            )
+            dados["credito_restituido"] = _arredondar_dinheiro(
+                float(dados["credito_restituido"])
+                + _float_seguro(evento.get("credito_restituido"), 0.0)
+            )
+        elif tipo == "Alteração/Renegociação de Operação":
+            dados["valor_negociado"] = _arredondar_dinheiro(
+                evento.get("valor_negociado")
+            )
+        dados["credito_compensado"] = _arredondar_dinheiro(
+            float(dados["credito_compensado"])
+            + _float_seguro(evento.get("credito_compensado"), 0.0)
+        )
+        dados["valor_retido_caixa"] = _arredondar_dinheiro(
+            float(dados["valor_retido_caixa"])
+            + _float_seguro(evento.get("valor_retido_caixa"), 0.0)
+        )
+        dados["impacto_banco"] = _arredondar_dinheiro(
+            float(dados["impacto_banco"])
+            + _float_seguro(evento.get("impacto_banco"), 0.0)
+        )
+        dados["eventos"] = int(dados["eventos"]) + 1
+    for dados in resumo.values():
+        dados["valor_pago_acumulado"] = max(
+            0.0,
+            _arredondar_dinheiro(dados["valor_pago_acumulado"]),
+        )
+        dados["credito_compensado_liquido"] = max(
+            0.0,
+            _arredondar_dinheiro(
+                float(dados["credito_compensado"])
+                - float(dados["credito_restituido"])
+            ),
+        )
+    return resumo
+
+
+def calcular_saldo_credito_digital(
+    itens: list[dict],
+    devolucoes: list[dict],
+    eventos_split: list[dict],
+    eventos_liquidacao: list[dict],
+) -> dict[str, float]:
+    creditos = calcular_resumo_creditos(itens)
+    estornado = _arredondar_dinheiro(sum(
+        _float_seguro(item.get("credito_estornado"), 0.0)
+        for item in devolucoes or []
+    ))
+    retido_webhook = _arredondar_dinheiro(sum(
+        max(0.0, _float_seguro(evento.get("retained_amount"), 0.0))
+        for evento in eventos_split or []
+    ))
+    resumo_operacoes = resumir_eventos_liquidacao(eventos_liquidacao)
+    compensado = _arredondar_dinheiro(sum(
+        _float_seguro(resumo.get("credito_compensado_liquido"), 0.0)
+        for resumo in resumo_operacoes.values()
+    ))
+    retido_caixa = _arredondar_dinheiro(sum(
+        _float_seguro(resumo.get("valor_retido_caixa"), 0.0)
+        for resumo in resumo_operacoes.values()
+    ))
+    retido_caixa = max(0.0, retido_caixa)
+    saldo = _arredondar_dinheiro(
+        creditos["validado"] - estornado - retido_webhook - compensado
+    )
+    return {
+        **creditos,
+        "estornado": estornado,
+        "retido_webhook": retido_webhook,
+        "credito_compensado": compensado,
+        "retido_caixa": retido_caixa,
+        "credito_liquido": saldo,
+        "credito_disponivel": max(0.0, saldo),
+        "valor_retido_split_payment": _arredondar_dinheiro(
+            retido_webhook + retido_caixa
+        ),
+    }
+
+
+def registrar_evento_liquidacao_supabase(
+    supabase,
+    empresa_id,
+    evento: dict,
+) -> dict:
+    if supabase is None:
+        raise RuntimeError("Supabase indisponível para registrar o evento financeiro.")
+    if not empresa_id or str(evento.get("empresa_id")) != str(empresa_id):
+        raise ValueError("O evento financeiro não corresponde à empresa ativa.")
+    if not str(evento.get("id_op") or "").strip():
+        raise ValueError("O evento financeiro não possui ID_OP.")
+    if not str(evento.get("event_id") or "").strip():
+        raise ValueError("O evento financeiro não possui identificador único.")
+    agora = datetime.now(timezone.utc).isoformat()
+    evento_persistido = {
+        **evento,
+        "record_type": "split_payment_operation_event",
+        "empresa_id": empresa_id,
+        "occurred_at": str(evento.get("occurred_at") or agora),
+    }
+    resposta = (
+        supabase.table("praesidium_ledger_fiscal")
+        .upsert(
+            {
+                "empresa_id": empresa_id,
+                "item_uid": f"split-event:{evento_persistido['event_id']}",
+                "payload": evento_persistido,
+                "updated_at": agora,
+            },
+            on_conflict="empresa_id,item_uid",
+        )
+        .select("item_uid")
+        .execute()
+    )
+    if not resposta.data:
+        raise RuntimeError("O Supabase não confirmou a gravação do evento financeiro.")
+    limpar_caches_dados()
+    return evento_persistido
+
+
+def carregar_perfil_tributario_empresa(supabase, empresa_id) -> dict:
+    derivacao_padrao = "Base Padrão Integral — 26,50% (Sem redutor)"
+    if supabase is None or not empresa_id:
+        return calcular_memoria_aliquota(derivacao_padrao)
+    try:
+        resposta = (
+            supabase.table("praesidium_ledger_fiscal")
+            .select("payload")
+            .eq("empresa_id", empresa_id)
+            .eq("item_uid", "config:aliquota-ibs-cbs:v1")
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao carregar o perfil tributário da empresa %s.",
+            empresa_id,
+        )
+        return calcular_memoria_aliquota(derivacao_padrao)
+    payload = (resposta.data or [{}])[0].get("payload") or {}
+    derivacao = str(payload.get("derivacao_setorial") or derivacao_padrao)
+    return calcular_memoria_aliquota(derivacao)
+
+
+def persistir_perfil_tributario_empresa(
+    supabase,
+    empresa_id,
+    derivacao: str,
+) -> dict[str, float | str]:
+    if supabase is None:
+        raise RuntimeError("Supabase indisponível para salvar o perfil tributário.")
+    if not empresa_id:
+        raise ValueError("Empresa inválida para salvar o perfil tributário.")
+    if derivacao not in ALIQUOTAS_REFORMA_TRIBUTARIA:
+        raise ValueError("Derivação setorial inválida.")
+    memoria = calcular_memoria_aliquota(derivacao)
+    payload = {
+        **memoria,
+        "record_type": "company_tax_profile",
+        "empresa_id": empresa_id,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    resposta = (
+        supabase.table("praesidium_ledger_fiscal")
+        .upsert(
+            {
+                "empresa_id": empresa_id,
+                "item_uid": "config:aliquota-ibs-cbs:v1",
+                "payload": payload,
+                "updated_at": payload["updated_at"],
+            },
+            on_conflict="empresa_id,item_uid",
+        )
+        .select("item_uid")
+        .execute()
+    )
+    if not resposta.data:
+        raise RuntimeError("O Supabase não confirmou o perfil tributário.")
+    limpar_caches_dados()
+    return memoria
 
 
 def obter_credito_quarentena(item: dict) -> float:
@@ -1223,7 +1566,7 @@ def executar_insert_seguro(
                     "confirmar o ledger fiscal.",
                     resultado.data or [],
                 )
-            return True, "OK", (resultado.data if resultado.data else [])
+            return True, "OK", persistidos
         except Exception as erro:
             codigo = _codigo_erro_supabase(erro)
             coluna = _coluna_erro_supabase(erro)
@@ -1598,6 +1941,107 @@ def _normalizar_item_hidratado(
     return normalizado
 
 
+def reconstruir_notas_a_partir_dos_itens(
+    notas: list[dict],
+    itens: list[dict],
+) -> list[dict]:
+    notas_por_id = {
+        str(nota.get("id")): dict(nota)
+        for nota in notas or []
+        if nota.get("id") is not None
+    }
+    notas_por_chave = {
+        str(nota.get("chave_acesso")): nota
+        for nota in notas_por_id.values()
+        if nota.get("chave_acesso")
+    }
+    grupos: dict[str, list[dict]] = {}
+    identificadores = {}
+    for item in itens or []:
+        nota_id = str(item.get("nota_id") or "")
+        nota_existente = notas_por_id.get(nota_id, {})
+        item_uid = str(item.get("item_uid") or "")
+        chave = str(
+            item.get("chave_acesso")
+            or nota_existente.get("chave_acesso")
+            or ""
+        )
+        if not chave:
+            correspondencia = CHAVE_ACESSO_PATTERN.search(item_uid)
+            chave = correspondencia.group(0) if correspondencia else ""
+        numero = str(
+            item.get("numero")
+            or item.get("nNF")
+            or nota_existente.get("numero")
+            or ""
+        )
+        chave_grupo = (
+            f"chave:{chave}"
+            if chave
+            else (
+                f"id:{nota_id}"
+                if nota_id
+                else (f"numero:{numero}" if numero else f"item:{item_uid}")
+            )
+        )
+        grupos.setdefault(chave_grupo, []).append(item)
+        identificadores[chave_grupo] = (nota_id, chave, numero)
+
+    resultado = list(notas_por_id.values())
+    ids_resultado = {str(nota.get("id")) for nota in resultado}
+    for chave_grupo, itens_grupo in grupos.items():
+        nota_id, chave, numero = identificadores[chave_grupo]
+        nota = notas_por_id.get(nota_id) if nota_id else None
+        if nota is None and chave:
+            nota = notas_por_chave.get(chave)
+        valor_itens = _arredondar_dinheiro(sum(
+            _float_seguro(
+                item.get("valor_item", item.get("valor_total_bruto")),
+                0.0,
+            )
+            for item in itens_grupo
+        ))
+        if nota is not None:
+            if not nota.get("chave_acesso") and chave:
+                nota["chave_acesso"] = chave
+            if not nota.get("numero") and numero:
+                nota["numero"] = numero
+            if not _float_seguro(nota.get("valor_total_nf"), 0.0):
+                nota["valor_total_nf"] = valor_itens
+            continue
+
+        nota_id_resultado = (
+            nota_id
+            if nota_id and nota_id not in ids_resultado
+            else f"reconstruida:{chave or numero or chave_grupo}"
+        )
+        if str(nota_id_resultado) in ids_resultado:
+            continue
+        nota_reconstruida = {
+            "id": nota_id_resultado,
+            "chave_acesso": chave,
+            "numero": numero,
+            "serie": str(itens_grupo[0].get("serie") or ""),
+            "cnpj_emitente": str(itens_grupo[0].get("cnpj_emitente") or ""),
+            "razao_social_emitente": str(
+                itens_grupo[0].get("razao_social_emitente") or "Emitente não informado"
+            ),
+            "valor_total_nf": valor_itens,
+            "manifestacao_status": "Nota reconstruída a partir dos itens persistidos",
+            "status_processamento": "Reconstruída",
+            "data_emissao": (
+                itens_grupo[0].get("data_emissao")
+                or itens_grupo[0].get("created_at")
+            ),
+            "_nota_reconstruida": True,
+        }
+        resultado.append(nota_reconstruida)
+        ids_resultado.add(str(nota_id_resultado))
+        if chave:
+            notas_por_chave[chave] = nota_reconstruida
+    return resultado
+
+
 def hidratar_dados_empresa_com_cache(
     supabase,
     empresa_id,
@@ -1710,6 +2154,14 @@ def excluir_empresa_supabase(supabase, empresa_id) -> dict:
             "excluir_cliente_cascade",
             {"p_empresa_id": str(empresa_id)},
         ).execute()
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Exclusão transacional indisponível para a empresa %s; "
+            "tentando a sequência direta de exclusão.",
+            empresa_id,
+            exc_info=True,
+        )
+    else:
         resultado = resposta.data
         if isinstance(resultado, list) and len(resultado) == 1:
             resultado = resultado[0]
@@ -1718,47 +2170,21 @@ def excluir_empresa_supabase(supabase, empresa_id) -> dict:
             and resultado.get("deleted") is True
             and str(resultado.get("empresa_id")) == str(empresa_id)
         ):
+            _limpar_estado_local_empresa(empresa_id, preservar_perfil=False)
             return resultado
-        raise RuntimeError("O Supabase não confirmou a exclusão transacional.")
-    except Exception:
         logging.getLogger(__name__).warning(
-            "Exclusão transacional indisponível para a empresa %s; "
-            "tentando a sequência direta de exclusão.",
+            "A RPC não confirmou a exclusão da empresa %s; "
+            "tentando a sequência direta.",
             empresa_id,
-            exc_info=True,
         )
 
     try:
-        supabase.table("itens_nota_fiscal").delete().eq(
-            "empresa_id", empresa_id
-        ).execute()
-        supabase.table("notas_fiscais_recebidas").delete().eq(
-            "empresa_id", empresa_id
-        ).execute()
-        supabase.table("praesidium_ledger_fiscal").delete().eq(
-            "empresa_id", empresa_id
-        ).execute()
-        for tabela in (
-            "conciliacao_devolucoes",
-            "praesidium_empresa_mirror",
-            "split_payment_events",
-            "empresa_cnpjs_autorizados",
-        ):
-            try:
-                supabase.table(tabela).delete().eq(
-                    "empresa_id", empresa_id
-                ).execute()
-            except Exception as erro_tabela:
-                if _codigo_erro_supabase(erro_tabela) not in {
-                    "42P01",
-                    "PGRST205",
-                }:
-                    raise
-                logging.getLogger(__name__).info(
-                    "Tabela opcional %s ausente durante exclusão da empresa %s.",
-                    tabela,
-                    empresa_id,
-                )
+        _excluir_registros_empresa_supabase(
+            supabase,
+            empresa_id,
+            preservar_perfil=False,
+            incluir_cnpjs=True,
+        )
         resultado_exclusao = (
             supabase.table("empresas_monitoradas")
             .delete()
@@ -1768,6 +2194,7 @@ def excluir_empresa_supabase(supabase, empresa_id) -> dict:
         )
         if not resultado_exclusao.data:
             raise RuntimeError("O Supabase não confirmou a exclusão do cliente.")
+        _limpar_estado_local_empresa(empresa_id, preservar_perfil=False)
         return {
             "deleted": True,
             "empresa_id": str(empresa_id),
@@ -1778,9 +2205,109 @@ def excluir_empresa_supabase(supabase, empresa_id) -> dict:
             "Falha na sequência direta de exclusão da empresa %s.",
             empresa_id,
         )
+        try:
+            _limpar_estado_local_empresa(empresa_id, preservar_perfil=False)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao invalidar o estado local da empresa %s após "
+                "exclusão parcial.",
+                empresa_id,
+            )
         raise RuntimeError(
             "Não foi possível concluir a exclusão do cliente."
         ) from erro_direto
+
+
+def _excluir_registros_empresa_supabase(
+    supabase,
+    empresa_id,
+    *,
+    preservar_perfil: bool,
+    incluir_cnpjs: bool,
+) -> None:
+    tabelas = (
+        "itens_nota_fiscal",
+        "conciliacao_devolucoes",
+        "notas_fiscais_recebidas",
+        "split_payment_events",
+        "praesidium_empresa_mirror",
+        "praesidium_ledger_fiscal",
+    )
+    if incluir_cnpjs:
+        tabelas += ("empresa_cnpjs_autorizados",)
+
+    for tabela in tabelas:
+        consulta = supabase.table(tabela).delete().eq("empresa_id", empresa_id)
+        if tabela == "praesidium_ledger_fiscal" and preservar_perfil:
+            consulta = consulta.neq(
+                "item_uid",
+                "config:aliquota-ibs-cbs:v1",
+            )
+        try:
+            consulta.execute()
+        except Exception as erro:
+            if _codigo_erro_supabase(erro) not in {"42P01", "PGRST205"}:
+                raise
+            logging.getLogger(__name__).info(
+                "Tabela %s ausente durante limpeza da empresa %s.",
+                tabela,
+                empresa_id,
+            )
+
+
+def _limpar_estado_local_empresa(
+    empresa_id,
+    *,
+    preservar_perfil: bool,
+) -> None:
+    id_empresa = str(empresa_id)
+    chave_hidratacao = "_dados_hidratados_por_empresa"
+    cache_hidratacao = st.session_state.get(chave_hidratacao, {})
+    if isinstance(cache_hidratacao, dict):
+        cache_hidratacao.pop(id_empresa, None)
+
+    for chave in list(st.session_state.keys()):
+        if not isinstance(chave, str):
+            continue
+        por_empresa = (
+            f"_{id_empresa}_" in chave
+            or chave.endswith(f"_{id_empresa}")
+            or chave == f"fallback_empresas_{id_empresa}"
+        )
+        if not por_empresa:
+            continue
+        if preservar_perfil and chave.startswith(
+            ("perfil_tributario_", "salvar_perfil_tributario_")
+        ):
+            continue
+        st.session_state.pop(chave, None)
+    limpar_caches_dados()
+
+
+def limpar_dados_empresa_supabase(supabase, empresa_id) -> None:
+    if supabase is None:
+        raise RuntimeError("Supabase indisponível para zerar os dados do cliente.")
+    if empresa_id is None or not str(empresa_id).strip():
+        raise ValueError("ID de cliente inválido.")
+
+    try:
+        _excluir_registros_empresa_supabase(
+            supabase,
+            empresa_id,
+            preservar_perfil=True,
+            incluir_cnpjs=False,
+        )
+    except Exception:
+        try:
+            _limpar_estado_local_empresa(empresa_id, preservar_perfil=True)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao invalidar o estado local da empresa %s após "
+                "limpeza fiscal parcial.",
+                empresa_id,
+            )
+        raise
+    _limpar_estado_local_empresa(empresa_id, preservar_perfil=True)
 
 
 def hidratar_dados_empresa_supabase(
@@ -1898,12 +2425,21 @@ def hidratar_dados_empresa_supabase(
         ),
     )
     ledger_por_uid = {}
+    eventos_liquidacao = []
+    perfil_tributario = None
     for registro in sorted(
         tabelas_primarias["praesidium_ledger_fiscal"],
         key=lambda item: str(item.get("updated_at", "")),
     ):
         payload = registro.get("payload")
         if not isinstance(payload, dict):
+            continue
+        tipo_registro = str(payload.get("record_type") or "")
+        if tipo_registro == "split_payment_operation_event":
+            eventos_liquidacao.append(dict(payload))
+            continue
+        if tipo_registro == "company_tax_profile":
+            perfil_tributario = dict(payload)
             continue
         uid_ledger = str(
             payload.get("item_uid")
@@ -2045,11 +2581,25 @@ def hidratar_dados_empresa_supabase(
     for item in itens_hidratados:
         item.pop("_mirror_updated_at", None)
         item.pop("_uid_legacy", None)
+    notas = reconstruir_notas_a_partir_dos_itens(
+        notas,
+        itens_hidratados,
+    )
     return {
         "notas": notas,
         "itens": itens_hidratados,
         "devolucoes": devolucoes,
         "eventos_split": eventos_split,
+        "eventos_liquidacao": eventos_liquidacao,
+        "perfil_tributario": (
+            calcular_memoria_aliquota(
+                str(
+                    perfil_tributario.get("derivacao_setorial")
+                )
+            )
+            if perfil_tributario
+            else None
+        ),
     }
 
 
@@ -2091,6 +2641,7 @@ def classificar_item_inteligente(
     cnaes_cliente_str: str,
     em_contingencia: bool,
     descricao: str = "",
+    fator_reducao: float = 1.0,
 ) -> tuple[str, float, float]:
     ncm_limpo = "".join(filter(str.isdigit, str(ncm))).ljust(8, "0")[:8]
     cfop_limpo = "".join(filter(str.isdigit, str(cfop)))
@@ -2100,14 +2651,7 @@ def classificar_item_inteligente(
         if "".join(filter(str.isdigit, c))
     ]
 
-    if ncm_limpo in NCM_CESTA_BASICA_ZERO:
-        aliquota_base = 0.0
-    elif ncm_limpo in NCM_REDUCAO_60:
-        aliquota_base = 0.106
-    elif str(crt_emitente).strip() == "1":
-        aliquota_base = 0.080
-    else:
-        aliquota_base = 0.265
+    aliquota_base = _aliquota_base_item(ncm_limpo, crt_emitente, fator_reducao)
 
     if em_contingencia:
         return "Quarentena Uso/Consumo", 0.0, 0.0
@@ -2140,7 +2684,11 @@ def classificar_item_inteligente(
             termo in descricao_normalizada for termo in termos_salao
         )
         if item_de_salao:
-            return "Aprovado Revenda", 0.265, _arredondar_dinheiro(vprod * 0.265)
+            return (
+                "Aprovado Revenda",
+                aliquota_base,
+                _arredondar_dinheiro(vprod * aliquota_base),
+            )
         cnaes_alternativos = [
             cnae_cod for cnae_cod in lista_cnaes
             if cnae_cod != "9602501"
@@ -2154,8 +2702,8 @@ def classificar_item_inteligente(
         ):
             return (
                 "Quarentena Uso/Consumo",
-                0.265,
-                _arredondar_dinheiro(vprod * 0.265),
+                aliquota_base,
+                _arredondar_dinheiro(vprod * aliquota_base),
             )
 
     compativel_cnae = False
@@ -2179,6 +2727,25 @@ def classificar_item_inteligente(
         return "Aprovado Revenda", aliquota_base, credito
 
     return "Quarentena Uso/Consumo", 0.0, 0.0
+
+
+def _aliquota_base_item(
+    ncm: str,
+    crt_emitente: str,
+    fator_reducao: float,
+) -> float:
+    ncm_limpo = "".join(filter(str.isdigit, str(ncm))).ljust(8, "0")[:8]
+    try:
+        fator_reducao = min(1.0, max(0.0, float(fator_reducao)))
+    except (TypeError, ValueError):
+        fator_reducao = 1.0
+    if ncm_limpo in NCM_CESTA_BASICA_ZERO:
+        return 0.0
+    if ncm_limpo in NCM_REDUCAO_60:
+        return 0.106
+    if str(crt_emitente).strip() == "1":
+        return 0.080
+    return 0.265 * fator_reducao
 
 
 def _justificativa_classificacao_item(
@@ -3074,6 +3641,14 @@ def processar_xml_lote_bytes(
             (False, "Supabase indisponível; o XML não foi persistido.")
             for _ in arquivos
         ]
+    perfil_tributario = carregar_perfil_tributario_empresa(
+        supabase,
+        empresa_id_ativo,
+    )
+    fator_reducao = _float_seguro(
+        perfil_tributario.get("fator_reducao"),
+        1.0,
+    )
     try:
         notas_existentes = _carregar_notas_existentes(
             supabase,
@@ -3201,6 +3776,18 @@ def processar_xml_lote_bytes(
             for nota in notas_resultado
             if nota.get("chave_acesso")
         })
+        if any(
+            not notas_por_chave.get(str(nota["chave_acesso"]), {}).get("id")
+            for _, _, nota, _ in novas_notas
+        ):
+            notas_confirmadas = _carregar_notas_existentes(
+                supabase,
+                empresa_id_ativo,
+            )
+            for _, _, nota, _ in novas_notas:
+                chave = str(nota["chave_acesso"])
+                if chave in notas_confirmadas:
+                    notas_por_chave[chave] = notas_confirmadas[chave]
 
     itens_lote = []
     dados_sucesso = []
@@ -3227,29 +3814,39 @@ def processar_xml_lote_bytes(
                 cnaes_cliente_str=cnaes_cliente,
                 em_contingencia=em_contingencia,
                 descricao=str(item.get("descricao", "")),
+                fator_reducao=fator_reducao,
             )
             valor_item = _float_seguro(item.get("valor_item"), 0.0)
+            aliquota_item = aliquota or _aliquota_base_item(
+                str(item.get("ncm", "")),
+                str(nota_payload.get("crt_emitente") or "3"),
+                fator_reducao,
+            )
             if item.get("_tributos_xml_presentes"):
                 credito = item.get("_credito_xml", 0.0)
                 credito_ibs = item.get("_credito_ibs_xml", 0.0)
                 credito_cbs = item.get("_credito_cbs_xml", 0.0)
+                aliquota_ibs = 0.177
+                aliquota_cbs = 0.088
             else:
                 credito = _arredondar_dinheiro(
-                    Decimal(str(valor_item)) * Decimal("0.265")
+                    Decimal(str(valor_item)) * Decimal(str(aliquota_item))
                 )
+                aliquota_ibs = aliquota_item * (0.177 / 0.265)
+                aliquota_cbs = aliquota_item * (0.088 / 0.265)
                 credito_ibs = _arredondar_dinheiro(
-                    Decimal(str(valor_item)) * Decimal("0.177")
+                    Decimal(str(valor_item)) * Decimal(str(aliquota_ibs))
                 )
                 credito_cbs = _arredondar_dinheiro(
-                    Decimal(str(valor_item)) * Decimal("0.088")
+                    Decimal(str(valor_item)) * Decimal(str(aliquota_cbs))
                 )
-            aliquota = 0.265
+            aliquota = aliquota_item
             uid = str(item.get("item_uid") or "")
             item_persistido = {
                 **item,
                 "nota_id": nota_id,
-                "aliquota_ibs_aplicada": 0.177,
-                "aliquota_cbs_aplicada": 0.088,
+                "aliquota_ibs_aplicada": aliquota_ibs,
+                "aliquota_cbs_aplicada": aliquota_cbs,
                 "credito_ibs_gerado": _arredondar_dinheiro(credito_ibs),
                 "credito_cbs_gerado": _arredondar_dinheiro(credito_cbs),
                 "aliquota_aplicada": aliquota,
@@ -3391,9 +3988,8 @@ def processar_xml_lote_bytes(
             icon="✅",
         )
     elif itens_lote and "Não foi possível persistir" in mensagem_itens:
-        st.toast(
+        st.warning(
             "Não foi possível confirmar a persistência dos itens no Supabase.",
-            icon="⚠️",
         )
     if dados_sucesso:
         st.toast(
@@ -3692,8 +4288,10 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
     feedback_upload = st.session_state.pop(upload_feedback_key, None)
     if feedback_upload:
         for nivel, mensagem in feedback_upload:
-            icone = "✅" if nivel == "success" else "⚠️"
-            st.toast(mensagem, icon=icone)
+            if nivel == "success":
+                st.toast(mensagem, icon="✅")
+            else:
+                st.warning(mensagem)
 
     aviso_regra = st.session_state.pop(f"aviso_regra_{empresa_id_ativo}", None)
     if aviso_regra:
@@ -3717,7 +4315,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                     or str(empresa_ativa.get("id")) != str(empresa_id_ativo)
                     or not "".join(filter(str.isdigit, str(empresa_ativa.get("cnpj", ""))))
                 ):
-                    st.toast("Sincronização indisponível: selecione uma empresa válida com CNPJ.", icon="⚠️")
+                    st.error("Sincronização indisponível: selecione uma empresa válida com CNPJ.")
                     st.stop()
 
                 cnaes_str = str(empresa_ativa.get("cnae_principal", "4711302"))
@@ -3762,10 +4360,10 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
 
                 ok_nf, msg_nf, data_nf = inserir_seguro_supabase(supabase, "notas_fiscais_recebidas", payload_nf_sim)
                 if not ok_nf:
-                    st.toast("Não foi possível registrar o lote de teste. Verifique a empresa ativa.", icon="⚠️")
+                    st.error("Não foi possível registrar o lote de teste. Verifique a empresa ativa.")
                     st.stop()
                 if not data_nf or data_nf[0].get("id") is None:
-                    st.toast("Não foi possível confirmar o registro do lote de teste.", icon="⚠️")
+                    st.error("Não foi possível confirmar o registro do lote de teste.")
                     st.stop()
                 n_id = data_nf[0]["id"]
 
@@ -3817,7 +4415,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                             "Falha ao remover nota simulada %s após falha ao persistir os itens.",
                             n_id,
                         )
-                    st.toast("Não foi possível registrar os itens do lote de teste.", icon="⚠️")
+                    st.error("Não foi possível registrar os itens do lote de teste.")
                     st.stop()
 
                 limpar_caches_dados()
@@ -3937,7 +4535,10 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
             key=f"sel_nf_dev_{empresa_ativa['id']}"
         )
         nf_orig = opcoes_nf[nf_escolhida_label]
-        itens_da_nota = [i for i in itens if i.get("nota_id") == nf_orig.get("id")]
+        itens_da_nota = [
+            i for i in itens
+            if str(i.get("nota_id")) == str(nf_orig.get("id"))
+        ]
 
         if not itens_da_nota:
             st.warning("Esta nota não possui itens detalhados para devolução.")
@@ -4052,7 +4653,7 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
                 st.success("✅ Devolução registrada e crédito estornado em tempo real!")
                 st.rerun()
             else:
-                st.toast("O XML foi gerado, mas não foi possível registrar a devolução.", icon="⚠️")
+                st.error("O XML foi gerado, mas não foi possível registrar a devolução.")
 
         if f"ultimo_xml_dev_{empresa_ativa['id']}" in st.session_state:
             ch_gerada, xml_gerado = st.session_state[f"ultimo_xml_dev_{empresa_ativa['id']}"]

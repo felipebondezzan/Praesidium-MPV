@@ -400,7 +400,7 @@ def renderizar_onboarding_vazio() -> None:
 # ==========================================
 # 2. CONEXÃO SUPABASE (EM CACHE DE ALTA VELOCIDADE)
 # ==========================================
-@st.cache_resource
+@st.cache_resource(ttl=900)
 def iniciar_conexao_supabase() -> Client:
     try:
         supabase_url = str(st.secrets["SUPABASE_URL"]).strip()
@@ -1358,25 +1358,41 @@ if aviso_persistencia_conta:
 def carregar_todas_empresas_db():
     empresas = []
     if supabase is not None:
-        inicio = 0
         tamanho_pagina = 1000
-        try:
+
+        def consultar_empresas(colunas: str) -> list[dict]:
+            registros = []
+            inicio = 0
             while True:
-                res = (
+                resposta = (
                     supabase.table("empresas_monitoradas")
-                    .select("id,cnpj,razao_social,regime_tributario,cnae_principal,certificado_a1_status")
+                    .select(colunas)
                     .range(inicio, inicio + tamanho_pagina - 1)
                     .execute()
                 )
-                pagina = res.data or []
-                empresas.extend(pagina)
+                pagina = resposta.data or []
+                registros.extend(pagina)
                 if len(pagina) < tamanho_pagina:
-                    break
+                    return registros
                 inicio += tamanho_pagina
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "Falha ao carregar empresas do Supabase; usando os dados da sessão."
+
+        try:
+            empresas = consultar_empresas(
+                "id,cnpj,razao_social,regime_tributario,cnae_principal,"
+                "certificado_a1_status"
             )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Leitura explícita de empresas indisponível; tentando schema completo.",
+                exc_info=True,
+            )
+            try:
+                empresas = consultar_empresas("*")
+            except Exception:
+                empresas = []
+                logging.getLogger(__name__).exception(
+                    "Falha ao carregar empresas do Supabase mesmo com select('*')."
+                )
     return [
         empresa for empresa in empresas
         if str(empresa.get("regime_tributario", "")) not in {"SYS_AUTH", "SYS_LOG"}
@@ -1496,6 +1512,10 @@ def carregar_dados_empresa_db(emp_id: int | str, emp_cnpj: str):
             "id",
             f"mirror_split_{registro.get('event_id') or indice}",
         )
+    notas_lista = xml_engine.reconstruir_notas_a_partir_dos_itens(
+        notas_lista,
+        itens_lista,
+    )
     return notas_lista, devs_lista, itens_lista, [], eventos_split
 
 
@@ -1570,18 +1590,45 @@ def combinar_registros_com_sessao(
 
 
 def hidratar_dados_empresa_supabase(empresa_id: int | str) -> dict[str, list[dict]]:
+    global supabase
     if str(empresa_ativa.get("id", "")) != str(empresa_id):
         raise ValueError("A empresa ativa não corresponde à seleção atual.")
     cache_hidratacao = st.session_state.setdefault(
         "_dados_hidratados_por_empresa",
         {},
     )
-    dados = xml_engine.hidratar_dados_empresa_com_cache(
-        supabase,
-        empresa_id,
-        empresa_ativa,
-        cache_hidratacao,
-    )
+    try:
+        dados = xml_engine.hidratar_dados_empresa_supabase(
+            supabase,
+            empresa_id,
+            empresa_ativa,
+        )
+    except RuntimeError as erro_hidratacao:
+        logging.getLogger(__name__).warning(
+            "Reconectando ao Supabase após falha de hidratação da empresa %s: %s",
+            empresa_id,
+            erro_hidratacao,
+        )
+        try:
+            iniciar_conexao_supabase.clear()
+            supabase = iniciar_conexao_supabase()
+            dados = xml_engine.hidratar_dados_empresa_supabase(
+                supabase,
+                empresa_id,
+                empresa_ativa,
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "A reconexão automática ao Supabase não recuperou a empresa %s.",
+                empresa_id,
+            )
+            dados = xml_engine.hidratar_dados_empresa_com_cache(
+                supabase,
+                empresa_id,
+                empresa_ativa,
+                cache_hidratacao,
+            )
+    cache_hidratacao[str(empresa_id)] = dados
     for nome in (
         "fallback_notas",
         "fallback_itens",
@@ -1629,6 +1676,23 @@ fragment_decorator = getattr(st, "fragment", None)
 if not callable(fragment_decorator):
     def fragment_decorator(func):
         return func
+
+
+TELEMETRIA_AUTOMATICA_15S = False
+
+
+def fragment_telemetria(func):
+    global TELEMETRIA_AUTOMATICA_15S
+    fragment = getattr(st, "fragment", None)
+    if not callable(fragment):
+        return func
+    try:
+        decorador = fragment(run_every="15s")
+        TELEMETRIA_AUTOMATICA_15S = True
+        return decorador(func)
+    except TypeError:
+        TELEMETRIA_AUTOMATICA_15S = False
+        return fragment(func)
 
 
 def rerun_fragment_local() -> None:
@@ -1757,6 +1821,11 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
     novo_nome = st.text_input("Razão Social", key="cad_nome")
     novo_cnpj = st.text_input("CNPJ (Com ou sem pontuação)", key="cad_cnpj")
     novo_regime = st.selectbox("Regime", ["Simples Nacional", "Simples Híbrido (LC 214)", "Lucro Presumido", "Lucro Real"], key="cad_regime")
+    derivacao_tributaria_nova = st.selectbox(
+        "Derivação IBS + CBS",
+        list(xml_engine.ALIQUOTAS_REFORMA_TRIBUTARIA),
+        key="cad_derivacao_tributaria",
+    )
     cnae_principal_input = st.text_input("Atividade Principal (CNAE 7 dígitos)", placeholder="Ex: 4711302 ou 9602501", key="cad_cnae_prin")
 
     if "cnae_secundarios_extras" not in st.session_state:
@@ -1805,8 +1874,60 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                     "cnae_principal": todos_cnaes_unicos[0],
                     "certificado_a1_status": status_certificado
                 }
-                ok_ins, msg_ins, _ = xml_engine.inserir_seguro_supabase(supabase, "empresas_monitoradas", payload_emp)
+                ok_ins, msg_ins, empresas_criadas = xml_engine.inserir_seguro_supabase(
+                    supabase,
+                    "empresas_monitoradas",
+                    payload_emp,
+                )
                 if ok_ins:
+                    empresa_nova = next(
+                        (
+                            registro for registro in empresas_criadas
+                            if registro.get("id") is not None
+                        ),
+                        None,
+                    )
+                    if (
+                        empresa_nova is None
+                        and derivacao_tributaria_nova
+                        != "Base Padrão Integral — 26,50% (Sem redutor)"
+                    ):
+                        try:
+                            resposta_empresa_nova = (
+                                supabase.table("empresas_monitoradas")
+                                .select("id")
+                                .eq("cnpj", cnpj_limpo)
+                                .limit(1)
+                                .execute()
+                            )
+                            empresa_nova = next(
+                                (
+                                    registro for registro in (resposta_empresa_nova.data or [])
+                                    if registro.get("id") is not None
+                                ),
+                                None,
+                            )
+                        except Exception:
+                            logging.getLogger(__name__).exception(
+                                "Falha ao confirmar o ID do novo cliente para salvar a derivação tributária."
+                            )
+                    if empresa_nova and derivacao_tributaria_nova != (
+                        "Base Padrão Integral — 26,50% (Sem redutor)"
+                    ):
+                        try:
+                            xml_engine.persistir_perfil_tributario_empresa(
+                                supabase,
+                                empresa_nova["id"],
+                                derivacao_tributaria_nova,
+                            )
+                        except Exception:
+                            logging.getLogger(__name__).exception(
+                                "Falha ao salvar a derivação tributária do novo cliente."
+                            )
+                            st.sidebar.warning(
+                                "Cliente cadastrado, mas não foi possível persistir a derivação IBS/CBS. "
+                                "Salve-a novamente na ficha do cliente."
+                            )
                     st.session_state["cnae_secundarios_extras"] = []
                     limpar_caches_dados()
                     st.sidebar.success("Cliente validado e cadastrado!")
@@ -1920,6 +2041,15 @@ empresa_ativa["cnae_principal"] = extrair_cnae_limpo_empresa(empresa_ativa_bruta
 empresa_ativa["cnpjs_autorizados"] = carregar_cnpjs_autorizados_db(
     empresa_id_ativo
 )
+chave_perfil_tributario = f"perfil_tributario_{empresa_id_ativo}"
+if chave_perfil_tributario not in st.session_state:
+    st.session_state[chave_perfil_tributario] = (
+        xml_engine.carregar_perfil_tributario_empresa(
+            supabase,
+            empresa_id_ativo,
+        )
+    )
+perfil_tributario_ativo = st.session_state[chave_perfil_tributario]
 
 st.sidebar.markdown(f"""
 <div class="sidebar-exec-card">
@@ -1994,36 +2124,77 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
                 logging.getLogger(__name__).exception("Falha ao atualizar CNAE do cliente.")
                 st.toast("Não foi possível atualizar os CNAEs. Tente novamente.", icon="⚠️")
 
+    st.markdown("#### Memória de Cálculo IBS + CBS")
+    derivacoes_tributarias = list(xml_engine.ALIQUOTAS_REFORMA_TRIBUTARIA)
+    derivacao_atual = str(
+        perfil_tributario_ativo.get("derivacao_setorial")
+        or derivacoes_tributarias[0]
+    )
+    derivacao_selecionada = st.selectbox(
+        "Derivação setorial da empresa",
+        derivacoes_tributarias,
+        index=(
+            derivacoes_tributarias.index(derivacao_atual)
+            if derivacao_atual in derivacoes_tributarias
+            else 0
+        ),
+        key=f"perfil_tributario_select_{empresa_id_ativo}",
+    )
+    memoria_selecionada = xml_engine.calcular_memoria_aliquota(
+        derivacao_selecionada
+    )
+    st.caption(
+        f"Base Legal 26,50% (17,70% IBS + 8,80% CBS) → "
+        f"Fator de Redução {memoria_selecionada['fator_reducao']:.0%} → "
+        f"Alíquota Efetiva Final {memoria_selecionada['aliquota_efetiva']:.2f}% "
+        f"(IBS {memoria_selecionada['aliquota_ibs_efetiva']:.2f}% + "
+        f"CBS {memoria_selecionada['aliquota_cbs_efetiva']:.2f}%)."
+    )
+    if st.button(
+        "💾 Salvar Derivação IBS/CBS",
+        use_container_width=True,
+        key=f"salvar_perfil_tributario_{empresa_id_ativo}",
+    ):
+        try:
+            perfil_tributario_ativo = (
+                xml_engine.persistir_perfil_tributario_empresa(
+                    supabase,
+                    empresa_id_ativo,
+                    derivacao_selecionada,
+                )
+            )
+            st.session_state[chave_perfil_tributario] = perfil_tributario_ativo
+            st.sidebar.success("Memória de cálculo salva no ledger fiscal.")
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Falha ao salvar a memória de cálculo IBS/CBS da empresa %s.",
+                empresa_id_ativo,
+            )
+            st.sidebar.error(
+                "Não foi possível salvar a derivação tributária no Supabase."
+            )
+
     st.markdown("<hr style='border:0; border-top:1px solid #374151; margin:8px 0;'>", unsafe_allow_html=True)
     if st.button("🔄 Zerar Notas deste Cliente", use_container_width=True, key=f"btn_reset_nf_{empresa_id_ativo}"):
-        dados_alterados = False
         try:
-            nfs_cli = supabase.table("notas_fiscais_recebidas").select("id").eq("empresa_id", empresa_id_ativo).execute()
-            ids_nf = [n["id"] for n in (nfs_cli.data or [])]
-            try:
-                resultado = supabase.table("conciliacao_devolucoes").delete().eq("empresa_id", empresa_id_ativo).select("id").execute()
-                dados_alterados = dados_alterados or bool(resultado.data)
-            except Exception:
-                pass
-            if ids_nf:
-                try:
-                    resultado = supabase.table("conciliacao_devolucoes").delete().in_("nota_original_id", ids_nf).select("id").execute()
-                    dados_alterados = dados_alterados or bool(resultado.data)
-                except Exception:
-                    pass
-                resultado = supabase.table("itens_nota_fiscal").delete().in_("nota_id", ids_nf).select("id").execute()
-                dados_alterados = dados_alterados or bool(resultado.data)
-                resultado = supabase.table("notas_fiscais_recebidas").delete().eq("empresa_id", empresa_id_ativo).select("id").execute()
-                dados_alterados = dados_alterados or bool(resultado.data)
+            xml_engine.limpar_dados_empresa_supabase(
+                supabase,
+                empresa_id_ativo,
+            )
+            st.sidebar.success(
+                "Notas, itens, liquidações e espelhos foram removidos; "
+                "o perfil tributário foi preservado."
+            )
+            st.rerun()
         except Exception:
-            pass
-        st.session_state.pop(f"fallback_notas_{empresa_id_ativo}", None)
-        st.session_state.pop(f"fallback_itens_{empresa_id_ativo}", None)
-        st.session_state.pop(f"fallback_devolucoes_{empresa_id_ativo}", None)
-        if dados_alterados:
-            limpar_caches_dados()
-        st.sidebar.success("Notas zeradas!")
-        st.rerun()
+            logging.getLogger(__name__).exception(
+                "Falha ao zerar os dados fiscais da empresa %s.",
+                empresa_id_ativo,
+            )
+            st.sidebar.error(
+                "Não foi possível confirmar a limpeza completa. "
+                "Alguns dados podem permanecer no Supabase."
+            )
 
     st.markdown("<hr style='border:0; border-top:1px solid #374151; margin:8px 0;'>", unsafe_allow_html=True)
     if st.button("🗑️ Excluir Cliente Ativo", use_container_width=True, key=f"btn_del_cli_{empresa_id_ativo}"):
@@ -2032,6 +2203,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
             st.session_state.pop(f"fallback_notas_{empresa_id_ativo}", None)
             st.session_state.pop(f"fallback_itens_{empresa_id_ativo}", None)
             st.session_state.pop(f"fallback_devolucoes_{empresa_id_ativo}", None)
+            st.session_state.pop(f"perfil_tributario_{empresa_id_ativo}", None)
             st.session_state.get("_dados_hidratados_por_empresa", {}).pop(
                 str(empresa_id_ativo),
                 None,
@@ -2053,29 +2225,13 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
             st.sidebar.success("Cliente excluído!")
             st.rerun()
         except Exception:
-            logging.getLogger(__name__).exception("Falha ao excluir cliente.")
-            st.session_state.pop(f"fallback_notas_{empresa_id_ativo}", None)
-            st.session_state.pop(f"fallback_itens_{empresa_id_ativo}", None)
-            st.session_state.pop(f"fallback_devolucoes_{empresa_id_ativo}", None)
-            st.session_state.get("_dados_hidratados_por_empresa", {}).pop(
-                str(empresa_id_ativo),
-                None,
+            logging.getLogger(__name__).exception(
+                "Falha ao excluir cliente %s.",
+                empresa_id_ativo,
             )
-            limpar_caches_dados()
-            proxima_empresa = next(
-                (
-                    empresa
-                    for empresa in lista_empresas
-                    if str(empresa.get("id")) != str(empresa_id_ativo)
-                ),
-                None,
+            st.sidebar.error(
+                "A exclusão não foi confirmada. O cliente e os dados permanecem ativos."
             )
-            st.session_state.pop(chave_empresa_selecao, None)
-            if proxima_empresa is None:
-                st.session_state.pop("empresa_id_ativa", None)
-            else:
-                st.session_state["empresa_id_ativa"] = proxima_empresa["id"]
-            st.rerun()
 
 if st.sidebar.button("🔒 Encerrar Sessão", use_container_width=True):
     encerrar_sessao()
@@ -2100,8 +2256,13 @@ itens = [
     xml_engine.normalizar_item_credito(item)
     for item in dados_empresa_hidratados["itens"]
 ]
+notas = xml_engine.reconstruir_notas_a_partir_dos_itens(notas, itens)
 devolucoes = dados_empresa_hidratados["devolucoes"]
 eventos_split = dados_empresa_hidratados["eventos_split"]
+eventos_liquidacao = dados_empresa_hidratados.get("eventos_liquidacao", [])
+if dados_empresa_hidratados.get("perfil_tributario"):
+    perfil_tributario_ativo = dados_empresa_hidratados["perfil_tributario"]
+    st.session_state[chave_perfil_tributario] = perfil_tributario_ativo
 
 if not notas:
     renderizar_onboarding_vazio()
@@ -2117,7 +2278,6 @@ itens_mes = [
     if periodo_por_nota.get(str(i.get("nota_id"))) == competencia_atual
 ]
 resumo_creditos_acumulado = xml_engine.calcular_resumo_creditos(itens)
-imposto_validado_acumulado = resumo_creditos_acumulado["validado"]
 imposto_quarentena_acumulado = resumo_creditos_acumulado["quarentena"]
 imposto_bruto_acumulado = resumo_creditos_acumulado["bruto"]
 ids_notas_mes = {
@@ -2148,51 +2308,79 @@ imposto_estornado = round(sum(
     for d in devolucoes
 ), 2)
 
-
-valor_retido_split_payment = round(sum(
-    max(0.0, float(evento.get("retained_amount", 0.0) or 0.0))
-    for evento in eventos_split
-), 2)
-credito_validado_tempo_real = round(
-    imposto_validado_acumulado - imposto_estornado - valor_retido_split_payment,
-    2,
+resumo_saldo_credito = xml_engine.calcular_saldo_credito_digital(
+    itens,
+    devolucoes,
+    eventos_split,
+    eventos_liquidacao,
 )
-saldo_credito_disponivel = max(
-    0.0,
-    credito_validado_tempo_real,
-)
+valor_retido_split_payment = resumo_saldo_credito["valor_retido_split_payment"]
+credito_validado_tempo_real = resumo_saldo_credito["credito_liquido"]
+saldo_credito_disponivel = resumo_saldo_credito["credito_disponivel"]
 
 # ==========================================
 # 8. PAINEL SUPERIOR: IMPOSTÔMETRO LUXO
 # ==========================================
-col1, col2, col3 = st.columns(3)
+@fragment_telemetria
+def renderizar_cards_telemetria() -> None:
+    dados_live = dados_empresa_hidratados
+    try:
+        dados_live = hidratar_dados_empresa_supabase(empresa_id_ativo)
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "Falha ao atualizar a telemetria fiscal da empresa %s.",
+            empresa_id_ativo,
+        )
+        st.caption("Atualização temporariamente indisponível; exibindo o último snapshot válido.")
 
-with col1:
-    st.markdown(f"""
-    <div class="exec-card card-bruto">
-        <div class="card-label">⚡ Crédito Digital Bruto Acumulado</div>
-        <div class="card-value-bruto">R$ {imposto_bruto_acumulado:,.2f}</div>
-        <div class="card-desc">Alíquotas inteligentes por NCM/CNAE para {empresa_ativa['razao_social']}</div>
-    </div>
-    """, unsafe_allow_html=True)
+    itens_live = [
+        xml_engine.normalizar_item_credito(item)
+        for item in dados_live.get("itens", [])
+    ]
+    saldos_live = xml_engine.calcular_saldo_credito_digital(
+        itens_live,
+        dados_live.get("devolucoes", []),
+        dados_live.get("eventos_split", []),
+        dados_live.get("eventos_liquidacao", []),
+    )
+    selo_telemetria = (
+        "🟢 Telemetria Hub Split Payment Ativa • Atualização em Tempo Real (&lt; 15s)"
+        if TELEMETRIA_AUTOMATICA_15S
+        else "🟡 Telemetria Hub Split Payment • Atualização na próxima interação"
+    )
+    st.markdown(
+        f"<div style='text-align:right;color:#34d399;font-size:12px;"
+        f"font-weight:700;margin-bottom:8px;'>{selo_telemetria}</div>",
+        unsafe_allow_html=True,
+    )
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown(f"""
+        <div class="exec-card card-bruto">
+            <div class="card-label">⚡ CRÉDITO DIGITAL BRUTO ACUMULADO</div>
+            <div class="card-value-bruto">R$ {saldos_live['bruto']:,.2f}</div>
+            <div class="card-desc">Alíquotas inteligentes por NCM/CNAE para {empresa_ativa['razao_social']}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""
+        <div class="exec-card card-validado">
+            <div class="card-label">🟩 CRÉDITO VALIDADO / SALDO LÍQUIDO</div>
+            <div class="card-value-validado">R$ {saldos_live['credito_liquido']:,.2f}</div>
+            <div class="card-desc">Disponível R$ {saldos_live['credito_disponivel']:,.2f} após abatimentos digitais de R$ {saldos_live['credito_compensado']:,.2f} e retenções de R$ {saldos_live['valor_retido_split_payment']:,.2f}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        st.markdown(f"""
+        <div class="exec-card card-quarentena">
+            <div class="card-label">🔒 SALDO EM QUARENTENA</div>
+            <div class="card-value-quarentena">R$ {saldos_live['quarentena']:,.2f}</div>
+            <div class="card-desc">Aguardando decisão técnica do contador (Zero bloqueio automático)</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-with col2:
-    st.markdown(f"""
-    <div class="exec-card card-validado">
-        <div class="card-label">✅ Crédito Validado / Saldo Líquido</div>
-        <div class="card-value-validado">R$ {credito_validado_tempo_real:,.2f}</div>
-        <div class="card-desc">Após estornos e retenção Split Payment de R$ {valor_retido_split_payment:,.2f}: R$ {saldo_credito_disponivel:,.2f}</div>
-    </div>
-    """, unsafe_allow_html=True)
 
-with col3:
-    st.markdown(f"""
-    <div class="exec-card card-quarentena">
-        <div class="card-label">🔒 Saldo em Quarentena</div>
-        <div class="card-value-quarentena">R$ {imposto_quarentena_acumulado:,.2f}</div>
-        <div class="card-desc">Aguardando decisão técnica do contador (Zero bloqueio automático)</div>
-    </div>
-    """, unsafe_allow_html=True)
+renderizar_cards_telemetria()
 
 st.write("")
 st.markdown("### 📂 Módulos de Auditoria, Devolução Expressa e Inteligência Estratégica")
@@ -2304,6 +2492,7 @@ def renderizar_fila_quarentena(
     pendentes: list[dict],
     auditados: list[dict],
     empresa_id: int | str,
+    eventos_liquidacao: list[dict],
 ) -> None:
     prefixo_selecao = f"quarentena_selecionar_{empresa_id}_"
     chave_selecionar_todos = f"quarentena_todos_{empresa_id}"
@@ -2582,9 +2771,53 @@ def renderizar_fila_quarentena(
                 for item in auditados
             ])
             st.dataframe(df_audit, height=250, hide_index=True, use_container_width=True)
+        if eventos_liquidacao:
+            st.markdown("#### 💳 Histórico de Auditoria Financeira — Split Payment")
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Timestamp": evento.get("occurred_at", ""),
+                        "Usuário": evento.get("usuario", ""),
+                        "ID_OP": evento.get("id_op", ""),
+                        "Chave NF-e": evento.get("chave_acesso", ""),
+                        "Evento": evento.get("event_type", ""),
+                        "Valor liquidado (R$)": float(
+                            evento.get("valor_liquidado", 0.0) or 0.0
+                        ),
+                        "IBS segregado (R$)": float(
+                            evento.get("ibs_segregado", 0.0) or 0.0
+                        ),
+                        "CBS segregado (R$)": float(
+                            evento.get("cbs_segregado", 0.0) or 0.0
+                        ),
+                        "Crédito compensado (R$)": float(
+                            evento.get("credito_compensado", 0.0) or 0.0
+                        ),
+                        "Retido em caixa (R$)": float(
+                            evento.get("valor_retido_caixa", 0.0) or 0.0
+                        ),
+                        "Impacto bancário (R$)": float(
+                            evento.get("impacto_banco", 0.0) or 0.0
+                        ),
+                    }
+                    for evento in sorted(
+                        eventos_liquidacao,
+                        key=lambda registro: str(registro.get("occurred_at", "")),
+                        reverse=True,
+                    )
+                ]),
+                height=250,
+                hide_index=True,
+                use_container_width=True,
+            )
 
 
-renderizar_fila_quarentena(itens_pendentes, itens_auditados, empresa_id_ativo)
+renderizar_fila_quarentena(
+    itens_pendentes,
+    itens_auditados,
+    empresa_id_ativo,
+    eventos_liquidacao,
+)
 
 # MÓDULO 5: NOTAS FISCAIS RECEBIDAS (COM SELETOR DE DOWNLOAD NOTA POR NOTA DO CLIENTE)
 with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} notas acumuladas deste cliente)", expanded=False):
@@ -2632,9 +2865,20 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
             key=f"visualizar_danfe_{empresa_id_ativo}",
         )
         nota_danfe = notas_por_id[nota_id_danfe]
+        chave_nota_danfe = str(nota_danfe.get("chave_acesso") or "")
         itens_danfe = [
             item for item in itens
-            if str(item.get("nota_id")) == str(nota_danfe.get("id"))
+            if (
+                str(item.get("nota_id")) == str(nota_danfe.get("id"))
+                or (
+                    chave_nota_danfe
+                    and (
+                        str(item.get("chave_acesso") or "") == chave_nota_danfe
+                        or chave_nota_danfe
+                        in str(item.get("item_uid") or "")
+                    )
+                )
+            )
         ]
         credito_ibs_danfe = round(sum(
             float(item.get("credito_ibs_gerado", 0.0) or 0.0)
@@ -2756,6 +3000,336 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
         else:
             st.info("Esta nota não possui itens detalhados persistidos.")
 
+        st.markdown("---")
+        st.markdown(
+            "#### 💳 Hub de Liquidação Financeira, Segregação & Eventos Split Payment"
+        )
+        valor_base_original = float(
+            nota_danfe.get("valor_total_nf")
+            or sum(float(item.get("valor_item", 0.0) or 0.0) for item in itens_danfe)
+        )
+        id_op = xml_engine.calcular_id_operacao(
+            empresa_id_ativo,
+            nota_danfe,
+            valor_base_original,
+            credito_ibs_danfe,
+            credito_cbs_danfe,
+        )
+        resumo_eventos_operacao = xml_engine.resumir_eventos_liquidacao(
+            eventos_liquidacao
+        ).get(id_op, {})
+        valor_base_operacao = float(
+            resumo_eventos_operacao.get("valor_negociado")
+            or valor_base_original
+        )
+        fator_negociacao = (
+            valor_base_operacao / valor_base_original
+            if valor_base_original
+            else 0.0
+        )
+        ibs_operacao = round(credito_ibs_danfe * fator_negociacao, 2)
+        cbs_operacao = round(credito_cbs_danfe * fator_negociacao, 2)
+        valor_pago_acumulado = float(
+            resumo_eventos_operacao.get("valor_pago_acumulado", 0.0)
+        )
+        saldo_operacao = max(0.0, valor_base_operacao - valor_pago_acumulado)
+        st.code(f"ID_OP: {id_op}", language=None)
+        st.caption(
+            f"Nota → Operação → Transação → Liquidação → Segregação → "
+            f"Recolhimento/Compensação → Conciliação | "
+            f"Base R$ {valor_base_operacao:,.2f} | IBS R$ {ibs_operacao:,.2f} | "
+            f"CBS R$ {cbs_operacao:,.2f}."
+        )
+        st.caption(
+            f"Liquidado R$ {valor_pago_acumulado:,.2f} | "
+            f"Saldo em aberto R$ {saldo_operacao:,.2f} | "
+            f"Crédito digital disponível R$ {saldo_credito_disponivel:,.2f}."
+        )
+        segregacao_acumulada = xml_engine.calcular_segregacao_liquidacao(
+            valor_base_operacao,
+            ibs_operacao,
+            cbs_operacao,
+            valor_pago_acumulado,
+        )
+        col_liquidado, col_pendente = st.columns(2)
+        col_liquidado.metric(
+            "IBS/CBS segregado nas liquidações",
+            f"R$ {segregacao_acumulada['ibs_segregado_atual'] + segregacao_acumulada['cbs_segregado_atual']:,.2f}",
+            help=(
+                f"IBS R$ {segregacao_acumulada['ibs_segregado_atual']:,.2f} + "
+                f"CBS R$ {segregacao_acumulada['cbs_segregado_atual']:,.2f}"
+            ),
+        )
+        col_pendente.metric(
+            "IBS/CBS pendente de liquidação futura",
+            f"R$ {segregacao_acumulada['ibs_pendente'] + segregacao_acumulada['cbs_pendente']:,.2f}",
+            help=(
+                f"IBS R$ {segregacao_acumulada['ibs_pendente']:,.2f} + "
+                f"CBS R$ {segregacao_acumulada['cbs_pendente']:,.2f}"
+            ),
+        )
+        with st.form(key=f"form_liquidacao_{empresa_id_ativo}_{id_op}", border=False):
+            tipo_evento_financeiro = st.selectbox(
+                "Evento financeiro auditável",
+                [
+                    "Liquidação Parcial/Integral",
+                    "Antecipação de Recebíveis (Desconto/Taxa)",
+                    "Estorno de Transação",
+                    "Alteração/Renegociação de Operação",
+                ],
+                key=f"tipo_evento_financeiro_{empresa_id_ativo}_{id_op}",
+            )
+            tipo_pagamento = st.radio(
+                "Modalidade de pagamento",
+                ["Pagamento parcial", "Pagamento parcelado", "Integral"],
+                horizontal=True,
+                key=f"modalidade_pagamento_{empresa_id_ativo}_{id_op}",
+            )
+            valor_padrao_evento = (
+                min(saldo_operacao, valor_base_operacao)
+                if tipo_evento_financeiro == "Liquidação Parcial/Integral"
+                else (
+                    min(valor_pago_acumulado, valor_base_operacao)
+                    if tipo_evento_financeiro == "Estorno de Transação"
+                    else valor_base_operacao
+                )
+            )
+            valor_evento_financeiro = st.number_input(
+                "Valor efetivamente liquidado / antecipado / ajustado (R$)",
+                min_value=0.0,
+                max_value=max(1_000_000_000.0, valor_base_operacao),
+                value=float(valor_padrao_evento),
+                step=100.0,
+                format="%.2f",
+                key=f"valor_evento_financeiro_{empresa_id_ativo}_{id_op}",
+            )
+            if tipo_pagamento == "Pagamento parcelado":
+                numero_parcela, total_parcelas = st.columns(2)
+                parcela_atual = numero_parcela.number_input(
+                    "Parcela atual",
+                    min_value=1,
+                    value=1,
+                    step=1,
+                    key=f"parcela_atual_{empresa_id_ativo}_{id_op}",
+                )
+                quantidade_parcelas = total_parcelas.number_input(
+                    "Total de parcelas",
+                    min_value=1,
+                    value=1,
+                    step=1,
+                    key=f"total_parcelas_{empresa_id_ativo}_{id_op}",
+                )
+            else:
+                parcela_atual = 1
+                quantidade_parcelas = 1
+            taxa_antecipacao = 0.0
+            if tipo_evento_financeiro == "Antecipação de Recebíveis (Desconto/Taxa)":
+                taxa_antecipacao = st.number_input(
+                    "Desconto / taxa de antecipação (%)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=0.0,
+                    step=0.1,
+                    format="%.2f",
+                    key=f"taxa_antecipacao_{empresa_id_ativo}_{id_op}",
+                )
+            registrar_liquidacao = st.form_submit_button(
+                "💾 Registrar Evento Oficial no Ledger",
+                use_container_width=True,
+            )
+        if registrar_liquidacao:
+            valor_evento = round(float(valor_evento_financeiro), 2)
+            dados_evento = None
+            if tipo_evento_financeiro == "Liquidação Parcial/Integral":
+                if (
+                    valor_evento <= 0
+                    or valor_evento > saldo_operacao
+                    or (
+                        tipo_pagamento == "Integral"
+                        and valor_evento != round(saldo_operacao, 2)
+                    )
+                    or (
+                        tipo_pagamento == "Pagamento parcelado"
+                        and parcela_atual > quantidade_parcelas
+                    )
+                ):
+                    st.error(
+                        f"Informe um valor válido para a modalidade; o saldo em aberto "
+                        f"é R$ {saldo_operacao:,.2f}."
+                    )
+                else:
+                    segregacao = xml_engine.calcular_segregacao_liquidacao(
+                        valor_base_operacao,
+                        ibs_operacao,
+                        cbs_operacao,
+                        valor_evento,
+                        valor_pago_acumulado,
+                    )
+                    tributo_segregado = round(
+                        segregacao["ibs_segregado_atual"]
+                        + segregacao["cbs_segregado_atual"],
+                        2,
+                    )
+                    credito_compensado = min(
+                        saldo_credito_disponivel,
+                        tributo_segregado,
+                    )
+                    retido_caixa = max(0.0, tributo_segregado - credito_compensado)
+                    impacto_banco = round(valor_evento - retido_caixa, 2)
+                    dados_evento = {
+                        "valor_liquidado": valor_evento,
+                        "ibs_segregado": segregacao["ibs_segregado_atual"],
+                        "cbs_segregado": segregacao["cbs_segregado_atual"],
+                        "ibs_pendente": segregacao["ibs_pendente"],
+                        "cbs_pendente": segregacao["cbs_pendente"],
+                        "credito_compensado": round(credito_compensado, 2),
+                        "valor_retido_caixa": round(retido_caixa, 2),
+                        "impacto_banco": impacto_banco,
+                    }
+            elif tipo_evento_financeiro == "Estorno de Transação":
+                if valor_evento <= 0 or valor_evento > valor_pago_acumulado:
+                    st.error(
+                        f"O estorno deve ser maior que zero e não exceder o "
+                        f"valor já liquidado de R$ {valor_pago_acumulado:,.2f}."
+                    )
+                else:
+                    segregacao = xml_engine.calcular_segregacao_liquidacao(
+                        valor_base_operacao,
+                        ibs_operacao,
+                        cbs_operacao,
+                        valor_evento,
+                        valor_pago_acumulado - valor_evento,
+                    )
+                    credito_restituido = (
+                        float(
+                            resumo_eventos_operacao.get(
+                                "credito_compensado_liquido",
+                                0.0,
+                            )
+                        )
+                        * valor_evento
+                        / valor_pago_acumulado
+                        if valor_pago_acumulado
+                        else 0.0
+                    )
+                    retido_restituido = (
+                        float(
+                            resumo_eventos_operacao.get(
+                                "valor_retido_caixa",
+                                0.0,
+                            )
+                        )
+                        * valor_evento
+                        / valor_pago_acumulado
+                        if valor_pago_acumulado
+                        else 0.0
+                    )
+                    dados_evento = {
+                        "valor_liquidado": valor_evento,
+                        "ibs_segregado": segregacao["ibs_segregado_atual"],
+                        "cbs_segregado": segregacao["cbs_segregado_atual"],
+                        "credito_restituido": round(credito_restituido, 2),
+                        "valor_retido_caixa": -round(retido_restituido, 2),
+                        "impacto_banco": -valor_evento,
+                    }
+            elif tipo_evento_financeiro == "Antecipação de Recebíveis (Desconto/Taxa)":
+                if valor_evento <= 0 or valor_evento > saldo_operacao:
+                    st.error(
+                        f"A antecipação deve ser maior que zero e não exceder "
+                        f"o saldo a receber de R$ {saldo_operacao:,.2f}."
+                    )
+                else:
+                    taxa = round(valor_evento * float(taxa_antecipacao) / 100, 2)
+                    dados_evento = {
+                        "valor_liquidado": 0.0,
+                        "valor_antecipado": valor_evento,
+                        "taxa_antecipacao_percentual": float(taxa_antecipacao),
+                        "desconto_antecipacao": taxa,
+                        "impacto_banco": round(valor_evento - taxa, 2),
+                    }
+            else:
+                if valor_evento <= 0:
+                    st.error("Informe o novo valor negociado, maior que zero.")
+                else:
+                    dados_evento = {
+                        "valor_liquidado": 0.0,
+                        "valor_negociado": valor_evento,
+                        "impacto_banco": 0.0,
+                    }
+
+            if dados_evento is not None:
+                evento_financeiro = {
+                    **dados_evento,
+                    "event_id": str(uuid.uuid4()),
+                    "event_type": tipo_evento_financeiro,
+                    "empresa_id": empresa_id_ativo,
+                    "nota_id": nota_danfe.get("id"),
+                    "chave_acesso": nota_danfe.get("chave_acesso"),
+                    "id_op": id_op,
+                    "valor_base_nota": round(valor_base_operacao, 2),
+                    "valor_ibs_total": ibs_operacao,
+                    "valor_cbs_total": cbs_operacao,
+                    "tipo_pagamento": tipo_pagamento,
+                    "parcela_atual": int(parcela_atual),
+                    "quantidade_parcelas": int(quantidade_parcelas),
+                    "usuario": str(
+                        st.session_state.get("auth_username")
+                        or usuario_autenticado
+                    ),
+                    "occurred_at": datetime.now(timezone.utc).isoformat(),
+                }
+                try:
+                    xml_engine.registrar_evento_liquidacao_supabase(
+                        supabase,
+                        empresa_id_ativo,
+                        evento_financeiro,
+                    )
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Falha ao registrar evento financeiro %s para ID_OP %s.",
+                        tipo_evento_financeiro,
+                        id_op,
+                    )
+                    st.error(
+                        "O evento não foi confirmado no ledger fiscal. "
+                        "Nenhuma alteração financeira foi aplicada."
+                    )
+                else:
+                    st.success("Evento financeiro oficial registrado na trilha de auditoria.")
+                    st.rerun()
+
+        eventos_historico_operacao = [
+            evento
+            for evento in eventos_liquidacao
+            if str(evento.get("id_op")) == id_op
+        ]
+        if eventos_historico_operacao:
+            st.markdown("##### 📜 Histórico de Auditoria da Operação")
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Timestamp": evento.get("occurred_at", ""),
+                        "Usuário": evento.get("usuario", ""),
+                        "ID_OP": evento.get("id_op", ""),
+                        "Evento": evento.get("event_type", ""),
+                        "Valor (R$)": float(evento.get("valor_liquidado", 0.0) or 0.0),
+                        "IBS segregado (R$)": float(evento.get("ibs_segregado", 0.0) or 0.0),
+                        "CBS segregado (R$)": float(evento.get("cbs_segregado", 0.0) or 0.0),
+                        "Crédito compensado (R$)": float(evento.get("credito_compensado", 0.0) or 0.0),
+                        "Impacto no saldo líquido (R$)": float(evento.get("impacto_banco", 0.0) or 0.0),
+                    }
+                    for evento in sorted(
+                        eventos_historico_operacao,
+                        key=lambda registro: str(registro.get("occurred_at", "")),
+                        reverse=True,
+                    )
+                ]),
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.caption("Nenhum evento financeiro registrado para este ID_OP.")
+
         chaves_para_baixar = df_notas_marcadas[df_notas_marcadas["Baixar XML"] == True]["Chave de Acesso NF-e"].tolist()
         chave_pacote = f"pacote_xml_{empresa_id_ativo}"
         selecao_atual = tuple(sorted(chaves_para_baixar))
@@ -2768,7 +3342,10 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
             with zipfile.ZipFile(buf_cli, "w", zipfile.ZIP_DEFLATED) as zf_c:
                 for n_obj in notas:
                     if str(n_obj.get("chave_acesso", "")) in chaves_para_baixar:
-                        itens_desta_nf = [i for i in itens if i.get("nota_id") == n_obj.get("id")]
+                        itens_desta_nf = [
+                            i for i in itens
+                            if str(i.get("nota_id")) == str(n_obj.get("id"))
+                        ]
                         xml_rec = str(n_obj.get("xml_reconstruido") or "").strip()
                         if not xml_rec:
                             xml_rec = xml_engine.gerar_xml_reconstruido_cliente(
@@ -2809,7 +3386,14 @@ with st.expander(f"📁 6. Conciliação de Devoluções ({len(devolucoes)} regi
 
 # MÓDULO 7: SIMULADOR ESTRATÉGICO
 @fragment_decorator
-def renderizar_simulador(empresa_ativa: dict, itens_mes: list[dict], devolucoes_empresa_mes: list[dict], empresa_id_ativo: int | str, saldo_credito_disponivel: float) -> None:
+def renderizar_simulador(
+    empresa_ativa: dict,
+    itens_mes: list[dict],
+    devolucoes_empresa_mes: list[dict],
+    empresa_id_ativo: int | str,
+    saldo_credito_disponivel: float,
+    perfil_tributario: dict,
+) -> None:
     def manter_simulador_aberto() -> None:
         st.session_state["modulo_ativo"] = "simulador"
 
@@ -2857,12 +3441,31 @@ def renderizar_simulador(empresa_ativa: dict, itens_mes: list[dict], devolucoes_
                 list(faixas_simples.keys()),
                 key=f"sim_faixa_{empresa_id_ativo}",
             )
-            aliquota_iva = col_in3.number_input(
-                "🏛️ Alíquota Base IBS + CBS (%)",
-                value=26.5,
-                step=0.5,
-                format="%.1f",
-                key=f"sim_aliquota_{empresa_id_ativo}",
+            derivacoes = list(xml_engine.ALIQUOTAS_REFORMA_TRIBUTARIA)
+            derivacao_salva = str(
+                perfil_tributario.get("derivacao_setorial")
+                or derivacoes[0]
+            )
+            derivacao_simulacao = col_in3.selectbox(
+                "🏛️ Derivação IBS + CBS",
+                derivacoes,
+                index=(
+                    derivacoes.index(derivacao_salva)
+                    if derivacao_salva in derivacoes
+                    else 0
+                ),
+                key=f"sim_derivacao_{empresa_id_ativo}",
+            )
+            memoria_simulacao = xml_engine.calcular_memoria_aliquota(
+                derivacao_simulacao
+            )
+            aliquota_iva = float(memoria_simulacao["aliquota_efetiva"])
+            st.caption(
+                f"Base Legal 26,50% (17,70% IBS + 8,80% CBS) → "
+                f"Fator de Redução {memoria_simulacao['fator_reducao']:.0%} → "
+                f"Alíquota Efetiva Final {aliquota_iva:.2f}% "
+                f"(IBS {memoria_simulacao['aliquota_ibs_efetiva']:.2f}% + "
+                f"CBS {memoria_simulacao['aliquota_cbs_efetiva']:.2f}%)."
             )
 
             col_comp1, col_comp2, col_comp3 = st.columns(3)
@@ -2889,7 +3492,30 @@ def renderizar_simulador(empresa_ativa: dict, itens_mes: list[dict], devolucoes_
             )
 
             st.write("")
-            st.form_submit_button("⚡ Aplicar Parâmetros e Calcular Simulação", use_container_width=True, on_click=manter_simulador_aberto)
+            parametros_aplicados = st.form_submit_button(
+                "⚡ Aplicar Parâmetros e Calcular Simulação",
+                use_container_width=True,
+                on_click=manter_simulador_aberto,
+            )
+
+        if parametros_aplicados:
+            try:
+                perfil_tributario = xml_engine.persistir_perfil_tributario_empresa(
+                    supabase,
+                    empresa_id_ativo,
+                    derivacao_simulacao,
+                )
+                st.session_state[
+                    f"perfil_tributario_{empresa_id_ativo}"
+                ] = perfil_tributario
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Falha ao persistir a derivação tributária do simulador para %s.",
+                    empresa_id_ativo,
+                )
+                st.error(
+                    "A simulação foi calculada, mas a derivação não foi persistida no Supabase."
+                )
 
         compras_liquidas_creditaveis = max(
             0.0,
@@ -2998,7 +3624,12 @@ def renderizar_simulador(empresa_ativa: dict, itens_mes: list[dict], devolucoes_
                 """, unsafe_allow_html=True)
 
 renderizar_simulador(
-    empresa_ativa, itens_mes, devolucoes_mes, empresa_id_ativo, saldo_credito_disponivel
+    empresa_ativa,
+    itens_mes,
+    devolucoes_mes,
+    empresa_id_ativo,
+    saldo_credito_disponivel,
+    perfil_tributario_ativo,
 )
 
 # MÓDULO 8: DOSSIÊ EXECUTIVO DE FECHAMENTO
@@ -3011,5 +3642,6 @@ relatorio_engine.renderizar_modulo_relatorio(
     notas,
     itens,
     valor_retido_split_payment,
+    eventos_liquidacao,
 )
 persistir_estado_sessao()

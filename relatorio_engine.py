@@ -376,89 +376,178 @@ def injetar_css_blindado_relatorio():
 
 
 @st.cache_data(show_spinner=False)
-def montar_dataframe_relacional(notas: list, itens: list) -> pd.DataFrame:
-    if not notas:
+def montar_dataframe_relacional(
+    notas: list,
+    itens: list,
+    eventos_liquidacao: list | None = None,
+    empresa_id=None,
+) -> pd.DataFrame:
+    if not notas and not itens:
         return pd.DataFrame()
 
     mapa_notas = {
-        n.get("id", f"sem_id_{idx}"): {
-            "chave_acesso": str(n.get("chave_acesso", "")),
-            "cnpj_emitente": str(n.get("cnpj_emitente", "")),
-            "valor_total_nf": float(n.get("valor_total_nf", 0.0)),
-            "manifestacao_status": str(n.get("manifestacao_status", "")),
-            "hash_sha256_xml": str(n.get("hash_sha256_xml", "")),
+        str(n.get("id", f"sem_id_{idx}")): {
+            **dict(n),
             "data_referencia": n.get("data_emissao") or n.get(
                 "created_at",
                 str(date.today()),
-            )
+            ),
         }
-        for idx, n in enumerate(notas)
+        for idx, n in enumerate(notas or [])
     }
-
-    linhas = []
-    notas_com_itens = set()
-
-    for item_bruto in (itens or []):
+    itens_por_nota: dict[str, list[dict]] = {}
+    for item_bruto in itens or []:
         item = xml_engine.normalizar_item_credito(item_bruto)
-        n_id = item.get("nota_id")
-        notas_com_itens.add(n_id)
-        nota_info = mapa_notas.get(n_id, {})
-        valor_contabil = float(item.get("valor_item", 0.0))
+        itens_por_nota.setdefault(str(item.get("nota_id") or ""), []).append(item)
+
+    resumo_eventos = xml_engine.resumir_eventos_liquidacao(
+        eventos_liquidacao or []
+    )
+    linhas = []
+
+    def data_nota(nota_info: dict):
+        try:
+            data = pd.to_datetime(
+                nota_info.get("data_referencia"),
+                errors="coerce",
+            )
+            return data.date() if not pd.isna(data) else date.today()
+        except (TypeError, ValueError):
+            return date.today()
+
+    def adicionar_linha(item: dict, nota_id: str, nota_info: dict, indice: int):
+        chave = str(nota_info.get("chave_acesso") or "")
+        itens_da_nota = itens_por_nota.get(nota_id, [])
+        valor_base_original = float(
+            nota_info.get("valor_total_nf")
+            or sum(float(registro.get("valor_item", 0.0) or 0.0) for registro in itens_da_nota)
+        )
+        valor_ibs_total = sum(
+            float(registro.get("credito_ibs_gerado", 0.0) or 0.0)
+            for registro in itens_da_nota
+        )
+        valor_cbs_total = sum(
+            float(registro.get("credito_cbs_gerado", 0.0) or 0.0)
+            for registro in itens_da_nota
+        )
+        id_op = xml_engine.calcular_id_operacao(
+            empresa_id or nota_info.get("empresa_id"),
+            nota_info,
+            valor_base_original,
+            valor_ibs_total,
+            valor_cbs_total,
+        )
+        resumo_operacao = resumo_eventos.get(id_op, {})
+        valor_base = float(
+            resumo_operacao.get("valor_negociado")
+            or valor_base_original
+        )
+        valor_item = float(item.get("valor_item", valor_base) or 0.0)
+        soma_itens = sum(
+            float(registro.get("valor_item", 0.0) or 0.0)
+            for registro in itens_da_nota
+        )
+        proporcao_item = (
+            valor_item / soma_itens
+            if soma_itens > 0
+            else 1.0
+        )
         classificacao = str(item.get("classificacao_item", "Não Classificado"))
-        credito_aprovado = float(item.get("valor_credito_item", 0.0))
+        credito_aprovado = float(item.get("valor_credito_item", 0.0) or 0.0)
         credito_quarentena = (
             xml_engine.obter_credito_quarentena(item)
             if classificacao == "Quarentena Uso/Consumo"
             else 0.0
         )
-
-        raw_date = nota_info.get("data_referencia", str(date.today()))
-        try:
-            data_parsed = pd.to_datetime(raw_date).date()
-        except Exception:
-            data_parsed = date.today()
-
+        saldo_aberto = max(
+            0.0,
+            valor_base - float(resumo_operacao.get("valor_pago_acumulado", 0.0)),
+        )
         linhas.append({
-            "ID Registro": f"ITEM-{item.get('id')}",
-            "Data": data_parsed,
-            "CNPJ Fornecedor": nota_info.get("cnpj_emitente", "N/A"),
-            "Chave de Acesso NF-e": nota_info.get("chave_acesso", "N/A"),
+            "ID Registro": f"ITEM-{item.get('id') or indice}",
+            "ID_OP": id_op,
+            "Data": data_nota(nota_info),
+            "CNPJ Fornecedor": str(nota_info.get("cnpj_emitente", "N/A")),
+            "Chave de Acesso NF-e": chave or "N/A",
             "Descrição do Item / Documento": str(item.get("descricao", "")),
             "NCM": str(item.get("ncm", "")),
             "CFOP": str(item.get("cfop", "")),
-            "Valor Contábil (R$)": valor_contabil,
-            "Alíquota (%)": round(float(item.get("aliquota_aplicada", 0.0)) * 100, 2),
+            "Valor Contábil (R$)": valor_item,
+            "Alíquota (%)": round(float(item.get("aliquota_aplicada", 0.0) or 0.0) * 100, 2),
             "Crédito Efetivo (R$)": credito_aprovado,
             "Risco / Quarentena (R$)": credito_quarentena,
             "Status Auditoria": classificacao,
-            "Hash SHA-256": nota_info.get("hash_sha256_xml", "N/A")
+            "Hash SHA-256": str(nota_info.get("hash_sha256_xml", "N/A")),
+            "Receita Operacional / Compras Brutas (R$)": valor_item,
+            "Contas a Receber / Pagar — Saldo em Aberto (R$)": saldo_aberto * proporcao_item,
+            "Banco / Conta Movimento — Liquidação Líquida (R$)": float(
+                resumo_operacao.get("impacto_banco", 0.0)
+            ) * proporcao_item,
+            "IBS/CBS a Recuperar — Crédito Validado (R$)": credito_aprovado,
+            "IBS/CBS Compensados / Recolhidos (R$)": (
+                float(resumo_operacao.get("ibs_segregado", 0.0))
+                + float(resumo_operacao.get("cbs_segregado", 0.0))
+            ) * proporcao_item,
+            "Crédito Digital Compensado no Hub (R$)": float(
+                resumo_operacao.get("credito_compensado_liquido", 0.0)
+            ) * proporcao_item,
+            "Glosa Preventiva / Quarentena (R$)": credito_quarentena,
+            "Status de Conciliação": (
+                "Conciliado via ID_OP"
+                if int(resumo_operacao.get("eventos", 0)) > 0
+                else "Aguardando evento de liquidação"
+            ),
         })
 
-    for n_id, n_info in mapa_notas.items():
-        if n_id not in notas_com_itens:
-            vl_nf = n_info["valor_total_nf"]
-            raw_date = n_info.get("data_referencia", str(date.today()))
-            try:
-                data_parsed = pd.to_datetime(raw_date).date()
-            except Exception:
-                data_parsed = date.today()
+    itens_por_nota_com_chave = set()
+    for nota_id, itens_da_nota in itens_por_nota.items():
+        nota_info = mapa_notas.get(nota_id)
+        if nota_info is None:
+            chave = next(
+                (
+                    str(item.get("chave_acesso") or "")
+                    for item in itens_da_nota
+                    if item.get("chave_acesso")
+                ),
+                "",
+            )
+            nota_info = {
+                "id": nota_id,
+                "chave_acesso": chave,
+                "valor_total_nf": sum(
+                    float(item.get("valor_item", 0.0) or 0.0)
+                    for item in itens_da_nota
+                ),
+                "data_referencia": date.today(),
+                "manifestacao_status": "Nota reconstruída a partir dos itens",
+            }
+        itens_por_nota_com_chave.add(nota_id)
+        for indice, item in enumerate(itens_da_nota, start=1):
+            adicionar_linha(item, nota_id, nota_info, indice)
 
-            linhas.append({
-                "ID Registro": f"NF-{n_id}",
-                "Data": data_parsed,
-                "CNPJ Fornecedor": n_info["cnpj_emitente"],
-                "Chave de Acesso NF-e": n_info["chave_acesso"],
-                "Descrição do Item / Documento": "NF-e Consolidada (Sem itens explodidos)",
-                "NCM": "DIVERSOS",
-                "CFOP": "5102",
-                "Valor Contábil (R$)": vl_nf,
-                "Alíquota (%)": 26.5,
-                "Crédito Efetivo (R$)": round(vl_nf * 0.265, 2),
-                "Risco / Quarentena (R$)": 0.0,
-                "Status Auditoria": n_info["manifestacao_status"] or "Nota Recebida",
-                "Hash SHA-256": n_info["hash_sha256_xml"]
-            })
-
+    for nota_id, nota_info in mapa_notas.items():
+        if nota_id in itens_por_nota_com_chave:
+            continue
+        adicionar_linha(
+            {
+                "id": nota_id,
+                "descricao": "NF-e Consolidada (Sem itens explodidos)",
+                "ncm": "DIVERSOS",
+                "cfop": "5102",
+                "valor_item": float(nota_info.get("valor_total_nf", 0.0) or 0.0),
+                "valor_credito_item": round(
+                    float(nota_info.get("valor_total_nf", 0.0) or 0.0) * 0.265,
+                    2,
+                ),
+                "classificacao_item": nota_info.get(
+                    "manifestacao_status",
+                    "Nota Recebida",
+                ),
+            },
+            nota_id,
+            nota_info,
+            1,
+        )
     return pd.DataFrame(linhas)
 
 
@@ -610,6 +699,17 @@ def gerar_csv_auditado(df_filtrado: pd.DataFrame) -> bytes:
     return df_filtrado.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig") if not df_filtrado.empty else b"Sem dados"
 
 
+def gerar_excel_auditado(df_filtrado: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as escritor:
+        df_filtrado.to_excel(
+            escritor,
+            sheet_name="Ponte Contabil",
+            index=False,
+        )
+    return buffer.getvalue()
+
+
 def renderizar_modulo_relatorio(
     empresa_ativa,
     imposto_bruto_mes,
@@ -619,6 +719,7 @@ def renderizar_modulo_relatorio(
     notas,
     itens,
     valor_retido_split_payment=0.0,
+    eventos_liquidacao=None,
 ):
     injetar_css_blindado_relatorio()
 
@@ -628,7 +729,12 @@ def renderizar_modulo_relatorio(
             unsafe_allow_html=True
         )
 
-        df_completo = montar_dataframe_relacional(notas, itens)
+        df_completo = montar_dataframe_relacional(
+            notas,
+            itens,
+            eventos_liquidacao,
+            empresa_ativa.get("id"),
+        )
 
         status_padrao = [
             "Aprovado Revenda",
@@ -642,10 +748,12 @@ def renderizar_modulo_relatorio(
             status_disponiveis = list(dict.fromkeys(status_padrao + status_presentes))
             fornecedores_disponiveis = ["Todos os Fornecedores"] + sorted(df_completo["CNPJ Fornecedor"].dropna().unique().tolist())
             cfops_disponiveis = ["Todos"] + sorted(df_completo["CFOP"].dropna().unique().tolist())
+            ncm_disponiveis = ["Todos"] + sorted(df_completo["NCM"].dropna().unique().tolist())
         else:
             status_disponiveis = status_padrao
             fornecedores_disponiveis = ["Todos os Fornecedores"]
             cfops_disponiveis = ["Todos"]
+            ncm_disponiveis = ["Todos"]
 
         with st.form(key=f"form_dossie_filtros_{empresa_ativa['id']}", border=False):
             f_col1, f_col2, f_col3 = st.columns([1.2, 1.5, 1.3])
@@ -669,7 +777,7 @@ def renderizar_modulo_relatorio(
                     key=f"flt_forn_{empresa_ativa['id']}"
                 )
 
-            f_col4, f_col5, f_col6 = st.columns([1.5, 1, 1.3])
+            f_col4, f_col5, f_col6, f_col7 = st.columns([1.5, 1, 1.3, 1.2])
             with f_col4:
                 busca_texto = st.text_input(
                     "🔍 Busca Textual",
@@ -686,6 +794,12 @@ def renderizar_modulo_relatorio(
                     value=(data_inicio_padrao, data_hoje),
                     key=f"flt_datas_{empresa_ativa['id']}"
                 )
+            with f_col7:
+                filtro_ncm = st.selectbox(
+                    "🏷️ NCM",
+                    options=ncm_disponiveis,
+                    key=f"flt_ncm_{empresa_ativa['id']}",
+                )
 
             st.write("")
             st.form_submit_button("⚡ Aplicar Filtros na Auditoria", use_container_width=True)
@@ -701,6 +815,8 @@ def renderizar_modulo_relatorio(
                 df_filtrado = df_filtrado[df_filtrado["CNPJ Fornecedor"] == filtro_fornecedor]
             if filtro_cfop != "Todos":
                 df_filtrado = df_filtrado[df_filtrado["CFOP"] == filtro_cfop]
+            if filtro_ncm != "Todos":
+                df_filtrado = df_filtrado[df_filtrado["NCM"] == filtro_ncm]
 
             if isinstance(intervalo_datas, (tuple, list)) and len(intervalo_datas) == 2:
                 d_ini, d_fim = intervalo_datas
@@ -750,6 +866,35 @@ def renderizar_modulo_relatorio(
         </div>
         """, unsafe_allow_html=True)
 
+        st.markdown(
+            "#### 📒 Ponte Contábil Integrada "
+            "(Documento Fiscal → Liquidação → Contabilidade)"
+        )
+        st.caption(
+            "Conciliação por ID_OP; saldos em aberto, movimento bancário, créditos "
+            "validados, compensações/recolhimentos e glosas são derivados dos eventos "
+            "persistidos para cada operação."
+        )
+        colunas_ponte = [
+            "ID_OP",
+            "Receita Operacional / Compras Brutas (R$)",
+            "Contas a Receber / Pagar — Saldo em Aberto (R$)",
+            "Banco / Conta Movimento — Liquidação Líquida (R$)",
+            "IBS/CBS a Recuperar — Crédito Validado (R$)",
+            "IBS/CBS Compensados / Recolhidos (R$)",
+            "Crédito Digital Compensado no Hub (R$)",
+            "Glosa Preventiva / Quarentena (R$)",
+            "Status de Conciliação",
+        ]
+        if not df_filtrado.empty:
+            st.dataframe(
+                df_filtrado[colunas_ponte],
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.info("A Ponte Contábil será preenchida após a importação ou seleção de notas.")
+
         aba_itens, aba_resumo = st.tabs([f"📋 Livro Analítico Filtrado ({qtd_reg} Registros)", "📊 Concentração por CFOP & NCM"])
 
         with aba_itens:
@@ -778,8 +923,9 @@ def renderizar_modulo_relatorio(
             valor_retido_split_payment,
         )
         csv_bytes = gerar_csv_auditado(df_filtrado)
+        excel_bytes = gerar_excel_auditado(df_filtrado)
 
-        b1, b2 = st.columns(2)
+        b1, b2, b3 = st.columns(3)
         with b1:
             st.download_button(
                 label=f"📥 Baixar Dossiê Analítico Completo ({len(df_filtrado)} reg) [.HTML / PDF]",
@@ -790,9 +936,17 @@ def renderizar_modulo_relatorio(
             )
         with b2:
             st.download_button(
-                label="📊 Exportar Planilha Auditada p/ Excel & ERP (.CSV)",
+                label="📊 Arquivo de Integração ERP (.CSV)",
                 data=csv_bytes,
-                file_name=f"Auditoria_Itens_{empresa_ativa['cnpj']}.csv",
+                file_name=f"Integracao_ERP_{empresa_ativa['cnpj']}.csv",
                 mime="text/csv",
                 use_container_width=True
+            )
+        with b3:
+            st.download_button(
+                label="📗 Exportar Ponte Contábil (.XLSX)",
+                data=excel_bytes,
+                file_name=f"Ponte_Contabil_{empresa_ativa['cnpj']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
             )

@@ -1,0 +1,12 @@
+{
+  "users": {
+    "felipebondezzan": {
+      "password_hash": "6051fc84a7a0d74c225fb18a496b09952da5642e60723ecae543298edd7d82d6",
+      "role": "admin",
+      "name": "Felipe Bondezzan (Admin)",
+      "company_id": null,
+      "company_id_synced": null
+    }
+  },
+  "access_logs": []
+}

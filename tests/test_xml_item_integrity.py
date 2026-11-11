@@ -126,6 +126,41 @@ assert xml_engine.obter_credito_quarentena({
     "classificacao_item": "Quarentena Uso/Consumo",
 }) == 0.00
 
+_, aliquota_reducao_60, _ = xml_engine.classificar_item_inteligente(
+    "02032900",
+    "5102",
+    1,
+    100.00,
+    "3",
+    "4711302",
+    False,
+    fator_reducao=0.0,
+)
+assert aliquota_reducao_60 == 0.106
+_, aliquota_zero_cesta, _ = xml_engine.classificar_item_inteligente(
+    "10063021",
+    "5102",
+    1,
+    100.00,
+    "3",
+    "4711302",
+    False,
+    fator_reducao=0.7,
+)
+assert aliquota_zero_cesta == 0.0
+_, aliquota_zero_perfil, _ = xml_engine.classificar_item_inteligente(
+    "33051000",
+    "5102",
+    1,
+    100.00,
+    "3",
+    "9602501",
+    False,
+    "Shampoo profissional",
+    fator_reducao=0.0,
+)
+assert aliquota_zero_perfil == 0.0
+
 itens_stress = _ler_e_classificar(
     [
         (f"Item {indice}", "33051000", 1.00)
