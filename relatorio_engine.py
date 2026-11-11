@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 
 import xml_engine
+import praesidium_persistence_fallback as ppf
 
 
 def _payload_danfe(nota: dict, itens: list[dict], empresa: dict) -> dict:
@@ -382,30 +383,84 @@ def montar_dataframe_relacional(
     eventos_liquidacao: list | None = None,
     empresa_id=None,
 ) -> pd.DataFrame:
+    """
+    REFORMULAÇÃO PROFUNDA para funcionar com [SYS_ITEM] quando itens_nota_fiscal não existe.
+    
+    ESTRATÉGIA CASCATA:
+    1. Se `itens` veio preenchido (lista Python), usa como-está (já decodificado)
+    2. Se `itens` é vazio/None e dados estão em st.session_state fallback, carrega [SYS_ITEM]
+    3. Se ambos falham, reconstrói nota consolidada
+    
+    LÓGICA PRESERVADA 100%:
+    - Mesma estrutura de linhas do relatório
+    - Mesmos cálculos de ID_OP, proporção_item, saldo_aberto
+    - Mesmas colunas de retorno (21 colunas no DataFrame)
+    """
     if not notas and not itens:
         return pd.DataFrame()
 
-    mapa_notas = {
-        str(n.get("id", f"sem_id_{idx}")): {
-            **dict(n),
-            "data_referencia": n.get("data_emissao") or n.get(
-                "created_at",
-                str(date.today()),
-            ),
+    # ESTRATÉGIA 1: Mapear notas recebidas (de lista ou fallback)
+    mapa_notas = {}
+    if notas:
+        mapa_notas = {
+            str(n.get("id", f"sem_id_{idx}")): {
+                **dict(n),
+                "data_referencia": n.get("data_emissao") or n.get("created_at", str(date.today())),
+            }
+            for idx, n in enumerate(notas or [])
         }
-        for idx, n in enumerate(notas or [])
-    }
-    itens_por_nota: dict[str, list[dict]] = {}
-    for item_bruto in itens or []:
-        item = xml_engine.normalizar_item_credito(item_bruto)
-        itens_por_nota.setdefault(str(item.get("nota_id") or ""), []).append(item)
+    elif empresa_id and hasattr(st, 'session_state'):
+        # FALLBACK: Tentar carregar [SYS_NOTA] de session_state
+        fallback_key_notas = f"fallback_notas_{empresa_id}"
+        if fallback_key_notas in st.session_state:
+            notas_fallback = st.session_state[fallback_key_notas]
+            if isinstance(notas_fallback, list):
+                mapa_notas = {
+                    str(n.get("id", f"sem_id_{idx}")): {
+                        **dict(n),
+                        "data_referencia": n.get("data_emissao") or n.get("created_at", str(date.today())),
+                    }
+                    for idx, n in enumerate(notas_fallback)
+                }
 
-    resumo_eventos = xml_engine.resumir_eventos_liquidacao(
-        eventos_liquidacao or []
-    )
+    # ESTRATÉGIA 2: Mapear itens
+    itens_por_nota: dict[str, list[dict]] = {}
+    
+    if itens:
+        # Usar itens recebidos (já decodificados)
+        for item_bruto in itens:
+            item = xml_engine.normalizar_item_credito(item_bruto)
+            nota_id_str = str(item.get("nota_id") or "")
+            itens_por_nota.setdefault(nota_id_str, []).append(item)
+    elif empresa_id and hasattr(st, 'session_state'):
+        # FALLBACK: Tentar carregar [SYS_ITEM] de session_state e decodificar
+        fallback_key_itens = f"fallback_itens_{empresa_id}"
+        if fallback_key_itens in st.session_state:
+            itens_fallback = st.session_state[fallback_key_itens]
+            if isinstance(itens_fallback, list):
+                for item_bruto in itens_fallback:
+                    try:
+                        # Se é string JSON [SYS_ITEM], decodificar
+                        if isinstance(item_bruto, str) and item_bruto.startswith("[SYS_ITEM]"):
+                            item_dict = ppf.decodificar_item(item_bruto)
+                        else:
+                            item_dict = item_bruto
+                        
+                        item = xml_engine.normalizar_item_credito(item_dict)
+                        nota_id_str = str(item.get("nota_id") or "")
+                        itens_por_nota.setdefault(nota_id_str, []).append(item)
+                    except (json.JSONDecodeError, ValueError, AttributeError):
+                        # Se decodificação falhar, usar como-está
+                        item = xml_engine.normalizar_item_credito(item_bruto)
+                        nota_id_str = str(item.get("nota_id") or "")
+                        itens_por_nota.setdefault(nota_id_str, []).append(item)
+
+    # ESTRATÉGIA 3: Resumir eventos de liquidação
+    resumo_eventos = xml_engine.resumir_eventos_liquidacao(eventos_liquidacao or [])
     linhas = []
 
     def data_nota(nota_info: dict):
+        """Extrai data da nota com fallback seguro"""
         try:
             data = pd.to_datetime(
                 nota_info.get("data_referencia"),
@@ -416,6 +471,10 @@ def montar_dataframe_relacional(
             return date.today()
 
     def adicionar_linha(item: dict, nota_id: str, nota_info: dict, indice: int):
+        """
+        Adiciona linha ao DataFrame com TODA a lógica original preservada.
+        Nenhuma mudança funcional — apenas tolerante a [SYS_ITEM] encoding.
+        """
         chave = str(nota_info.get("chave_acesso") or "")
         itens_da_nota = itens_por_nota.get(nota_id, [])
         valor_base_original = float(
@@ -499,6 +558,7 @@ def montar_dataframe_relacional(
             ),
         })
 
+    # ESTRATÉGIA 4: Iterar por notas e itens (lógica original)
     itens_por_nota_com_chave = set()
     for nota_id, itens_da_nota in itens_por_nota.items():
         nota_info = mapa_notas.get(nota_id)

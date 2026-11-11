@@ -19,6 +19,7 @@ from supabase import create_client, Client
 from urllib.parse import urlparse
 import xml_engine
 import relatorio_engine
+import praesidium_persistence_fallback as ppf
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 
 SESSION_TIMESTAMP_RE = re.compile(r"\d{20}")
@@ -1356,50 +1357,86 @@ if aviso_persistencia_conta:
 # ==========================================
 @st.cache_data(ttl=180, show_spinner=False)
 def carregar_todas_empresas_db():
+    """
+    REFORMULAÇÃO: Carrega APENAS clientes reais (não [SYS_*] records).
+    
+    Estratégia:
+    1. Tenta select de colunas explícitas (fallback: select "*")
+    2. Pagina através de todos os registros
+    3. Filtra usando ppf.eh_cliente_real() para descartar TODOS [SYS_*]
+    4. Retorna APENAS clientes reais
+    
+    IMPORTANTE: Preserva fallback para select("*") se coluna não existir.
+    """
     empresas = []
+    
     if supabase is not None:
         tamanho_pagina = 1000
 
         def consultar_empresas(colunas: str) -> list[dict]:
+            """Consulta paginada de empresas com tratamento de erro de coluna."""
             registros = []
             inicio = 0
+            
             while True:
-                resposta = (
-                    supabase.table("empresas_monitoradas")
-                    .select(colunas)
-                    .range(inicio, inicio + tamanho_pagina - 1)
-                    .execute()
-                )
+                try:
+                    resposta = (
+                        supabase.table("empresas_monitoradas")
+                        .select(colunas)
+                        .range(inicio, inicio + tamanho_pagina - 1)
+                        .execute()
+                    )
+                except Exception as e:
+                    # Se falhar por coluna inexistente, re-levanta para retry com select(*)
+                    raise
+
                 pagina = resposta.data or []
                 registros.extend(pagina)
+                
                 if len(pagina) < tamanho_pagina:
                     return registros
+                
                 inicio += tamanho_pagina
 
+        # 1º tentativa: select com colunas explícitas
         try:
             empresas = consultar_empresas(
                 "id,cnpj,razao_social,regime_tributario,cnae_principal,"
                 "certificado_a1_status"
             )
         except Exception:
+            # Se falhar, tenta select("*")
             logging.getLogger(__name__).warning(
-                "Leitura explícita de empresas indisponível; tentando schema completo.",
-                exc_info=True,
+                "Leitura explícita de colunas indisponível; tentando select('*').",
             )
             try:
                 empresas = consultar_empresas("*")
             except Exception:
-                empresas = []
                 logging.getLogger(__name__).exception(
                     "Falha ao carregar empresas do Supabase mesmo com select('*')."
                 )
-    return [
-        empresa for empresa in empresas
-        if str(empresa.get("regime_tributario", "")) not in {"SYS_AUTH", "SYS_LOG"}
-        and not str(empresa.get("razao_social", "")).startswith(
-            (PREFIXO_USUARIO_SISTEMA, PREFIXO_LOG_SISTEMA)
-        )
-    ]
+                empresas = []
+    
+    # ========== FILTRAR [SYS_*] RECORDS ==========
+    # Usar ppf.eh_cliente_real() para filtrar corretamente
+    clientes_reais = []
+    for empresa in empresas:
+        try:
+            razao_social = str(empresa.get("razao_social", ""))
+            regime_tributario = str(empresa.get("regime_tributario", ""))
+            cnae_principal = str(empresa.get("cnae_principal", ""))
+            
+            # Usar função ppf para validar se é cliente real
+            if ppf.eh_cliente_real(razao_social, regime_tributario, cnae_principal):
+                clientes_reais.append(empresa)
+        except Exception as e:
+            logging.getLogger(__name__).debug(
+                "Erro ao validar cliente %s: %s (pulando)",
+                empresa.get("id"),
+                e,
+            )
+    
+    return clientes_reais
 
 
 @st.cache_data(ttl=180, show_spinner=False)
