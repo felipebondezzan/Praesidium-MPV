@@ -861,6 +861,34 @@ def _escrever_ledger_empresa(supabase, empresa_id, chave: str, payload: dict) ->
         except Exception as erro:
             if not _registrar_recurso_ausente(erro, "praesidium_ledger_fiscal"):
                 raise
+    if _espelho_disponivel():
+        # O banco real não tem payload/item_uid no ledger e razao_social é
+        # varchar(255): o espelho (jsonb, record_type 'split_payment') guarda
+        # perfis e eventos de liquidação sem limite de tamanho.
+        try:
+            resposta = (
+                supabase.table("praesidium_empresa_mirror")
+                .upsert(
+                    {
+                        "empresa_id": empresa_id,
+                        "record_type": "split_payment",
+                        "record_key": chave,
+                        "payload": payload,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    on_conflict="empresa_id,record_type,record_key",
+                )
+                .execute()
+            )
+            if resposta.data:
+                return
+        except Exception as erro:
+            if not _registrar_recurso_ausente(erro, "praesidium_empresa_mirror"):
+                logging.getLogger(__name__).warning(
+                    "Espelho indisponível para o ledger da empresa %s: %s",
+                    empresa_id,
+                    erro,
+                )
     if ppf is None:
         raise RuntimeError("Persistência do ledger indisponível.")
     registro = ppf.codificar_registro_ledger(empresa_id, chave, payload)
@@ -922,6 +950,34 @@ def _ler_ledger_empresa(supabase, empresa_id, chave: str | None = None) -> list[
                     empresa_id,
                     erro,
                 )
+    if _espelho_disponivel():
+        try:
+            consulta = (
+                supabase.table("praesidium_empresa_mirror")
+                .select("record_key,payload,updated_at")
+                .eq("empresa_id", empresa_id)
+                .eq("record_type", "split_payment")
+            )
+            if chave:
+                consulta = consulta.eq("record_key", chave)
+            for linha in consulta.execute().data or []:
+                payload = linha.get("payload")
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("record_type") in TIPOS_REGISTRO_LEDGER
+                ):
+                    registros.append({
+                        "item_uid": linha.get("record_key"),
+                        **payload,
+                        "updated_at": payload.get("updated_at") or linha.get("updated_at"),
+                    })
+        except Exception as erro:
+            if not _registrar_recurso_ausente(erro, "praesidium_empresa_mirror"):
+                logging.getLogger(__name__).warning(
+                    "Falha ao ler o ledger do espelho da empresa %s: %s",
+                    empresa_id,
+                    erro,
+                )
     if ppf is None:
         return registros
     try:
@@ -960,7 +1016,11 @@ def carregar_perfil_tributario_empresa(supabase, empresa_id) -> dict:
         empresa_id,
         ppf.CHAVE_LEDGER_PERFIL_TRIBUTARIO if ppf else "config:aliquota-ibs-cbs:v1",
     )
-    payload = registros[-1] if registros else {}
+    payload = max(
+        registros,
+        key=lambda registro: str(registro.get("updated_at", "")),
+        default={},
+    )
     derivacao = str(payload.get("derivacao_setorial") or derivacao_padrao)
     return calcular_memoria_aliquota(derivacao)
 
@@ -1079,6 +1139,12 @@ def normalizar_item_credito(item: dict) -> dict:
             float(normalizado.get("credito_ibs_gerado", 0.0) or 0.0)
             + float(normalizado.get("credito_cbs_gerado", 0.0) or 0.0)
         )
+    for destino, alias in (
+        ("credito_ibs_gerado", "valor_ibs"),
+        ("credito_cbs_gerado", "valor_cbs"),
+    ):
+        if normalizado.get(destino) is None and normalizado.get(alias) is not None:
+            normalizado[destino] = normalizado[alias]
     if not normalizado.get("justificativa_motor"):
         normalizado["justificativa_motor"] = normalizado.get("justificativa", "")
 
@@ -1128,6 +1194,12 @@ _TABELAS_SEM_FALLBACK_LOCAL = frozenset({
     "itens_nota_fiscal",
     "conciliacao_devolucoes",
     "split_payment_events",
+})
+
+
+TIPOS_REGISTRO_LEDGER = frozenset({
+    "split_payment_operation_event",
+    "company_tax_profile",
 })
 
 
@@ -1278,6 +1350,8 @@ def carregar_espelho_empresa(supabase, empresa_id) -> dict[str, list[dict]]:
             if tipo not in registros or not isinstance(dado, dict):
                 continue
             normalizado = dict(dado)
+            if tipo == "split_payment" and normalizado.get("record_type") in TIPOS_REGISTRO_LEDGER:
+                continue
             normalizado.setdefault("empresa_id", empresa_id_str)
             normalizado["_mirror_updated_at"] = linha.get("updated_at")
             if str(normalizado["empresa_id"]) != str(empresa_id_str):
@@ -1410,7 +1484,7 @@ _COLUNAS_NUMERICAS = {
     "valor_total_nf", "valor_item", "valor_total_bruto", "quantidade_comercial",
     "qcom", "aliquota_aplicada", "aliquota_ibs_aplicada", "aliquota_cbs_aplicada",
     "valor_credito_item", "credito_ibs_gerado", "credito_cbs_gerado",
-    "valor_unitario",
+    "valor_unitario", "valor_ibs", "valor_cbs",
 }
 _COLUNAS_ITENS_NFE = {
     "empresa_id", "nota_id", "item_uid", "nitem", "codigo", "descricao",
@@ -1418,8 +1492,14 @@ _COLUNAS_ITENS_NFE = {
     "valor_unitario", "valor_item", "valor_total_bruto", "aliquota_aplicada",
     "aliquota_ibs_aplicada", "aliquota_cbs_aplicada", "valor_credito_item",
     "credito_ibs_gerado", "credito_cbs_gerado", "classificacao_item",
-    "status_credito", "justificativa_motor",
+    "status_credito", "justificativa_motor", "valor_ibs", "valor_cbs",
 }
+# Campos que o banco real não possui e que só sobrevivem no espelho.
+_CAMPOS_SOMENTE_ESPELHO = (
+    "quantidade_comercial", "qcom", "valor_unitario",
+    "credito_ibs_gerado", "credito_cbs_gerado",
+    "aliquota_ibs_aplicada", "aliquota_cbs_aplicada",
+)
 
 
 def _dv_chave_nfe(base: str) -> str:
@@ -1783,6 +1863,8 @@ def sanitizar_payload_supabase(tabela: str, payload, parcial: bool = False):
                     atual[coluna] = _valor_padrao_coluna(tabela, coluna, atual)
             
             # Sanitização rigorosa: conversão explícita de tipos
+            atual.setdefault("valor_ibs", atual.get("credito_ibs_gerado", 0.0))
+            atual.setdefault("valor_cbs", atual.get("credito_cbs_gerado", 0.0))
             for coluna in _COLUNAS_NUMERICAS:
                 if coluna in atual:
                     try:
@@ -2081,6 +2163,39 @@ def _persistir_payload_no_espelho(supabase, tabela: str, registros: list[dict]) 
         return False
 
 
+def _mesclar_com_registros_completos(
+    persistidos: list[dict],
+    completos: list[dict],
+) -> list[dict]:
+    """Devolve o que o banco gravou acrescido das colunas que ele não possui.
+
+    O espelho (jsonb) é o único lugar onde campos ausentes do schema real, como
+    quantidade e IBS/CBS por item, permanecem disponíveis após a hidratação.
+    """
+    por_uid = {
+        str(registro.get("item_uid")): registro
+        for registro in completos
+        if registro.get("item_uid")
+    }
+    mesclados = []
+    for indice, persistido in enumerate(persistidos):
+        completo = por_uid.get(str(persistido.get("item_uid")))
+        if completo is None and len(persistidos) == len(completos):
+            completo = completos[indice]
+        if completo is None:
+            mesclados.append(persistido)
+            continue
+        mesclados.append({
+            **completo,
+            **{
+                chave: valor
+                for chave, valor in persistido.items()
+                if valor is not None
+            },
+        })
+    return mesclados
+
+
 def executar_insert_seguro(
     tabela: str,
     payload,
@@ -2132,6 +2247,7 @@ def executar_insert_seguro(
         return True, mensagem_final, persistidos
 
     colunas_corrigidas = set()
+    registros_completos = [dict(registro) for registro in registros]
     conflito_item_uid = tabela == "itens_nota_fiscal"
     for _ in range(32):
         try:
@@ -2150,6 +2266,10 @@ def executar_insert_seguro(
                 construtor = construtor.insert(dados)
             resultado = construtor.select("*").execute()
             persistidos = resultado.data if resultado.data else registros
+            para_espelho = _mesclar_com_registros_completos(
+                persistidos,
+                registros_completos,
+            )
             
             # REFORMULAÇÃO: Espelho agora é 100% OPCIONAL (best-effort, silencioso)
             # Se os itens foram gravados em itens_nota_fiscal, considera sucesso
@@ -2158,7 +2278,7 @@ def executar_insert_seguro(
                 _persistir_payload_no_espelho(
                     supabase,
                     tabela,
-                    persistidos,
+                    para_espelho,
                 )
             except Exception:
                 logging.getLogger(__name__).debug(
@@ -2883,6 +3003,11 @@ def _excluir_registros_empresa_supabase(
                 "item_uid",
                 ppf.CHAVE_LEDGER_PERFIL_TRIBUTARIO if ppf else "config:aliquota-ibs-cbs:v1",
             )
+        if tabela == "praesidium_empresa_mirror" and preservar_perfil:
+            consulta = consulta.neq(
+                "record_key",
+                ppf.CHAVE_LEDGER_PERFIL_TRIBUTARIO if ppf else "config:aliquota-ibs-cbs:v1",
+            )
         try:
             consulta.execute()
         except Exception as erro:
@@ -3083,6 +3208,8 @@ def hidratar_dados_empresa_supabase(
         if tipo not in espelho or not isinstance(payload, dict):
             continue
         registro = dict(payload)
+        if tipo == "split_payment" and registro.get("record_type") in TIPOS_REGISTRO_LEDGER:
+            continue
         if str(registro.get("empresa_id", empresa_id)) != str(empresa_id):
             continue
         registro.setdefault("empresa_id", empresa_id)
@@ -3157,15 +3284,19 @@ def hidratar_dados_empresa_supabase(
             )
         ):
             itens_por_uid[item_uid] = normalizado
-        elif str(normalizado.get("id", "")).startswith("mirror_"):
-            itens_por_uid[item_uid] = {
-                **normalizado,
-                **{
-                    chave: valor
-                    for chave, valor in existente.items()
-                    if valor is not None
-                },
-            }
+        elif normalizado.get("_mirror_updated_at") is not None:
+            combinado = dict(normalizado)
+            for chave, valor in existente.items():
+                if valor is None:
+                    continue
+                if (
+                    chave in _CAMPOS_SOMENTE_ESPELHO
+                    and valor in (0, 0.0)
+                    and combinado.get(chave) not in (None, 0, 0.0)
+                ):
+                    continue
+                combinado[chave] = valor
+            itens_por_uid[item_uid] = combinado
 
     ids_notas_com_itens = {
         str(item.get("nota_id"))
@@ -3797,9 +3928,11 @@ def _preparar_xml_nfe(
         logging.getLogger(__name__).warning("Arquivo XML malformado ou inválido: %s", ex)
         return None, [], "XML malformado ou inválido. Verifique o arquivo e tente novamente."
 
-    nfe = _xml_filho(raiz, "NFe") or raiz
+    nfe = _xml_filho(raiz, "NFe")
+    if nfe is None:
+        nfe = raiz
     inf_nfe = _xml_filho(nfe, "infNFe")
-    if not inf_nfe:
+    if inf_nfe is None:
         return None, [], "Estrutura fiscal não encontrada no XML."
 
     chave_raw = str(inf_nfe.attrib.get("Id", "")).replace("NFe", "").strip()
@@ -4046,7 +4179,9 @@ def processar_devolucao_nfe_xml(
     except ET.ParseError:
         return False, "XML de devolução inválido."
 
-    nfe = _xml_filho(raiz, "NFe") or raiz
+    nfe = _xml_filho(raiz, "NFe")
+    if nfe is None:
+        nfe = raiz
     inf_nfe = _xml_filho(nfe, "infNFe")
     ide = _xml_filho(inf_nfe, "ide")
     if inf_nfe is None or _xml_texto(ide, "finNFe") != "4":
@@ -4372,7 +4507,9 @@ def processar_xml_lote_bytes(
     for indice, (nome_arquivo, conteudo) in enumerate(arquivos):
         try:
             raiz = ET.fromstring(conteudo)
-            nfe = _xml_filho(raiz, "NFe") or raiz
+            nfe = _xml_filho(raiz, "NFe")
+            if nfe is None:
+                nfe = raiz
             inf_nfe = _xml_filho(nfe, "infNFe")
             ide = _xml_filho(inf_nfe, "ide")
             if _xml_texto(ide, "finNFe") == "4":
@@ -4668,7 +4805,7 @@ def processar_xml_lote_bytes(
 
     st.toast(
         "Notas e itens persistidos com sucesso no Supabase.",
-        icon="✓",
+        icon="✅",
     )
 
     return resultados
@@ -4984,7 +5121,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 f"Simula a busca direta no WebService SEFAZ para **{limpar_tag_tenant_empresa(empresa_ativa['razao_social'])}** "
                 f"(CNAEs: `{empresa_ativa.get('cnae_principal', '4711302')}`)."
             )
-            if st.button("🔄 Sincronizar Lote de Teste SEFAZ", use_container_width=True, key=f"btn_sync_sefaz_{empresa_id_ativo}"):
+            if st.button("🔄 Sincronizar Lote de Teste SEFAZ", width="stretch", key=f"btn_sync_sefaz_{empresa_id_ativo}"):
                 if (
                     empresa_id_ativo is None
                     or str(empresa_ativa.get("id")) != str(empresa_id_ativo)
@@ -5043,6 +5180,13 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 n_id = data_nf[0]["id"]
 
                 novos_itens = []
+                fator_reducao_sim = _float_seguro(
+                    carregar_perfil_tributario_empresa(
+                        supabase,
+                        empresa_id_ativo,
+                    ).get("fator_reducao"),
+                    1.0,
+                )
                 for nitem, (desc, ncm, cfop, qcom, vprod) in enumerate(
                     itens_sim,
                     start=1,
@@ -5056,6 +5200,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                         cnaes_str,
                         False,
                         descricao=desc,
+                        fator_reducao=fator_reducao_sim,
                     )
                     if status_it == "Quarentena Uso/Consumo":
                         aliq = ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA
@@ -5129,7 +5274,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 key=f"xml_up_{empresa_id_ativo}_{st.session_state.get('up_reset', 0)}"
             )
             if arquivos_xml:
-                if st.button("⚡ Auditar e Importar Arquivos Selecionados", use_container_width=True, key=f"btn_proc_xml_{empresa_id_ativo}"):
+                if st.button("⚡ Auditar e Importar Arquivos Selecionados", width="stretch", key=f"btn_proc_xml_{empresa_id_ativo}"):
                     documentos_xml = []
                     indices_documentos = []
                     resultados_lote: list[tuple[bool, str] | None] = [
@@ -5287,7 +5432,7 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
             unsafe_allow_html=True
         )
 
-        if st.button("🚨 Emitir NF-e de Devolução (finNFe=4) e Estornar Crédito", use_container_width=True, key=f"btn_emitir_dev_{item_key_id}"):
+        if st.button("🚨 Emitir NF-e de Devolução (finNFe=4) e Estornar Crédito", width="stretch", key=f"btn_emitir_dev_{item_key_id}"):
             chave_dev = "352611" + "".join([str(random.randint(0, 9)) for _ in range(38)])
             motivo_formatado = f"[{empresa_ativa['cnpj']}] {motivo_dev} - Item: {str(item_alvo.get('descricao', ''))[:35]}"
 
@@ -5337,6 +5482,6 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
                 data=xml_gerado.encode("utf-8"),
                 file_name=f"NFe_Devolucao_{ch_gerada}.xml",
                 mime="application/xml",
-                use_container_width=True,
+                width="stretch",
                 key=f"dl_xml_dev_{empresa_ativa['id']}"
             )

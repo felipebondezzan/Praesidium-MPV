@@ -209,6 +209,8 @@ class FakeSupabase:
         self.tabelas = {nome: [] for nome in SCHEMA}
         self.chamadas = []
         self.erros = []
+
+    def table(self, nome):
         return FakeQuery(self, nome)
 
     def rpc(self, nome, params):

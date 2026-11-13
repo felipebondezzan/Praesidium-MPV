@@ -849,7 +849,7 @@ def renderizar_modulo_relatorio(
                 )
 
             st.write("")
-            st.form_submit_button("⚡ Aplicar Filtros na Auditoria", use_container_width=True)
+            st.form_submit_button("⚡ Aplicar Filtros na Auditoria", width="stretch")
 
         df_filtrado = df_completo.copy()
         if not df_filtrado.empty:
@@ -937,7 +937,7 @@ def renderizar_modulo_relatorio(
             st.dataframe(
                 df_filtrado[colunas_ponte],
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
         else:
             st.info("A Ponte Contábil será preenchida após a importação ou seleção de notas.")
@@ -979,7 +979,7 @@ def renderizar_modulo_relatorio(
                 data=html_analitico.encode("utf-8"),
                 file_name=f"Dossie_Analitico_{empresa_ativa['cnpj']}.html",
                 mime="text/html",
-                use_container_width=True
+                width="stretch"
             )
         with b2:
             st.download_button(
@@ -987,7 +987,7 @@ def renderizar_modulo_relatorio(
                 data=csv_bytes,
                 file_name=f"Integracao_ERP_{empresa_ativa['cnpj']}.csv",
                 mime="text/csv",
-                use_container_width=True
+                width="stretch"
             )
         with b3:
             st.download_button(
@@ -995,5 +995,5 @@ def renderizar_modulo_relatorio(
                 data=excel_bytes,
                 file_name=f"Ponte_Contabil_{empresa_ativa['cnpj']}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+                width="stretch",
             )

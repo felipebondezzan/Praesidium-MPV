@@ -1120,8 +1120,7 @@ def injetar_persistencia_navegador(
 ) -> None:
     token_json = json.dumps(token)
     limpar_json = json.dumps(limpar_token)
-    components.html(
-        f"""
+    html_persistencia = f"""
         <script>
         (() => {{
             const storageKey = "praesidium_session";
@@ -1152,9 +1151,11 @@ def injetar_persistencia_navegador(
             }}
         }})();
         </script>
-        """,
-        height=0,
-    )
+        """
+    if hasattr(st, "iframe"):
+        st.iframe(html_persistencia, height=1)
+    else:
+        components.html(html_persistencia, height=0)
 
 
 # ==========================================
@@ -1241,7 +1242,7 @@ if not st.session_state["autenticado"]:
                 identificacao_input = st.text_input("Usuário")
                 senha_input = st.text_input("Senha", type="password")
                 manter_conectado = st.checkbox("Manter conectado neste aparelho", value=True)
-                btn_entrar = st.form_submit_button("Entrar", use_container_width=True)
+                btn_entrar = st.form_submit_button("Entrar", width="stretch")
             if btn_entrar:
                 username = identificacao_input.lower()
                 if username:
@@ -1278,7 +1279,7 @@ if not st.session_state["autenticado"]:
                 novo_nome_usuario = st.text_input("Nome")
                 novo_usuario_input = st.text_input("Usuário")
                 nova_senha = st.text_input("Senha", type="password")
-                btn_criar_conta = st.form_submit_button("Criar Conta", use_container_width=True)
+                btn_criar_conta = st.form_submit_button("Criar Conta", width="stretch")
             if btn_criar_conta:
                 novo_usuario = novo_usuario_input.lower()
                 if not novo_usuario or not novo_nome_usuario or not nova_senha:
@@ -1758,7 +1759,7 @@ def renderizar_radar_admin() -> None:
         "🔔 Radar de Acessos (Admin)",
         expanded=st.session_state.get("modulo_ativo") == "admin",
     ):
-        if st.button("Atualizar Acessos", use_container_width=True, key="btn_atualizar_acessos"):
+        if st.button("Atualizar Acessos", width="stretch", key="btn_atualizar_acessos"):
             try:
                 atualizar_logs_do_supabase()
                 st.session_state["modulo_ativo"] = "admin"
@@ -1768,7 +1769,7 @@ def renderizar_radar_admin() -> None:
                 st.error("Não foi possível atualizar o histórico pelo Supabase.")
         if st.button(
             "Testar Alerta no Celular",
-            use_container_width=True,
+            width="stretch",
             key="btn_testar_alerta_celular",
         ):
             registrar_e_notificar_acesso(
@@ -1800,7 +1801,7 @@ def renderizar_radar_admin() -> None:
                     for log in reversed(logs_acesso)
                 ]),
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
         else:
             st.caption("Nenhum acesso registrado nos últimos 7 dias.")
@@ -1901,7 +1902,7 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
         st.rerun()
 
     st.write("")
-    if st.button("Salvar Cliente Definitivo", use_container_width=True, key="btn_salvar_cli_def"):
+    if st.button("Salvar Cliente Definitivo", width="stretch", key="btn_salvar_cli_def"):
         if novo_nome and novo_cnpj and cnae_principal_input:
             cnpj_limpo = "".join(filter(str.isdigit, novo_cnpj))
             cnae_prin_limpo = "".join(filter(str.isdigit, cnae_principal_input))
@@ -1931,6 +1932,8 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
             ):
                 st.session_state["empresa_id_ativa"] = empresa_existente["id"]
                 st.session_state.pop(f"empresa_ativa_select_{usuario_autenticado}", None)
+                st.session_state["_forcar_selecao_empresa"] = True
+                persistir_estado_sessao()
                 st.toast("Cliente já cadastrado; selecionado como cliente ativo.", icon="ℹ️")
                 st.rerun()
             else:
@@ -2004,6 +2007,8 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                     if empresa_nova and xml_engine.eh_uuid_valido(empresa_nova.get("id")):
                         st.session_state["empresa_id_ativa"] = empresa_nova["id"]
                         st.session_state.pop(f"empresa_ativa_select_{usuario_autenticado}", None)
+                        st.session_state["_forcar_selecao_empresa"] = True
+                        persistir_estado_sessao()
                     st.sidebar.success("Cliente validado e cadastrado!")
                     st.rerun()
                 else:
@@ -2028,7 +2033,7 @@ if not lista_empresas:
     </div>
     """, unsafe_allow_html=True)
     renderizar_onboarding_vazio()
-    if st.sidebar.button("🔒 Encerrar Sessão", use_container_width=True):
+    if st.sidebar.button("🔒 Encerrar Sessão", width="stretch"):
         encerrar_sessao()
     st.stop()
 
@@ -2059,11 +2064,24 @@ empresa_preferida_index = next(
     ),
     0,
 )
+rotulos_empresas = list(opcoes_empresas.keys())
+selecao_forcada = st.session_state.pop("_forcar_selecao_empresa", False)
+selecao_atual_widget = st.session_state.get(chave_empresa_selecao)
+if selecao_forcada or (
+    selecao_atual_widget is not None and selecao_atual_widget not in opcoes_empresas
+):
+    # Atribuir antes de instanciar o widget garante que o cliente escolhido
+    # (novo, existente ou o próximo após exclusão) vire o cliente ativo.
+    st.session_state[chave_empresa_selecao] = rotulos_empresas[empresa_preferida_index]
 empresa_selecionada_nome = st.sidebar.selectbox(
     "📂 Cliente Ativo Monitorado",
-    list(opcoes_empresas.keys()),
-    index=empresa_preferida_index,
+    rotulos_empresas,
     key=chave_empresa_selecao,
+    **(
+        {}
+        if chave_empresa_selecao in st.session_state
+        else {"index": empresa_preferida_index}
+    ),
 )
 empresa_id_ativo = opcoes_empresas[empresa_selecionada_nome]
 empresa_ativa_bruta = next(
@@ -2167,7 +2185,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
         help="Ex: 9602501 (Salão), 4772500 (Cosméticos), 4711302 (Supermercado)",
         key=f"edit_cnae_{empresa_id_ativo}"
     )
-    if st.button("💾 Salvar Novo CNAE", use_container_width=True, key=f"btn_save_cnae_{empresa_id_ativo}"):
+    if st.button("💾 Salvar Novo CNAE", width="stretch", key=f"btn_save_cnae_{empresa_id_ativo}"):
         owner_tag = extrair_tenant_empresa(empresa_ativa_bruta) or tenant_atual
         cnaes_editados = list(dict.fromkeys(
             "".join(filter(str.isdigit, cnae.strip()))
@@ -2234,7 +2252,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
     )
     if st.button(
         "💾 Salvar Derivação IBS/CBS",
-        use_container_width=True,
+        width="stretch",
         key=f"salvar_perfil_tributario_{empresa_id_ativo}",
     ):
         try:
@@ -2257,7 +2275,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
             )
 
     st.markdown("<hr style='border:0; border-top:1px solid #374151; margin:8px 0;'>", unsafe_allow_html=True)
-    if st.button("🔄 Zerar Notas deste Cliente", use_container_width=True, key=f"btn_reset_nf_{empresa_id_ativo}"):
+    if st.button("🔄 Zerar Notas deste Cliente", width="stretch", key=f"btn_reset_nf_{empresa_id_ativo}"):
         try:
             xml_engine.limpar_dados_empresa_supabase(
                 supabase,
@@ -2279,7 +2297,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
             )
 
     st.markdown("<hr style='border:0; border-top:1px solid #374151; margin:8px 0;'>", unsafe_allow_html=True)
-    if st.button("🗑️ Excluir Cliente Ativo", use_container_width=True, key=f"btn_del_cli_{empresa_id_ativo}"):
+    if st.button("🗑️ Excluir Cliente Ativo", width="stretch", key=f"btn_del_cli_{empresa_id_ativo}"):
         try:
             xml_engine.excluir_empresa_supabase(supabase, empresa_id_ativo)
             st.session_state.pop(f"fallback_notas_{empresa_id_ativo}", None)
@@ -2300,10 +2318,12 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
                 None,
             )
             st.session_state.pop(chave_empresa_selecao, None)
+            st.session_state["_forcar_selecao_empresa"] = True
             if proxima_empresa is None:
                 st.session_state.pop("empresa_id_ativa", None)
             else:
                 st.session_state["empresa_id_ativa"] = proxima_empresa["id"]
+            persistir_estado_sessao()
             st.sidebar.success("Cliente excluído!")
             st.rerun()
         except Exception:
@@ -2315,7 +2335,7 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
                 "A exclusão não foi confirmada. O cliente e os dados permanecem ativos."
             )
 
-if st.sidebar.button("🔒 Encerrar Sessão", use_container_width=True):
+if st.sidebar.button("🔒 Encerrar Sessão", width="stretch"):
     encerrar_sessao()
 
 # ==========================================
@@ -2513,7 +2533,7 @@ with st.expander("📊 Histórico Anual da Empresa (Últimos 12 Meses)", expande
         resumo_anual[1].metric("Aceito / validado", f"R$ {total_aceito_anual:,.2f}")
         resumo_anual[2].metric("Em quarentena", f"R$ {total_pendente_anual:,.2f}")
         resumo_anual[3].metric("Rejeitado / glosado", f"R$ {total_rejeitado_anual:,.2f}")
-        st.dataframe(pd.DataFrame(linhas_historico), hide_index=True, use_container_width=True)
+        st.dataframe(pd.DataFrame(linhas_historico), hide_index=True, width="stretch")
     else:
         st.info("O histórico será consolidado automaticamente após a primeira importação de XML.")
 
@@ -2561,7 +2581,7 @@ with st.expander(f"📁 3. ⚠️ Radar de Contingência & Divergência SEFAZ ({
             }
             for n in notas_contingencia
         ])
-        st.dataframe(df_cont, hide_index=True, use_container_width=True)
+        st.dataframe(df_cont, hide_index=True, width="stretch")
     else:
         st.success(f"✅ Nenhuma nota fiscal em contingência ou divergência pendente para o CNPJ {empresa_ativa['cnpj']}.")
 
@@ -2699,7 +2719,7 @@ def renderizar_fila_quarentena(
                 if aprovar.button(
                     "✅ Liberar Crédito (Aprovar)",
                     key=f"lib_{item_id}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     try:
                         persistir_decisao(
@@ -2732,7 +2752,7 @@ def renderizar_fila_quarentena(
                 if rejeitar.button(
                     "🚫 Bloquear Crédito (Uso/Consumo Definitivo)",
                     key=f"bloq_{item_id}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     try:
                         persistir_decisao(item, "Rejeitado", credito)
@@ -2777,7 +2797,7 @@ def renderizar_fila_quarentena(
                 if aprovar_lote.button(
                     f"✅ Aprovar Itens Selecionados ({len(selecionados)})",
                     key=f"quarentena_aprovar_lote_{empresa_id}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     try:
                         xml_engine.decidir_itens_quarentena_lote(
@@ -2808,7 +2828,7 @@ def renderizar_fila_quarentena(
                 if rejeitar_lote.button(
                     f"🛑 Rejeitar Itens Selecionados ({len(selecionados)})",
                     key=f"quarentena_rejeitar_lote_{empresa_id}",
-                    use_container_width=True,
+                    width="stretch",
                 ):
                     try:
                         xml_engine.decidir_itens_quarentena_lote(
@@ -2852,7 +2872,7 @@ def renderizar_fila_quarentena(
                 }
                 for item in auditados
             ])
-            st.dataframe(df_audit, height=250, hide_index=True, use_container_width=True)
+            st.dataframe(df_audit, height=250, hide_index=True, width="stretch")
         if eventos_liquidacao:
             st.markdown("#### 💳 Histórico de Auditoria Financeira — Split Payment")
             st.dataframe(
@@ -2890,7 +2910,7 @@ def renderizar_fila_quarentena(
                 ]),
                 height=250,
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
 
 
@@ -2925,7 +2945,7 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
             df_exibir,
             height=250,
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             disabled=["Chave de Acesso NF-e", "CNPJ Fornecedor", "Valor Total (R$)", "Status SEFAZ", "Hash SHA-256 (Auditoria)"],
             key=f"editor_notas_acumuladas_{empresa_id_ativo}"
         )
@@ -3007,7 +3027,7 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                 data=pdf_danfe,
                 file_name=f"DANFE_{chave_acesso or nota_id_danfe}.pdf",
                 mime="application/pdf",
-                use_container_width=True,
+                width="stretch",
                 key=f"baixar_danfe_pdf_{empresa_id_ativo}_{nota_id_danfe}",
             )
         with c_xml:
@@ -3023,7 +3043,7 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                 data=xml_danfe.encode("utf-8"),
                 file_name=f"NFe_{chave_acesso or nota_id_danfe}.xml",
                 mime="application/xml",
-                use_container_width=True,
+                width="stretch",
                 key=f"baixar_xml_reconstruido_{empresa_id_ativo}_{nota_id_danfe}",
             )
 
@@ -3077,7 +3097,7 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                     for item in itens_danfe
                 ]),
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
         else:
             st.info("Esta nota não possui itens detalhados persistidos.")
@@ -3150,15 +3170,21 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                 f"CBS R$ {segregacao_acumulada['cbs_pendente']:,.2f}"
             ),
         )
-        with st.form(key=f"form_liquidacao_{empresa_id_ativo}_{id_op}", border=False):
+        qtd_eventos_operacao = sum(
+            1 for evento in eventos_liquidacao if str(evento.get("id_op")) == id_op
+        )
+        # Widgets fora de st.form: o tipo e a modalidade precisam recarregar os
+        # campos condicionais (parcelas, taxa e valor padrão) na hora da escolha.
+        with st.container(border=False):
+            tipos_evento_financeiro = [
+                "Liquidação Parcial/Integral",
+                "Antecipação de Recebíveis (Desconto/Taxa)",
+                "Estorno de Transação",
+                "Alteração/Renegociação de Operação",
+            ]
             tipo_evento_financeiro = st.selectbox(
                 "Evento financeiro auditável",
-                [
-                    "Liquidação Parcial/Integral",
-                    "Antecipação de Recebíveis (Desconto/Taxa)",
-                    "Estorno de Transação",
-                    "Alteração/Renegociação de Operação",
-                ],
+                tipos_evento_financeiro,
                 key=f"tipo_evento_financeiro_{empresa_id_ativo}_{id_op}",
             )
             tipo_pagamento = st.radio(
@@ -3176,6 +3202,9 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                     else valor_base_operacao
                 )
             )
+            sufixo_valor_evento = (
+                f"{tipos_evento_financeiro.index(tipo_evento_financeiro)}_{qtd_eventos_operacao}"
+            )
             valor_evento_financeiro = st.number_input(
                 "Valor efetivamente liquidado / antecipado / ajustado (R$)",
                 min_value=0.0,
@@ -3183,7 +3212,10 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                 value=float(valor_padrao_evento),
                 step=100.0,
                 format="%.2f",
-                key=f"valor_evento_financeiro_{empresa_id_ativo}_{id_op}",
+                key=(
+                    f"valor_evento_financeiro_{empresa_id_ativo}_{id_op}_"
+                    f"{sufixo_valor_evento}"
+                ),
             )
             if tipo_pagamento == "Pagamento parcelado":
                 numero_parcela, total_parcelas = st.columns(2)
@@ -3215,9 +3247,10 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                     format="%.2f",
                     key=f"taxa_antecipacao_{empresa_id_ativo}_{id_op}",
                 )
-            registrar_liquidacao = st.form_submit_button(
+            registrar_liquidacao = st.button(
                 "💾 Registrar Evento Oficial no Ledger",
-                use_container_width=True,
+                width="stretch",
+                key=f"registrar_liquidacao_{empresa_id_ativo}_{id_op}",
             )
         if registrar_liquidacao:
             valor_evento = round(float(valor_evento_financeiro), 2)
@@ -3407,7 +3440,7 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                     )
                 ]),
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
             )
         else:
             st.caption("Nenhum evento financeiro registrado para este ID_OP.")
@@ -3417,7 +3450,7 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
         selecao_atual = tuple(sorted(chaves_para_baixar))
         if chaves_para_baixar and st.button(
             "📦 Preparar Pacote .ZIP das Notas Selecionadas",
-            use_container_width=True,
+            width="stretch",
             key=f"btn_preparar_zip_{empresa_id_ativo}"
         ):
             buf_cli = io.BytesIO()
@@ -3444,7 +3477,7 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                 data=pacote_preparado[1],
                 file_name=f"XMLs_Auditados_{empresa_ativa['cnpj']}.zip",
                 mime="application/zip",
-                use_container_width=True,
+                width="stretch",
                 key=f"btn_dl_notas_cli_{empresa_id_ativo}"
             )
     else:
@@ -3462,7 +3495,7 @@ with st.expander(f"📁 6. Conciliação de Devoluções ({len(devolucoes)} regi
             }
             for d in devolucoes
         ])
-        st.dataframe(df_dev_exibir, height=250, hide_index=True, use_container_width=True)
+        st.dataframe(df_dev_exibir, height=250, hide_index=True, width="stretch")
     else:
         st.info("Nenhuma devolução registrada no período.")
 
@@ -3576,7 +3609,7 @@ def renderizar_simulador(
             st.write("")
             parametros_aplicados = st.form_submit_button(
                 "⚡ Aplicar Parâmetros e Calcular Simulação",
-                use_container_width=True,
+                width="stretch",
                 on_click=manter_simulador_aberto,
             )
 
