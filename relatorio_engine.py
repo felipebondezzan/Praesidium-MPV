@@ -7,7 +7,6 @@ import pandas as pd
 import streamlit as st
 
 import xml_engine
-import praesidium_persistence_fallback as ppf
 
 
 def _payload_danfe(nota: dict, itens: list[dict], empresa: dict) -> dict:
@@ -384,11 +383,11 @@ def montar_dataframe_relacional(
     empresa_id=None,
 ) -> pd.DataFrame:
     """
-    REFORMULAÇÃO PROFUNDA para funcionar com [SYS_ITEM] quando itens_nota_fiscal não existe.
-    
+    Monta o DataFrame relacional a partir das notas e itens hidratados do Supabase.
+
     ESTRATÉGIA CASCATA:
-    1. Se `itens` veio preenchido (lista Python), usa como-está (já decodificado)
-    2. Se `itens` é vazio/None e dados estão em st.session_state fallback, carrega [SYS_ITEM]
+    1. Se `itens` veio preenchido (lista Python), usa como-está
+    2. Se `itens` é vazio/None e há dados em st.session_state fallback, usa-os
     3. Se ambos falham, reconstrói nota consolidada
     
     LÓGICA PRESERVADA 100%:
@@ -410,7 +409,7 @@ def montar_dataframe_relacional(
             for idx, n in enumerate(notas or [])
         }
     elif empresa_id and hasattr(st, 'session_state'):
-        # FALLBACK: Tentar carregar [SYS_NOTA] de session_state
+        # FALLBACK: notas mantidas na sessão
         fallback_key_notas = f"fallback_notas_{empresa_id}"
         if fallback_key_notas in st.session_state:
             notas_fallback = st.session_state[fallback_key_notas]
@@ -433,27 +432,15 @@ def montar_dataframe_relacional(
             nota_id_str = str(item.get("nota_id") or "")
             itens_por_nota.setdefault(nota_id_str, []).append(item)
     elif empresa_id and hasattr(st, 'session_state'):
-        # FALLBACK: Tentar carregar [SYS_ITEM] de session_state e decodificar
+        # Itens mantidos na sessão enquanto a hidratação do Supabase não retorna.
         fallback_key_itens = f"fallback_itens_{empresa_id}"
         if fallback_key_itens in st.session_state:
             itens_fallback = st.session_state[fallback_key_itens]
             if isinstance(itens_fallback, list):
                 for item_bruto in itens_fallback:
-                    try:
-                        # Se é string JSON [SYS_ITEM], decodificar
-                        if isinstance(item_bruto, str) and item_bruto.startswith("[SYS_ITEM]"):
-                            item_dict = ppf.decodificar_item(item_bruto)
-                        else:
-                            item_dict = item_bruto
-                        
-                        item = xml_engine.normalizar_item_credito(item_dict)
-                        nota_id_str = str(item.get("nota_id") or "")
-                        itens_por_nota.setdefault(nota_id_str, []).append(item)
-                    except (json.JSONDecodeError, ValueError, AttributeError):
-                        # Se decodificação falhar, usar como-está
-                        item = xml_engine.normalizar_item_credito(item_bruto)
-                        nota_id_str = str(item.get("nota_id") or "")
-                        itens_por_nota.setdefault(nota_id_str, []).append(item)
+                    item = xml_engine.normalizar_item_credito(item_bruto)
+                    nota_id_str = str(item.get("nota_id") or "")
+                    itens_por_nota.setdefault(nota_id_str, []).append(item)
 
     # ESTRATÉGIA 3: Resumir eventos de liquidação
     resumo_eventos = xml_engine.resumir_eventos_liquidacao(eventos_liquidacao or [])
@@ -473,7 +460,7 @@ def montar_dataframe_relacional(
     def adicionar_linha(item: dict, nota_id: str, nota_info: dict, indice: int):
         """
         Adiciona linha ao DataFrame com TODA a lógica original preservada.
-        Nenhuma mudança funcional — apenas tolerante a [SYS_ITEM] encoding.
+        Nenhuma mudança funcional na lógica original do relatório.
         """
         chave = str(nota_info.get("chave_acesso") or "")
         itens_da_nota = itens_por_nota.get(nota_id, [])

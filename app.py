@@ -476,12 +476,24 @@ def chave_log_acesso(log: dict) -> tuple:
     )
 
 
+def cnpjs_usuario_sistema(usuario: str) -> list[str]:
+    """Identificadores do usuário em empresas_monitoradas.cnpj (VARCHAR(14)).
+
+    O primeiro é o atual (hash de 14 caracteres); o legado `USR_<login>` só é
+    considerado quando cabe nos 14 caracteres da coluna.
+    """
+    identificadores = [ppf.cnpj_usuario_sistema(usuario)]
+    legado = f"USR_{usuario}"
+    if len(legado) <= ppf.TAMANHO_MAXIMO_CNPJ:
+        identificadores.append(legado)
+    return identificadores
+
+
 def usuario_from_row(row: dict) -> tuple[str, dict] | None:
     cnpj = str(row.get("cnpj", ""))
     razao_social = str(row.get("razao_social", ""))
-    if not cnpj.startswith("USR_") or not razao_social.startswith(PREFIXO_USUARIO_SISTEMA):
+    if not razao_social.startswith(PREFIXO_USUARIO_SISTEMA):
         return None
-    username = cnpj[4:].lower()
     registro_usuario = razao_social[len(PREFIXO_USUARIO_SISTEMA):]
     try:
         dados = json.loads(registro_usuario)
@@ -495,18 +507,26 @@ def usuario_from_row(row: dict) -> tuple[str, dict] | None:
             "password_hash": campos[1],
             "company_id": campos[2] if len(campos) == 3 else None,
         }
-    if not username or not isinstance(dados, dict):
+    if not isinstance(dados, dict):
+        return None
+    username = str(dados.get("username") or "").strip().lower()
+    if not username and cnpj.startswith("USR_"):
+        username = cnpj[4:].lower()
+    if not username:
         return None
     password_hash = str(dados.get("password_hash", ""))
     nome = str(dados.get("name", ""))
     if not password_hash or not nome:
         return None
+    company_id = dados.get("company_id")
+    if not xml_engine.eh_uuid_valido(company_id):
+        company_id = None
     return username, {
         "password_hash": password_hash,
         "role": "contador",
         "name": nome,
-        "company_id": dados.get("company_id"),
-        "company_id_synced": dados.get("company_id"),
+        "company_id": company_id,
+        "company_id_synced": company_id,
     }
 
 
@@ -636,19 +656,21 @@ def filtrar_logs_ultimos_sete_dias(logs: list[dict]) -> list[dict]:
 
 
 def payload_usuario_supabase(usuario: str, dados_usuario: dict) -> dict:
+    company_id = dados_usuario.get("company_id")
     return {
-        "cnpj": f"USR_{usuario}",
+        "cnpj": ppf.cnpj_usuario_sistema(usuario),
         "razao_social": PREFIXO_USUARIO_SISTEMA + json.dumps(
             {
+                "username": usuario,
                 "name": dados_usuario["name"],
                 "password_hash": dados_usuario["password_hash"],
-                "company_id": dados_usuario.get("company_id"),
+                "company_id": company_id if xml_engine.eh_uuid_valido(company_id) else None,
             },
             ensure_ascii=False,
             separators=(",", ":"),
         ),
-        "regime_tributario": "SYS_AUTH",
-        "cnae_principal": "0000000",
+        "regime_tributario": ppf.REGIME_TRIBUTARIO_AUTH,
+        "cnae_principal": ppf.CNAE_REGISTRO_SISTEMA,
     }
 
 
@@ -658,8 +680,8 @@ def persistir_usuario_supabase(usuario: str, dados_usuario: dict) -> None:
     registro = payload_usuario_supabase(usuario, dados_usuario)
     existente = (
         supabase.table("empresas_monitoradas")
-        .select("id")
-        .eq("cnpj", registro["cnpj"])
+        .select("cnpj")
+        .in_("cnpj", cnpjs_usuario_sistema(usuario))
         .eq("regime_tributario", "SYS_AUTH")
         .execute()
     )
@@ -668,7 +690,7 @@ def persistir_usuario_supabase(usuario: str, dados_usuario: dict) -> None:
             supabase,
             "empresas_monitoradas",
             registro,
-            {"cnpj": registro["cnpj"], "regime_tributario": "SYS_AUTH"},
+            {"cnpj": existente.data[0]["cnpj"], "regime_tributario": "SYS_AUTH"},
         )
     else:
         ok, mensagem, _ = xml_engine.executar_insert_seguro(
@@ -685,7 +707,7 @@ def criar_usuario_supabase(usuario: str, dados_usuario: dict) -> None:
     existente = (
         supabase.table("empresas_monitoradas")
         .select("cnpj")
-        .eq("cnpj", registro["cnpj"])
+        .in_("cnpj", cnpjs_usuario_sistema(usuario))
         .eq("regime_tributario", "SYS_AUTH")
         .execute()
     )
@@ -704,7 +726,7 @@ def buscar_usuario_persistido(usuario: str) -> dict | None:
     resposta = (
         supabase.table("empresas_monitoradas")
         .select("cnpj,razao_social,regime_tributario,cnae_principal")
-        .eq("cnpj", f"USR_{usuario}")
+        .in_("cnpj", cnpjs_usuario_sistema(usuario))
         .eq("regime_tributario", "SYS_AUTH")
         .execute()
     )
@@ -1626,8 +1648,7 @@ def combinar_registros_com_sessao(
     return list(combinados.values())
 
 
-def hidratar_dados_empresa_supabase(empresa_id: int | str) -> dict[str, list[dict]]:
-    global supabase
+def hidratar_dados_empresa_supabase(empresa_id: str) -> dict[str, list[dict]]:
     if str(empresa_ativa.get("id", "")) != str(empresa_id):
         raise ValueError("A empresa ativa não corresponde à seleção atual.")
     cache_hidratacao = st.session_state.setdefault(
@@ -1640,31 +1661,21 @@ def hidratar_dados_empresa_supabase(empresa_id: int | str) -> dict[str, list[dic
             empresa_id,
             empresa_ativa,
         )
-    except RuntimeError as erro_hidratacao:
+    except RuntimeError:
         logging.getLogger(__name__).warning(
-            "Reconectando ao Supabase após falha de hidratação da empresa %s: %s",
+            "Hidratação indisponível para a empresa %s; usando o último snapshot válido.",
             empresa_id,
-            erro_hidratacao,
         )
-        try:
-            iniciar_conexao_supabase.clear()
-            supabase = iniciar_conexao_supabase()
-            dados = xml_engine.hidratar_dados_empresa_supabase(
-                supabase,
-                empresa_id,
-                empresa_ativa,
-            )
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "A reconexão automática ao Supabase não recuperou a empresa %s.",
-                empresa_id,
-            )
-            dados = xml_engine.hidratar_dados_empresa_com_cache(
-                supabase,
-                empresa_id,
-                empresa_ativa,
-                cache_hidratacao,
-            )
+        dados = xml_engine.hidratar_dados_empresa_com_cache(
+            supabase,
+            empresa_id,
+            empresa_ativa,
+            cache_hidratacao,
+        )
+        return dados
+    snapshot = cache_hidratacao.get(str(empresa_id))
+    if dados.get("_falha_hidratacao") and snapshot is not None:
+        return snapshot
     cache_hidratacao[str(empresa_id)] = dados
     for nome in (
         "fallback_notas",
@@ -1823,10 +1834,19 @@ except RuntimeError:
     logging.getLogger(__name__).exception("Falha ao carregar clientes.")
     st.toast("Não foi possível carregar os clientes agora. Tente novamente.", icon="⚠️")
     st.stop()
-todas_empresas_brutas = combinar_registros_com_sessao(
-    todas_empresas_brutas,
-    st.session_state.get("fallback_empresas", []),
-)
+def empresa_eh_cliente_real(empresa: dict) -> bool:
+    """Cliente real do escritório: UUID válido e fora dos registros [SYS_*]."""
+    return xml_engine.eh_uuid_valido(empresa.get("id")) and ppf.eh_cliente_real(
+        str(empresa.get("razao_social", "")),
+        str(empresa.get("regime_tributario", "")),
+        str(empresa.get("cnae_principal", "")),
+    )
+
+
+todas_empresas_brutas = [
+    empresa for empresa in todas_empresas_brutas if empresa_eh_cliente_real(empresa)
+]
+st.session_state.pop("fallback_empresas", None)
 
 # Administrador: radar global de acessos e visão multi-tenant.
 if is_admin:
@@ -1899,6 +1919,20 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                     f"❌ CNAE inválido: {', '.join(cnaes_invalidos_cad)}. "
                     f"Digite um CNAE real de 7 dígitos (Ex: 4711302 p/ Supermercado, 9602501 p/ Salão, 4772500 p/ Cosméticos)."
                 )
+            elif len(cnpj_limpo) != 14:
+                st.sidebar.error("❌ CNPJ inválido: informe exatamente 14 dígitos.")
+            elif empresa_existente := next(
+                (
+                    empresa for empresa in todas_empresas_brutas
+                    if "".join(filter(str.isdigit, str(empresa.get("cnpj", "")))) == cnpj_limpo
+                    and extrair_tenant_empresa(empresa) == tenant_atual
+                ),
+                None,
+            ):
+                st.session_state["empresa_id_ativa"] = empresa_existente["id"]
+                st.session_state.pop(f"empresa_ativa_select_{usuario_autenticado}", None)
+                st.toast("Cliente já cadastrado; selecionado como cliente ativo.", icon="ℹ️")
+                st.rerun()
             else:
                 cnaes_secundarios = ",".join(todos_cnaes_unicos[1:])
                 status_certificado = "Ativo"
@@ -1967,9 +2001,10 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                             )
                     st.session_state["cnae_secundarios_extras"] = []
                     limpar_caches_dados()
+                    if empresa_nova and xml_engine.eh_uuid_valido(empresa_nova.get("id")):
+                        st.session_state["empresa_id_ativa"] = empresa_nova["id"]
+                        st.session_state.pop(f"empresa_ativa_select_{usuario_autenticado}", None)
                     st.sidebar.success("Cliente validado e cadastrado!")
-                    if msg_ins != "OK":
-                        st.toast("Cliente mantido nesta sessão enquanto o banco está indisponível.", icon="ℹ️")
                     st.rerun()
                 else:
                     if "api key" in msg_ins.lower() or "invalid jwt" in msg_ins.lower():
@@ -2031,6 +2066,17 @@ empresa_selecionada_nome = st.sidebar.selectbox(
     key=chave_empresa_selecao,
 )
 empresa_id_ativo = opcoes_empresas[empresa_selecionada_nome]
+empresa_ativa_bruta = next(
+    (
+        e for e in lista_empresas
+        if e["id"] == empresa_id_ativo and empresa_eh_cliente_real(e)
+    ),
+    None,
+)
+if empresa_ativa_bruta is None:
+    # Registros [SYS_*] nunca podem ser o cliente ativo.
+    empresa_ativa_bruta = next(e for e in lista_empresas if empresa_eh_cliente_real(e))
+    empresa_id_ativo = empresa_ativa_bruta["id"]
 st.session_state["empresa_id_ativa"] = empresa_id_ativo
 if sessao_ativa is not None:
     with registro_global["lock"]:
@@ -2058,7 +2104,6 @@ if (
         salvar_cache_local()
     except Exception:
         logging.getLogger(__name__).exception("Falha ao salvar a última empresa ativa localmente.")
-empresa_ativa_bruta = next((e for e in lista_empresas if e["id"] == empresa_id_ativo), lista_empresas[0])
 tenant_empresa_ativa = extrair_tenant_empresa(empresa_ativa_bruta)
 nome_dono_ativo = (
     registro_global["users"].get(tenant_empresa_ativa, {}).get("name", tenant_empresa_ativa)

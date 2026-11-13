@@ -59,6 +59,15 @@ CODIGO_ERRO_PATTERN = re.compile(r"""['"]code['"]\s*:\s*['"]([A-Z0-9]+)['"]""")
 COLUNA_ERRO_PATTERNS = (
     re.compile(r"""column\s+['"]([^'"]+)['"]""", re.IGNORECASE),
     re.compile(r"""['"]([^'"]+)['"]\s+column""", re.IGNORECASE),
+    re.compile(r"""column\s+(?:[\w$]+\.)*([\w$]+)\s+does not exist""", re.IGNORECASE),
+)
+SINTAXE_INVALIDA_PATTERN = re.compile(
+    r"""invalid input syntax for (?:type )?([\w ]+?):\s*"(.*?)"(?=\s*$|'\s*[,}])""",
+    re.IGNORECASE | re.DOTALL,
+)
+VALOR_LONGO_PATTERN = re.compile(
+    r"""value too long for type character varying\((\d+)\)""",
+    re.IGNORECASE,
 )
 
 _limpador_cache_dados = None
@@ -67,6 +76,120 @@ _gateway_last_request_by_tenant: dict[str, float] = {}
 _gateway_request_interval = 1.0
 _gateway_max_retries = 2
 _CNPJ_PATTERN = re.compile(r"\D")
+
+# Recursos (tabelas/colunas) que o Supabase real já informou não existirem.
+# O cache vale para o processo inteiro porque o schema é o mesmo em todas as
+# sessões; expira para que uma migração aplicada seja reconhecida sem restart.
+_RECURSOS_AUSENTES: dict[str, float] = {}
+_TTL_RECURSO_AUSENTE_SEGUNDOS = 900.0
+_CODIGOS_TABELA_AUSENTE = {"42P01", "PGRST205"}
+_CODIGOS_COLUNA_AUSENTE = {"42703", "PGRST204"}
+
+# Tipos/limites aprendidos com erros 22P02/22001 do banco real.
+_TIPOS_COLUNAS_APRENDIDOS: dict[tuple[str, str], str] = {}
+_LIMITES_VARCHAR_APRENDIDOS: dict[tuple[str, str], int] = {}
+
+_TIPOS_COLUNAS_ESTATICOS: dict[str, dict[str, str]] = {
+    "empresas_monitoradas": {"id": "uuid"},
+    "notas_fiscais_recebidas": {
+        "id": "uuid",
+        "empresa_id": "uuid",
+        "valor_total_nf": "numeric",
+    },
+    "itens_nota_fiscal": {
+        "id": "uuid",
+        "empresa_id": "uuid",
+        "nota_id": "uuid",
+        "nitem": "integer",
+    },
+    "conciliacao_devolucoes": {
+        "id": "uuid",
+        "empresa_id": "uuid",
+        "nota_original_id": "uuid",
+        "valor_mercadoria_devolvida": "numeric",
+        "credito_estornado": "numeric",
+    },
+    "split_payment_events": {
+        "id": "uuid",
+        "empresa_id": "uuid",
+        "gross_amount": "numeric",
+        "retained_amount": "numeric",
+    },
+}
+_LIMITES_VARCHAR_ESTATICOS: dict[tuple[str, str], int] = {
+    ("empresas_monitoradas", "cnpj"): 14,
+}
+_COLUNAS_INTEIRAS_GENERICAS = {"nitem", "numero_item"}
+_PREFIXOS_COLUNAS_NUMERICAS = ("valor_", "aliquota_", "credito_", "quantidade_")
+_COLUNAS_NUMERICAS_GENERICAS = {"qcom"}
+_COLUNAS_CODIGO_CURTO = {"cnpj", "cnae_principal", "cnpj_emitente", "crt_emitente"}
+_FORMATO_CODIGO_NUMERICO = re.compile(r"^[\d.\-/\s]+$")
+
+
+def eh_uuid_valido(valor) -> bool:
+    """True somente para UUIDs canônicos (a única forma aceita em id/empresa_id)."""
+    if isinstance(valor, uuid.UUID):
+        return True
+    if not isinstance(valor, str):
+        return False
+    texto = valor.strip().lower()
+    try:
+        return str(uuid.UUID(texto)) == texto
+    except (ValueError, AttributeError):
+        return False
+
+
+def _recurso_ausente(tabela: str, coluna: str | None = None) -> bool:
+    agora = time.monotonic()
+    for chave in (tabela, f"{tabela}.{coluna}" if coluna else None):
+        if chave is None:
+            continue
+        expira_em = _RECURSOS_AUSENTES.get(chave)
+        if expira_em is None:
+            continue
+        if expira_em > agora:
+            return True
+        _RECURSOS_AUSENTES.pop(chave, None)
+    return False
+
+
+def _marcar_recurso_ausente(tabela: str, coluna: str | None = None) -> None:
+    chave = f"{tabela}.{coluna}" if coluna else tabela
+    _RECURSOS_AUSENTES[chave] = time.monotonic() + _TTL_RECURSO_AUSENTE_SEGUNDOS
+
+
+def _registrar_recurso_ausente(erro: Exception, tabela: str) -> bool:
+    """Memoriza tabela/coluna inexistente (42P01/PGRST205/42703/PGRST204)."""
+    codigo = _codigo_erro_supabase(erro)
+    if codigo in _CODIGOS_TABELA_AUSENTE:
+        _marcar_recurso_ausente(tabela)
+        return True
+    if codigo in _CODIGOS_COLUNA_AUSENTE:
+        coluna = _coluna_erro_supabase(erro)
+        if coluna:
+            _marcar_recurso_ausente(tabela, coluna)
+            return True
+    return False
+
+
+def limpar_cache_recursos_ausentes() -> None:
+    _RECURSOS_AUSENTES.clear()
+    _TIPOS_COLUNAS_APRENDIDOS.clear()
+    _LIMITES_VARCHAR_APRENDIDOS.clear()
+
+
+def _ledger_fiscal_disponivel() -> bool:
+    return not any(
+        _recurso_ausente("praesidium_ledger_fiscal", coluna)
+        for coluna in (None, "payload", "item_uid", "empresa_id")
+    )
+
+
+def _espelho_disponivel() -> bool:
+    return not any(
+        _recurso_ausente("praesidium_empresa_mirror", coluna)
+        for coluna in (None, "payload", "record_key", "record_type")
+    )
 
 
 def _ler_configuracao_secreta(nome: str) -> str:
@@ -690,6 +813,8 @@ def registrar_evento_liquidacao_supabase(
         raise ValueError("O evento financeiro não possui ID_OP.")
     if not str(evento.get("event_id") or "").strip():
         raise ValueError("O evento financeiro não possui identificador único.")
+    if not eh_uuid_valido(empresa_id):
+        raise ValueError("A empresa ativa não possui um UUID válido.")
     agora = datetime.now(timezone.utc).isoformat()
     evento_persistido = {
         **evento,
@@ -697,46 +822,145 @@ def registrar_evento_liquidacao_supabase(
         "empresa_id": empresa_id,
         "occurred_at": str(evento.get("occurred_at") or agora),
     }
-    resposta = (
-        supabase.table("praesidium_ledger_fiscal")
-        .upsert(
-            {
-                "empresa_id": empresa_id,
-                "item_uid": f"split-event:{evento_persistido['event_id']}",
-                "payload": evento_persistido,
-                "updated_at": agora,
-            },
-            on_conflict="empresa_id,item_uid",
-        )
-        .select("item_uid")
-        .execute()
+    _escrever_ledger_empresa(
+        supabase,
+        empresa_id,
+        f"split-event:{evento_persistido['event_id']}",
+        evento_persistido,
     )
-    if not resposta.data:
-        raise RuntimeError("O Supabase não confirmou a gravação do evento financeiro.")
     limpar_caches_dados()
     return evento_persistido
 
 
+def _escrever_ledger_empresa(supabase, empresa_id, chave: str, payload: dict) -> None:
+    """Grava `payload` sob (empresa_id, chave).
+
+    Usa praesidium_ledger_fiscal apenas quando o banco real possui as colunas
+    `payload`/`item_uid`; caso contrário grava o registro [SYS_LEDGER] em
+    empresas_monitoradas (cnpj de 14 caracteres, sem coluna empresa_id).
+    """
+    if _ledger_fiscal_disponivel():
+        agora = datetime.now(timezone.utc).isoformat()
+        try:
+            resposta = (
+                supabase.table("praesidium_ledger_fiscal")
+                .upsert(
+                    {
+                        "empresa_id": empresa_id,
+                        "item_uid": chave,
+                        "payload": payload,
+                        "updated_at": agora,
+                    },
+                    on_conflict="empresa_id,item_uid",
+                )
+                .select("item_uid")
+                .execute()
+            )
+            if resposta.data:
+                return
+        except Exception as erro:
+            if not _registrar_recurso_ausente(erro, "praesidium_ledger_fiscal"):
+                raise
+    if ppf is None:
+        raise RuntimeError("Persistência do ledger indisponível.")
+    registro = ppf.codificar_registro_ledger(empresa_id, chave, payload)
+    filtros = {
+        "cnpj": registro["cnpj"],
+        "regime_tributario": ppf.REGIME_TRIBUTARIO_LEDGER,
+    }
+    existente = (
+        supabase.table("empresas_monitoradas")
+        .select("id")
+        .eq("regime_tributario", filtros["regime_tributario"])
+        .eq("cnpj", filtros["cnpj"])
+        .limit(1)
+        .execute()
+    )
+    if existente.data:
+        ok, mensagem, _ = executar_update_seguro(
+            supabase,
+            "empresas_monitoradas",
+            registro,
+            filtros,
+        )
+    else:
+        ok, mensagem, _ = executar_insert_seguro(
+            "empresas_monitoradas",
+            registro,
+            supabase=supabase,
+        )
+    if not ok:
+        raise RuntimeError(mensagem)
+
+
+def _ler_ledger_empresa(supabase, empresa_id, chave: str | None = None) -> list[dict]:
+    """Payloads do ledger da empresa (ledger fiscal e/ou [SYS_LEDGER])."""
+    if supabase is None or not eh_uuid_valido(empresa_id):
+        return []
+    registros: list[dict] = []
+    if _ledger_fiscal_disponivel():
+        try:
+            consulta = (
+                supabase.table("praesidium_ledger_fiscal")
+                .select("item_uid,payload,updated_at")
+                .eq("empresa_id", empresa_id)
+            )
+            if chave:
+                consulta = consulta.eq("item_uid", chave)
+            for linha in consulta.execute().data or []:
+                payload = linha.get("payload")
+                if isinstance(payload, dict):
+                    registros.append({
+                        "item_uid": linha.get("item_uid"),
+                        "updated_at": linha.get("updated_at"),
+                        **payload,
+                    })
+        except Exception as erro:
+            if not _registrar_recurso_ausente(erro, "praesidium_ledger_fiscal"):
+                logging.getLogger(__name__).warning(
+                    "Falha ao ler o ledger fiscal da empresa %s: %s",
+                    empresa_id,
+                    erro,
+                )
+    if ppf is None:
+        return registros
+    try:
+        consulta = (
+            supabase.table("empresas_monitoradas")
+            .select("id,cnpj,razao_social,regime_tributario")
+            .eq("regime_tributario", ppf.REGIME_TRIBUTARIO_LEDGER)
+        )
+        if chave:
+            consulta = consulta.eq("cnpj", ppf.cnpj_registro_ledger(empresa_id, chave))
+        else:
+            consulta = consulta.like(
+                "cnpj",
+                f"{ppf.prefixo_cnpj_ledger_empresa(empresa_id)}%",
+            )
+        for linha in consulta.execute().data or []:
+            payload = ppf.decodificar_ledger(linha)
+            if payload and str(payload.get("empresa_id")) == str(empresa_id):
+                payload.pop("_sys_id", None)
+                registros.append(payload)
+    except Exception as erro:
+        logging.getLogger(__name__).warning(
+            "Falha ao ler o ledger [SYS_LEDGER] da empresa %s: %s",
+            empresa_id,
+            erro,
+        )
+    return registros
+
+
 def carregar_perfil_tributario_empresa(supabase, empresa_id) -> dict:
     derivacao_padrao = "Base Padrão Integral — 26,50% (Sem redutor)"
-    if supabase is None or not empresa_id:
+    if supabase is None or not eh_uuid_valido(empresa_id):
         return calcular_memoria_aliquota(derivacao_padrao)
-    try:
-        resposta = (
-            supabase.table("praesidium_ledger_fiscal")
-            .select("payload")
-            .eq("empresa_id", empresa_id)
-            .eq("item_uid", "config:aliquota-ibs-cbs:v1")
-            .limit(1)
-            .execute()
-        )
-    except Exception:
-        logging.getLogger(__name__).exception(
-            "Falha ao carregar o perfil tributário da empresa %s.",
-            empresa_id,
-        )
-        return calcular_memoria_aliquota(derivacao_padrao)
-    payload = (resposta.data or [{}])[0].get("payload") or {}
+    registros = _ler_ledger_empresa(
+        supabase,
+        empresa_id,
+        ppf.CHAVE_LEDGER_PERFIL_TRIBUTARIO if ppf else "config:aliquota-ibs-cbs:v1",
+    )
+    payload = registros[-1] if registros else {}
     derivacao = str(payload.get("derivacao_setorial") or derivacao_padrao)
     return calcular_memoria_aliquota(derivacao)
 
@@ -748,7 +972,7 @@ def persistir_perfil_tributario_empresa(
 ) -> dict[str, float | str]:
     if supabase is None:
         raise RuntimeError("Supabase indisponível para salvar o perfil tributário.")
-    if not empresa_id:
+    if not eh_uuid_valido(empresa_id):
         raise ValueError("Empresa inválida para salvar o perfil tributário.")
     if derivacao not in ALIQUOTAS_REFORMA_TRIBUTARIA:
         raise ValueError("Derivação setorial inválida.")
@@ -759,22 +983,12 @@ def persistir_perfil_tributario_empresa(
         "empresa_id": empresa_id,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    resposta = (
-        supabase.table("praesidium_ledger_fiscal")
-        .upsert(
-            {
-                "empresa_id": empresa_id,
-                "item_uid": "config:aliquota-ibs-cbs:v1",
-                "payload": payload,
-                "updated_at": payload["updated_at"],
-            },
-            on_conflict="empresa_id,item_uid",
-        )
-        .select("item_uid")
-        .execute()
+    _escrever_ledger_empresa(
+        supabase,
+        empresa_id,
+        ppf.CHAVE_LEDGER_PERFIL_TRIBUTARIO if ppf else "config:aliquota-ibs-cbs:v1",
+        payload,
     )
-    if not resposta.data:
-        raise RuntimeError("O Supabase não confirmou o perfil tributário.")
     limpar_caches_dados()
     return memoria
 
@@ -906,6 +1120,15 @@ _TIPOS_ESPELHO = {
     "conciliacao_devolucoes": "devolucao",
     "split_payment_events": "split_payment",
 }
+# Nunca recebem fallback de sessão: um id gerado fora do banco quebraria as
+# consultas por UUID e criaria clientes "fantasmas" na interface.
+_TABELAS_SEM_FALLBACK_LOCAL = frozenset({
+    "empresas_monitoradas",
+    "notas_fiscais_recebidas",
+    "itens_nota_fiscal",
+    "conciliacao_devolucoes",
+    "split_payment_events",
+})
 
 
 def _chave_registro_espelho(tipo: str, registro: dict) -> str:
@@ -935,7 +1158,9 @@ def persistir_espelho_empresa(
     tipo: str,
     registros: list[dict] | dict,
 ) -> bool:
-    if supabase is None or not empresa_id or not tipo:
+    if supabase is None or not eh_uuid_valido(empresa_id) or not tipo:
+        return False
+    if not _espelho_disponivel():
         return False
     entradas = registros if isinstance(registros, list) else [registros]
     payload = []
@@ -964,48 +1189,60 @@ def persistir_espelho_empresa(
     if not payload:
         return True
     for inicio in range(0, len(payload), 25):
+        lote = payload[inicio:inicio + 25]
         try:
-            lote = payload[inicio:inicio + 25]
             supabase.table("praesidium_empresa_mirror").upsert(
                 lote,
                 on_conflict="empresa_id,record_type,record_key",
             ).execute()
-            if tipo == "item":
-                ledger = [
-                    {
-                        "empresa_id": entrada["empresa_id"],
-                        "item_uid": entrada["record_key"],
-                        "payload": entrada["payload"],
-                        "updated_at": entrada["updated_at"],
-                    }
-                    for entrada in lote
-                ]
+        except Exception as erro:
+            if _registrar_recurso_ausente(erro, "praesidium_empresa_mirror"):
+                logging.getLogger(__name__).debug(
+                    "Espelho praesidium_empresa_mirror ausente no banco real; "
+                    "desativado nesta execução."
+                )
+            else:
+                logging.getLogger(__name__).exception(
+                    "Falha ao persistir o espelho %s da empresa %s.",
+                    tipo,
+                    empresa_id,
+                )
+            return False
+        if tipo == "item" and _ledger_fiscal_disponivel():
+            ledger = [
+                {
+                    "empresa_id": entrada["empresa_id"],
+                    "item_uid": entrada["record_key"],
+                    "payload": entrada["payload"],
+                    "updated_at": entrada["updated_at"],
+                }
+                for entrada in lote
+            ]
+            try:
                 supabase.table("praesidium_ledger_fiscal").upsert(
                     ledger,
                     on_conflict="empresa_id,item_uid",
                 ).execute()
-        except Exception:
-            logging.getLogger(__name__).exception(
-                "Falha ao persistir o espelho %s da empresa %s.",
-                tipo,
-                empresa_id,
-            )
-            return False
+            except Exception as erro:
+                if not _registrar_recurso_ausente(erro, "praesidium_ledger_fiscal"):
+                    logging.getLogger(__name__).exception(
+                        "Falha ao persistir o ledger do espelho da empresa %s.",
+                        empresa_id,
+                    )
+                    return False
     return True
 
 
 def carregar_espelho_empresa(supabase, empresa_id) -> dict[str, list[dict]]:
-    """
-    REFORMULAÇÃO: Carrega espelho de persistência com 3 estratégias em cascata:
-    
-    1. Tenta ler praesidium_empresa_mirror (pode não existir em prod real)
-    2. Se falhar com 42P01/PGRST205, tenta ler [SYS_ITEM], [SYS_NOTA], [SYS_EVENT] direto
-    3. Se tudo falhar, retorna vazio (fallback graceful)
-    
+    """Carrega o espelho persistente (praesidium_empresa_mirror) da empresa.
+
+    Se a tabela/colunas não existirem no banco real, o espelho é desativado
+    (cache em memória) e a função retorna estruturas vazias.
+
     Returns:
         dict com chaves "item", "devolucao", "split_payment" (lista de dicts)
     """
-    if supabase is None or not empresa_id:
+    if supabase is None or not eh_uuid_valido(empresa_id) or not _espelho_disponivel():
         return {"item": [], "devolucao": [], "split_payment": []}
     
     empresa_id_str = str(empresa_id)
@@ -1063,138 +1300,15 @@ def carregar_espelho_empresa(supabase, empresa_id) -> dict[str, list[dict]]:
         return registros
     
     except Exception as e:
-        codigo = _codigo_erro_supabase(e)
-        if codigo not in {"42P01", "PGRST205"}:
-            # Erro diferente de "tabela não existe"
+        if _registrar_recurso_ausente(e, "praesidium_empresa_mirror"):
+            log.debug(
+                "praesidium_empresa_mirror ausente no banco real; espelho desativado."
+            )
+        else:
             log.exception(
                 "Falha ao carregar o espelho persistente da empresa %s.",
                 empresa_id_str,
             )
-            return {"item": [], "devolucao": [], "split_payment": []}
-        
-        # Tabela não existe - tentar fallback [SYS_*]
-        log.debug(
-            "praesidium_empresa_mirror não existe; tentando [SYS_ITEM]/[SYS_EVENT]"
-        )
-    
-    # ========== ESTRATÉGIA 2: Ler [SYS_ITEM] e [SYS_EVENT] direto ==========
-    registros: dict[str, list[dict]] = {
-        "item": [],
-        "devolucao": [],
-        "split_payment": [],
-    }
-    
-    try:
-        # Buscar [SYS_NOTA] para mapear nota_ids
-        linhas_sys_nota = []
-        inicio = 0
-        while True:
-            resposta = (
-                supabase.table("empresas_monitoradas")
-                .select("*")
-                .eq("regime_tributario", "SYS_NOTA")
-                .eq("cnae_principal", empresa_id_str)
-                .range(inicio, inicio + 999)
-                .execute()
-            )
-            pagina = resposta.data or []
-            linhas_sys_nota.extend(pagina)
-            if len(pagina) < 1000:
-                break
-            inicio += 1000
-        
-        # Mapear nota_ids
-        nota_ids = set()
-        for record in linhas_sys_nota:
-            try:
-                nota = ppf.decodificar_nota(record)
-                nota_id = nota.get("id")
-                if nota_id:
-                    nota_ids.add(str(nota_id))
-            except Exception:
-                pass
-        
-        # Buscar [SYS_ITEM] records para esta empresa (via nota_ids)
-        linhas_sys_item = []
-        inicio = 0
-        while True:
-            resposta = (
-                supabase.table("empresas_monitoradas")
-                .select("*")
-                .eq("regime_tributario", "SYS_ITEM")
-                .range(inicio, inicio + 999)
-                .execute()
-            )
-            pagina = resposta.data or []
-            # Filtrar apenas registros cujo cnae_principal (nota_id) pertence a esta empresa
-            for rec in pagina:
-                if str(rec.get("cnae_principal", "")) in nota_ids:
-                    linhas_sys_item.append(rec)
-            if len(pagina) < 1000:
-                break
-            inicio += 1000
-        
-        # Processar [SYS_ITEM]
-        for record in linhas_sys_item:
-            try:
-                item = ppf.decodificar_item(record)
-                item.setdefault("empresa_id", empresa_id_str)
-                item["_mirror_updated_at"] = record.get("updated_at")
-                item.setdefault("id", f"sys_item_{record.get('id', '')}")
-                
-                registros["item"].append(item)
-                log.debug(
-                    "Carregado [SYS_ITEM] id=%s de mirror para empresa %s",
-                    item.get("id"),
-                    empresa_id_str,
-                )
-            except Exception as ex:
-                log.debug("Erro decodificar [SYS_ITEM]: %s", ex)
-        
-        # Buscar [SYS_EVENT] (eventos de split payment)
-        linhas_sys_event = []
-        inicio = 0
-        while True:
-            resposta = (
-                supabase.table("empresas_monitoradas")
-                .select("*")
-                .eq("regime_tributario", "SYS_EVENT")
-                .eq("cnae_principal", empresa_id_str)
-                .range(inicio, inicio + 999)
-                .execute()
-            )
-            pagina = resposta.data or []
-            linhas_sys_event.extend(pagina)
-            if len(pagina) < 1000:
-                break
-            inicio += 1000
-        
-        # Processar [SYS_EVENT]
-        for record in linhas_sys_event:
-            try:
-                evento = ppf.decodificar_evento_financeiro(record)
-                evento.setdefault("empresa_id", empresa_id_str)
-                evento["_mirror_updated_at"] = record.get("updated_at")
-                evento.setdefault("id", f"sys_event_{record.get('id', '')}")
-                
-                registros["split_payment"].append(evento)
-                log.debug(
-                    "Carregado [SYS_EVENT] id=%s de mirror para empresa %s",
-                    evento.get("id"),
-                    empresa_id_str,
-                )
-            except Exception as ex:
-                log.debug("Erro decodificar [SYS_EVENT]: %s", ex)
-        
-        log.info(
-            "Espelho [SYS_*] carregado: %d itens, %d eventos",
-            len(registros["item"]),
-            len(registros["split_payment"]),
-        )
-        return registros
-    
-    except Exception as e:
-        log.debug("Falha ao carregar espelho [SYS_*]: %s", e)
         return {"item": [], "devolucao": [], "split_payment": []}
 
 
@@ -1327,6 +1441,28 @@ def gerar_chave_acesso_padrao() -> str:
     return base + _dv_chave_nfe(base)
 
 
+def _empresa_id_sessao_valida():
+    empresa_id = st.session_state.get("empresa_id_ativa")
+    return empresa_id if eh_uuid_valido(empresa_id) else None
+
+
+def _tipo_coluna(tabela: str, coluna: str) -> str:
+    """Tipo lógico (uuid/integer/numeric/text) conhecido ou aprendido do banco real."""
+    aprendido = _TIPOS_COLUNAS_APRENDIDOS.get((tabela, coluna))
+    if aprendido:
+        return aprendido
+    estatico = _TIPOS_COLUNAS_ESTATICOS.get(tabela, {}).get(coluna)
+    if estatico:
+        return estatico
+    if coluna in _COLUNAS_INTEIRAS_GENERICAS:
+        return "integer"
+    if coluna in _COLUNAS_NUMERICAS or coluna in _COLUNAS_NUMERICAS_GENERICAS or (
+        coluna.startswith(_PREFIXOS_COLUNAS_NUMERICAS)
+    ):
+        return "numeric"
+    return "text"
+
+
 def _valor_padrao_coluna(tabela: str, coluna: str, registro: dict | None = None):
     registro = registro or {}
     padroes = {
@@ -1338,7 +1474,7 @@ def _valor_padrao_coluna(tabela: str, coluna: str, registro: dict | None = None)
             "certificado_a1_status": "Não informado",
         },
         "notas_fiscais_recebidas": {
-            "empresa_id": st.session_state.get("empresa_id_ativa", ""),
+            "empresa_id": _empresa_id_sessao_valida(),
             "crt_emitente": "3",
             "razao_social_emitente": _FORNECEDOR_PADRAO,
             "nome_emitente": _FORNECEDOR_PADRAO,
@@ -1351,15 +1487,14 @@ def _valor_padrao_coluna(tabela: str, coluna: str, registro: dict | None = None)
             "regra_tributaria_version": _VERSAO_REGRA_PADRAO,
             "versao_regra": _VERSAO_REGRA_PADRAO,
             "data_emissao": datetime.now().isoformat(),
-            "hash_sha256_xml": "",
         },
         "itens_nota_fiscal": {
-            "empresa_id": st.session_state.get("empresa_id_ativa", ""),
-            "nota_id": "",
-            "ncm": "",
-            "cfop": "",
-            "descricao": "",
-            "descricao_produto": "",
+            "empresa_id": _empresa_id_sessao_valida(),
+            "nota_id": None,
+            "ncm": "00000000",
+            "cfop": "0000",
+            "descricao": "N/A",
+            "descricao_produto": "N/A",
             "quantidade_comercial": 0.0,
             "valor_item": 0.0,
             "valor_total_bruto": 0.0,
@@ -1376,11 +1511,188 @@ def _valor_padrao_coluna(tabela: str, coluna: str, registro: dict | None = None)
     }
     if coluna in padroes.get(tabela, {}):
         return padroes[tabela][coluna]
-    if coluna in _COLUNAS_NUMERICAS or coluna.startswith(
-        ("valor_", "aliquota_", "credito_", "quantidade_")
-    ):
+    tipo = _tipo_coluna(tabela, coluna)
+    if tipo == "numeric":
         return 0.0
-    return ""
+    if tipo == "integer":
+        return 0
+    if tipo == "uuid":
+        return None
+    return "N/A"
+
+
+def _para_inteiro(valor):
+    """Converte para int ou retorna None quando não há dígitos aproveitáveis."""
+    if isinstance(valor, bool):
+        return int(valor)
+    if isinstance(valor, int):
+        return valor
+    if isinstance(valor, float):
+        return int(valor) if math.isfinite(valor) else None
+    if isinstance(valor, Decimal):
+        return int(valor) if valor.is_finite() else None
+    texto = str(valor).strip()
+    if re.fullmatch(r"[+-]?\d+", texto):
+        return int(texto)
+    try:
+        numero = float(texto.replace(",", "."))
+        if math.isfinite(numero):
+            return int(numero)
+    except ValueError:
+        pass
+    digitos = re.sub(r"\D", "", texto)
+    return int(digitos) if digitos else None
+
+
+def _para_numero(valor):
+    """Converte para float ou retorna None quando o valor não é numérico."""
+    if isinstance(valor, bool):
+        return None
+    if isinstance(valor, (int, float, Decimal)):
+        convertido = float(valor)
+        return convertido if math.isfinite(convertido) else None
+    texto = str(valor).strip()
+    if "," in texto and "." not in texto:
+        texto = texto.replace(",", ".")
+    try:
+        convertido = float(texto)
+    except ValueError:
+        return None
+    return convertido if math.isfinite(convertido) else None
+
+
+def _limitar_texto_coluna(tabela: str, coluna: str, valor: str, limite: int) -> str:
+    """Ajusta códigos curtos (cnpj/cnae) ao VARCHAR(n) sem corromper o formato."""
+    if coluna in _COLUNAS_CODIGO_CURTO and _FORMATO_CODIGO_NUMERICO.fullmatch(valor):
+        valor = re.sub(r"\D", "", valor)
+    return valor[:limite]
+
+
+def _sanitizar_payload_postgres(
+    tabela: str,
+    registro: dict,
+    vazio_como_none: bool = False,
+) -> dict:
+    """Garante que o registro respeita os tipos reais do Postgres antes do envio.
+
+    - strings vazias/brancas nunca são enviadas (a chave é removida, ou vira
+      None em atualizações para limpar a coluna);
+    - colunas inteiras/numéricas recebem int/float; valores não numéricos saem;
+    - colunas uuid só aceitam UUID canônico; ids falsos (``local_...``) saem;
+    - colunas VARCHAR(n) conhecidas/aprendidas são limitadas ao tamanho real;
+    - ``empresas_monitoradas`` não possui a coluna ``empresa_id``.
+    """
+    limpo: dict = {}
+    for coluna, valor in dict(registro).items():
+        if tabela == "empresas_monitoradas" and coluna == "empresa_id":
+            continue
+        if isinstance(valor, str) and not valor.strip():
+            if vazio_como_none:
+                limpo[coluna] = None
+            continue
+        if valor is None or isinstance(valor, (bool, dict, list)):
+            limpo[coluna] = valor
+            continue
+        tipo = _tipo_coluna(tabela, coluna)
+        if tipo == "uuid":
+            if not eh_uuid_valido(valor):
+                continue
+            valor = str(valor).strip().lower()
+        elif tipo == "integer":
+            valor = _para_inteiro(valor)
+            if valor is None:
+                continue
+        elif tipo == "numeric":
+            valor = _para_numero(valor)
+            if valor is None:
+                continue
+        elif isinstance(valor, str):
+            limite = _LIMITES_VARCHAR_APRENDIDOS.get(
+                (tabela, coluna)
+            ) or _LIMITES_VARCHAR_ESTATICOS.get((tabela, coluna))
+            if limite:
+                valor = _limitar_texto_coluna(tabela, coluna, valor.strip(), limite)
+                if not valor:
+                    continue
+            elif tabela == "empresas_monitoradas" and coluna == "cnae_principal":
+                if _FORMATO_CODIGO_NUMERICO.fullmatch(valor.strip()):
+                    valor = re.sub(r"\D", "", valor)
+        limpo[coluna] = valor
+    return limpo
+
+
+def _aprender_erro_tipo_postgres(
+    tabela: str,
+    dados,
+    erro: Exception,
+) -> bool:
+    """Interpreta 22P02/22001, corrige `dados` in-place e informa se houve mudança.
+
+    22P02 (``invalid input syntax for type X: "valor"``): localiza as colunas cujo
+    valor coincide com o literal rejeitado, converte quando possível ou remove.
+    22001 (``value too long for type character varying(n)``): trunca as colunas
+    de código curto que excedem n e memoriza o limite para as próximas gravações.
+    """
+    codigo = _codigo_erro_supabase(erro)
+    mensagem = str(getattr(erro, "message", None) or erro)
+    registros = dados if isinstance(dados, list) else [dados]
+    alterou = False
+
+    if codigo == "22001":
+        correspondencia = VALOR_LONGO_PATTERN.search(mensagem)
+        if not correspondencia:
+            return False
+        limite = int(correspondencia.group(1))
+        for registro in registros:
+            for coluna in list(registro):
+                valor = registro[coluna]
+                if (
+                    coluna in _COLUNAS_CODIGO_CURTO
+                    and isinstance(valor, str)
+                    and len(valor) > limite
+                ):
+                    registro[coluna] = _limitar_texto_coluna(
+                        tabela, coluna, valor, limite
+                    )
+                    _LIMITES_VARCHAR_APRENDIDOS[(tabela, coluna)] = limite
+                    alterou = True
+        return alterou
+
+    if codigo != "22P02":
+        return False
+    correspondencia = SINTAXE_INVALIDA_PATTERN.search(mensagem.replace("\\'", "'"))
+    if not correspondencia:
+        return False
+    tipo_pg = correspondencia.group(1).strip().lower()
+    literal = correspondencia.group(2)
+    if "uuid" in tipo_pg:
+        tipo_logico = "uuid"
+    elif any(parte in tipo_pg for parte in ("int", "serial")):
+        tipo_logico = "integer"
+    elif any(parte in tipo_pg for parte in ("numeric", "double", "real", "decimal")):
+        tipo_logico = "numeric"
+    else:
+        tipo_logico = None
+    for registro in registros:
+        for coluna in list(registro):
+            valor = registro[coluna]
+            if isinstance(valor, (bool, dict, list)) or valor is None:
+                continue
+            if str(valor) != literal:
+                continue
+            if tipo_logico:
+                _TIPOS_COLUNAS_APRENDIDOS[(tabela, coluna)] = tipo_logico
+            convertido = None
+            if tipo_logico == "integer":
+                convertido = _para_inteiro(valor) if literal.strip() else None
+            elif tipo_logico == "numeric":
+                convertido = _para_numero(valor)
+            if convertido is None:
+                registro.pop(coluna, None)
+            else:
+                registro[coluna] = convertido
+            alterou = True
+    return alterou
 
 
 def sanitizar_payload_supabase(tabela: str, payload, parcial: bool = False):
@@ -1426,7 +1738,6 @@ def sanitizar_payload_supabase(tabela: str, payload, parcial: bool = False):
             crt = str(atual.get("crt_emitente", "")).strip()
             atual["crt_emitente"] = crt if crt in {"1", "2", "3"} else "3"
             atual.setdefault("data_emissao", datetime.now().isoformat())
-            atual.setdefault("hash_sha256_xml", "")
             atual.setdefault("status_manifestacao", atual["manifestacao_status"])
         elif tabela == "itens_nota_fiscal" and not parcial:
             aliases_numericos = {
@@ -1518,7 +1829,9 @@ def sanitizar_payload_supabase(tabela: str, payload, parcial: bool = False):
                     atual[coluna] = padrao
             for coluna in ("gross_amount", "retained_amount"):
                 atual[coluna] = _float_seguro(atual.get(coluna), 0.0)
-        sanitizados.append(atual)
+        sanitizados.append(
+            _sanitizar_payload_postgres(tabela, atual, vazio_como_none=parcial)
+        )
     return sanitizados if isinstance(payload, list) else sanitizados[0]
 
 
@@ -1673,11 +1986,11 @@ def _guardar_fallback(tabela: str, payload, operacao: str = "insert", filtros: d
             )
             continue
         if tabela == "notas_fiscais_recebidas" and not registro.get("id"):
-            registro["id"] = f"local_{uuid.uuid4().hex}"
+            registro["id"] = str(uuid.uuid4())
         elif tabela == "itens_nota_fiscal" and not registro.get("id"):
-            registro["id"] = f"local_{uuid.uuid4().hex}"
+            registro["id"] = str(uuid.uuid4())
         elif tabela in {"empresas_monitoradas", "conciliacao_devolucoes"} and not registro.get("id"):
-            registro["id"] = f"local_{uuid.uuid4().hex}"
+            registro["id"] = str(uuid.uuid4())
 
         if operacao == "update":
             registro.update(registro_original)
@@ -1734,69 +2047,38 @@ def _remover_coluna(payload, coluna: str) -> None:
 
 
 def _persistir_payload_no_espelho(supabase, tabela: str, registros: list[dict]) -> bool:
-    """
-    Persiste registros no espelho (praesidium_empresa_mirror/ledger).
-    AGORA: Completamente OPCIONAL (best-effort). Falhas são apenas logs, não impedem sucesso.
-    Razão: Supabase real pode não ter essas tabelas se migrações SQL não rodaram.
-    
-    CACHE DE FALHAS: Se a tabela foi marcada como inexistente em session_state,
-    pula a tentativa para evitar requisições HTTP desnecessárias.
+    """Persiste registros no espelho (best-effort).
+
+    O espelho/ledger pode não existir no Supabase real; nesse caso
+    `persistir_espelho_empresa` desativa o recurso via cache em memória e esta
+    função apenas retorna False, sem poluir o log.
     """
     tipo = _TIPOS_ESPELHO.get(tabela)
     if not tipo or not registros:
         return False
     empresa_ids = {str(registro.get("empresa_id", "")) for registro in registros}
-    if len(empresa_ids) != 1 or not next(iter(empresa_ids)):
+    if len(empresa_ids) != 1 or not eh_uuid_valido(next(iter(empresa_ids))):
         logging.getLogger(__name__).debug(
             "Espelho: Lote sem empresa única na tabela %s; pulando.",
             tabela,
         )
         return False
-    
-    # Verifica cache de falhas (tabelas que não existem no Supabase real desta sessão)
     try:
-        import streamlit as st
-        tabelas_inexistentes_cache = st.session_state.get("_TABELAS_INEXISTENTES_CACHE", set())
-        if tabela in tabelas_inexistentes_cache:
-            logging.getLogger(__name__).debug(
-                "Tabela %s marcada como inexistente; pulando (cache)",
-                tabela,
-            )
-            return False
-    except (ImportError, RuntimeError):
-        tabelas_inexistentes_cache = set()
-    
-    try:
-        result = persistir_espelho_empresa(
+        return persistir_espelho_empresa(
             supabase,
             next(iter(empresa_ids)),
             tipo,
             registros,
         )
-        return result
     except Exception as erro:
-        codigo = _codigo_erro_supabase(erro)
-        if codigo in {"42P01", "PGRST205"}:
-            # Marca tabela como inexistente no cache
-            try:
-                import streamlit as st
-                if "_TABELAS_INEXISTENTES_CACHE" not in st.session_state:
-                    st.session_state["_TABELAS_INEXISTENTES_CACHE"] = set()
-                st.session_state["_TABELAS_INEXISTENTES_CACHE"].add(tabela)
-            except (ImportError, RuntimeError):
-                pass
-            logging.getLogger(__name__).debug(
-                "Tabela %s não existe no Supabase real (42P01); cacheado para próximas tentativas",
-                tabela,
-            )
-        else:
-            logging.getLogger(__name__).debug(
-                "Espelho indisponível ou erro ao persistir %s (%s): %s",
-                tabela,
-                codigo,
-                erro,
-            )
-        return False  # Falha silenciosa
+        _registrar_recurso_ausente(erro, "praesidium_empresa_mirror")
+        logging.getLogger(__name__).debug(
+            "Espelho indisponível ao persistir %s (%s): %s",
+            tabela,
+            _codigo_erro_supabase(erro),
+            erro,
+        )
+        return False
 
 
 def executar_insert_seguro(
@@ -1808,28 +2090,23 @@ def executar_insert_seguro(
     dados = sanitizar_payload_supabase(tabela, payload)
     registros = dados if isinstance(dados, list) else [dados]
     if tabela == "notas_fiscais_recebidas" and any(
-        not str(registro.get("empresa_id", "")).strip() for registro in registros
+        not eh_uuid_valido(registro.get("empresa_id")) for registro in registros
     ):
         return False, "Não foi possível vincular a nota à empresa ativa.", []
     if tabela == "itens_nota_fiscal" and any(
-        not str(registro.get("empresa_id", "")).strip()
-        or not str(registro.get("nota_id", "")).strip()
+        not eh_uuid_valido(registro.get("empresa_id"))
+        or not eh_uuid_valido(registro.get("nota_id"))
         for registro in registros
     ):
         return False, "Não foi possível vincular os itens à empresa e à nota.", []
 
     if supabase is None:
-        if tabela in {
-            "notas_fiscais_recebidas",
-            "itens_nota_fiscal",
-            "conciliacao_devolucoes",
-            "split_payment_events",
-        }:
-            return False, "Supabase indisponível; dados fiscais não foram persistidos.", []
+        if tabela in _TABELAS_SEM_FALLBACK_LOCAL:
+            return False, "Supabase indisponível; dados não foram persistidos.", []
         local = _guardar_fallback(tabela, dados)
         return (
             (True, "Mantido temporariamente nesta sessão.", local)
-            if local or tabela not in {"notas_fiscais_recebidas", "itens_nota_fiscal"}
+            if local
             else (False, "Não foi possível registrar os dados nesta sessão.", [])
         )
 
@@ -1895,21 +2172,37 @@ def executar_insert_seguro(
             coluna = _coluna_erro_supabase(erro)
             colunas_presentes = set(dados[0] if isinstance(dados, list) and dados else dados)
             mensagem_erro = str(erro).lower()
-            
-            # REFORMULAÇÃO: Se upsert com constraint falhar (coluna/constraint inexistente),
-            # tenta insert puro sem on_conflict
+
+            if codigo in {"22P02", "22001"} and _aprender_erro_tipo_postgres(
+                tabela, dados, erro
+            ):
+                if any(
+                    not eh_uuid_valido(registro.get("empresa_id"))
+                    or (
+                        tabela == "itens_nota_fiscal"
+                        and not eh_uuid_valido(registro.get("nota_id"))
+                    )
+                    for registro in registros
+                    if tabela in {"notas_fiscais_recebidas", "itens_nota_fiscal"}
+                ):
+                    return False, "Não foi possível vincular os dados à empresa ativa.", []
+                continue
+
+            # Se o upsert por (empresa_id,item_uid) falhar por constraint/coluna
+            # inexistente, tenta insert puro sem on_conflict
             if (
-                codigo in {"42P10", "PGRST204"}
-                and ("on_conflict" in mensagem_erro or "constraint" in mensagem_erro)
+                codigo in {"42P10", "PGRST204", "42703"}
+                and conflito_item_uid
                 and tabela == "itens_nota_fiscal"
-                and operacao == "upsert"
+                and ("on_conflict" in mensagem_erro or "constraint" in mensagem_erro)
             ):
                 logging.getLogger(__name__).debug(
-                    "Upsert com constraint falhou (%s); tentando insert puro para %s",
+                    "Upsert com constraint falhou (%s); tentando upsert por id para %s",
                     codigo,
                     tabela,
                 )
                 conflito_item_uid = False
+                continue
             
             if codigo == "23505" and tabela == "conciliacao_devolucoes":
                 registro = registros[0] if registros else {}
@@ -1946,14 +2239,14 @@ def executar_insert_seguro(
                     _valor_padrao_coluna(tabela, coluna, registros[0] if registros else {}),
                 )
                 continue
-            if codigo == "PGRST204" and coluna in {"empresa_id", "nota_id"}:
+            if codigo in {"PGRST204", "42703"} and coluna in {"empresa_id", "nota_id"}:
                 logging.getLogger(__name__).error(
                     "Schema sem vínculo obrigatório (%s) na tabela %s.",
                     coluna,
                     tabela,
                 )
                 return False, "Não foi possível vincular os dados à empresa ativa.", []
-            if codigo == "PGRST204" and coluna and coluna in colunas_presentes:
+            if codigo in {"PGRST204", "42703"} and coluna and coluna in colunas_presentes:
                 _remover_coluna(dados, coluna)
                 if coluna == "item_uid":
                     conflito_item_uid = False
@@ -1989,26 +2282,16 @@ def executar_insert_seguro(
             if _persistir_payload_no_espelho(supabase, tabela, registros):
                 limpar_caches_dados()
                 return True, "Espelho Supabase persistido.", registros
-            logging.getLogger(__name__).exception(
-                "Falha ao gravar na tabela %s e no espelho persistente.",
+            logging.getLogger(__name__).error(
+                "Falha ao gravar na tabela %s (%s): %s",
                 tabela,
+                codigo or "sem código",
+                erro,
             )
-            local = (
-                []
-                if tabela in {
-                    "notas_fiscais_recebidas",
-                    "itens_nota_fiscal",
-                    "conciliacao_devolucoes",
-                    "split_payment_events",
-                }
-                else _guardar_fallback(tabela, dados)
-            )
-            if local or tabela not in {
-                "notas_fiscais_recebidas",
-                "itens_nota_fiscal",
-                "conciliacao_devolucoes",
-                "split_payment_events",
-            }:
+            if tabela in _TABELAS_SEM_FALLBACK_LOCAL:
+                return False, "Não foi possível registrar os dados. Tente novamente.", []
+            local = _guardar_fallback(tabela, dados)
+            if local:
                 return True, "Mantido temporariamente nesta sessão.", local
             return False, "Não foi possível registrar os dados. Tente novamente.", []
     logging.getLogger(__name__).error(
@@ -2017,22 +2300,10 @@ def executar_insert_seguro(
     if _persistir_payload_no_espelho(supabase, tabela, registros):
         limpar_caches_dados()
         return True, "Espelho Supabase persistido.", registros
-    local = (
-        []
-        if tabela in {
-            "notas_fiscais_recebidas",
-            "itens_nota_fiscal",
-            "conciliacao_devolucoes",
-            "split_payment_events",
-        }
-        else _guardar_fallback(tabela, dados)
-    )
-    if local or tabela not in {
-        "notas_fiscais_recebidas",
-        "itens_nota_fiscal",
-        "conciliacao_devolucoes",
-        "split_payment_events",
-    }:
+    if tabela in _TABELAS_SEM_FALLBACK_LOCAL:
+        return False, "Não foi possível registrar os dados. Tente novamente.", []
+    local = _guardar_fallback(tabela, dados)
+    if local:
         return True, "Mantido temporariamente nesta sessão.", local
     return False, "Não foi possível registrar os dados. Tente novamente.", []
 
@@ -2047,14 +2318,12 @@ def executar_update_seguro(
     dados = sanitizar_payload_supabase(tabela, payload, parcial=True)
     if not dados:
         return False, "Não há alterações disponíveis para salvar.", []
-    if supabase is None and tabela in {
-        "notas_fiscais_recebidas",
-        "itens_nota_fiscal",
-        "conciliacao_devolucoes",
-        "split_payment_events",
-    }:
-        return False, "Supabase indisponível; dados fiscais não foram persistidos.", []
+    if supabase is None and tabela in _TABELAS_SEM_FALLBACK_LOCAL:
+        return False, "Supabase indisponível; dados não foram persistidos.", []
     filtros_ativos = dict(filtros)
+    for coluna, valor in filtros_ativos.items():
+        if _tipo_coluna(tabela, coluna) == "uuid" and not eh_uuid_valido(valor):
+            return False, "Identificador inválido (UUID esperado) para a atualização.", []
     colunas_corrigidas = set()
     for _ in range(32):
         try:
@@ -2064,44 +2333,25 @@ def executar_update_seguro(
             resultado = consulta.select("*").execute()
             if resultado.data:
                 if tabela in _TIPOS_ESPELHO:
-                    espelhados = []
-                    for registro in resultado.data:
-                        atualizado = {
-                            **(fallback_record or {}),
-                            **registro,
-                            **dados,
-                        }
-                        if atualizado.get("status_credito"):
-                            status_normalizado = normalizar_item_credito({
-                                "status_credito": atualizado["status_credito"],
-                            }).get("classificacao_item")
-                            if status_normalizado:
-                                atualizado["classificacao_item"] = status_normalizado
-                        espelhados.append(atualizado)
-                    ledger_confirmado = _persistir_payload_no_espelho(
+                    # Espelho/ledger é best-effort: a linha real já foi atualizada.
+                    _persistir_payload_no_espelho(
                         supabase,
                         tabela,
-                        espelhados,
+                        [
+                            {
+                                **(fallback_record or {}),
+                                **registro,
+                                **dados,
+                            }
+                            for registro in resultado.data
+                        ],
                     )
-                    if (
-                        tabela == "itens_nota_fiscal"
-                        and not ledger_confirmado
-                    ):
-                        limpar_caches_dados()
-                        return (
-                            False,
-                            "Item atualizado, mas não foi possível confirmar "
-                            "o ledger fiscal.",
-                            resultado.data,
-                        )
                 return True, "OK", resultado.data
             if (
                 tabela in _TIPOS_ESPELHO
                 and fallback_record
                 and (
-                    str(fallback_record.get("id", "")).startswith(
-                        ("mirror_", "local_")
-                    )
+                    str(fallback_record.get("id", "")).startswith("mirror_")
                     or (
                         tabela == "itens_nota_fiscal"
                         and fallback_record.get("item_uid")
@@ -2119,24 +2369,17 @@ def executar_update_seguro(
                     tabela,
                     [atualizado],
                 ):
-                    if tabela not in {
-                        "notas_fiscais_recebidas",
-                        "itens_nota_fiscal",
-                        "conciliacao_devolucoes",
-                        "split_payment_events",
-                    }:
-                        _guardar_fallback(
-                            tabela,
-                            atualizado,
-                            "update",
-                            filtros_ativos,
-                        )
                     limpar_caches_dados()
                     return True, "Espelho Supabase atualizado.", [atualizado]
             return False, "A decisão já foi processada ou o item não está mais pendente.", []
         except Exception as erro:
             codigo = _codigo_erro_supabase(erro)
             coluna = _coluna_erro_supabase(erro)
+            if codigo in {"22P02", "22001"} and _aprender_erro_tipo_postgres(
+                tabela, dados, erro
+            ):
+                if dados:
+                    continue
             if codigo == "23502" and coluna:
                 if coluna in colunas_corrigidas:
                     break
@@ -2149,7 +2392,7 @@ def executar_update_seguro(
                 continue
             colunas_presentes = set(dados)
             if (
-                codigo == "PGRST204"
+                codigo in {"PGRST204", "42703"}
                 and tabela == "itens_nota_fiscal"
                 and coluna == "classificacao_item"
                 and coluna in filtros_ativos
@@ -2159,7 +2402,7 @@ def executar_update_seguro(
                     status_esperado
                 )
                 continue
-            if codigo == "PGRST204" and coluna and coluna in colunas_presentes:
+            if codigo in {"PGRST204", "42703"} and coluna and coluna in colunas_presentes:
                 dados.pop(coluna, None)
                 if dados:
                     continue
@@ -2167,9 +2410,7 @@ def executar_update_seguro(
                 tabela in _TIPOS_ESPELHO
                 and fallback_record
                 and (
-                    str(fallback_record.get("id", "")).startswith(
-                        ("mirror_", "local_")
-                    )
+                    str(fallback_record.get("id", "")).startswith("mirror_")
                     or (
                         tabela == "itens_nota_fiscal"
                         and fallback_record.get("item_uid")
@@ -2187,32 +2428,17 @@ def executar_update_seguro(
                     tabela,
                     [atualizado],
                 ):
-                    if tabela not in {
-                        "notas_fiscais_recebidas",
-                        "itens_nota_fiscal",
-                        "conciliacao_devolucoes",
-                        "split_payment_events",
-                    }:
-                        _guardar_fallback(
-                            tabela,
-                            atualizado,
-                            "update",
-                            filtros_ativos,
-                        )
                     limpar_caches_dados()
                     return True, "Espelho Supabase atualizado.", [atualizado]
-            logging.getLogger(__name__).exception(
-                "Falha ao atualizar a tabela %s; tentando atualizar o espelho persistente.",
+            logging.getLogger(__name__).error(
+                "Falha ao atualizar a tabela %s (%s): %s",
                 tabela,
+                codigo or "sem código",
+                erro,
             )
             break
 
-    if tabela in {
-        "notas_fiscais_recebidas",
-        "itens_nota_fiscal",
-        "conciliacao_devolucoes",
-        "split_payment_events",
-    }:
+    if tabela in _TABELAS_SEM_FALLBACK_LOCAL:
         return False, "Não foi possível persistir a alteração no Supabase.", []
 
     fallback = dict(fallback_record or {})
@@ -2229,6 +2455,8 @@ def inserir_seguro_supabase(supabase, tabela: str, payload) -> tuple[bool, str, 
 
 
 def _consultar_registros_empresa(supabase, tabela: str, empresa_id) -> list[dict]:
+    if not eh_uuid_valido(empresa_id):
+        return []
     registros = []
     inicio = 0
     while True:
@@ -2421,36 +2649,25 @@ def decidir_itens_quarentena_lote(
     itens: list[dict],
     decisao: str,
 ) -> int:
-    """
-    REFORMULAÇÃO v2: Aprovação/rejeição em lote de itens em quarentena.
-    
-    Lê [SYS_ITEM] de empresas_monitoradas, atualiza decisão,
-    reescreve de volta. Sem dependência de itens_nota_fiscal ou RPC.
-    
-    Args:
-        supabase: Cliente Supabase
-        empresa_id: UUID da empresa
-        itens: Lista de dicts com id/_sys_id, item_uid, nota_id, descricao, etc.
-        decisao: "aprovar" ou "rejeitar"
-    
+    """Aprova/rejeita itens da quarentena atualizando as linhas reais de itens_nota_fiscal.
+
+    A operação é tudo-ou-nada: todos os itens são validados antes do primeiro
+    UPDATE e, se algum UPDATE falhar, os já aplicados são revertidos.
+
     Returns:
-        int: Quantidade de itens efetivamente atualizados no Supabase
-        Retorna 0 apenas se lista vazia; se houver erro, levanta exceção.
+        Quantidade de itens efetivamente atualizados no Supabase.
     """
-    import streamlit as st
-    import logging
-    
     log = logging.getLogger(__name__)
-    
-    # ========== VALIDAÇÃO RIGOROSA ==========
+
     if supabase is None:
         raise RuntimeError("Supabase indisponível para registrar as decisões.")
     if decisao not in {"aprovar", "rejeitar"}:
         raise ValueError("Decisão de auditoria inválida.")
     if not itens:
         return 0
-    
-    # ========== CONFIGURAÇÃO DE METADADOS ==========
+    if not eh_uuid_valido(empresa_id):
+        raise ValueError("A empresa ativa não possui um UUID válido.")
+
     classificacao = (
         "Aprovado Manualmente Contador"
         if decisao == "aprovar"
@@ -2462,362 +2679,179 @@ def decidir_itens_quarentena_lote(
         if decisao == "aprovar"
         else "Art. 57: crédito glosado após análise manual do contador."
     )
-    
-    atualizados_count = 0
-    atualizados_registro = []  # Para atualizar snapshot depois
-    
-    # ========== PROCESSAR CADA ITEM SELECIONADO ==========
-    for item_input in itens:
-        # Extrair IDs de identificação (pode vir de várias formas)
-        sys_id = item_input.get("_sys_id")  # UUID da linha [SYS_ITEM] no Supabase
-        item_uid = str(item_input.get("item_uid") or "").strip()
-        item_id = item_input.get("id")
-        nota_id = item_input.get("nota_id")
-        
-        # Validar que item pertence à empresa
-        if str(item_input.get("empresa_id")) != str(empresa_id):
-            log.error(
-                "Item %s não pertence à empresa %s; rejeitando",
-                item_uid or item_id,
-                empresa_id,
-            )
-            continue
-        
-        # ===== ESTRATÉGIA: Buscar [SYS_ITEM] no Supabase =====
-        # Prioridade: _sys_id (UUID único) > item_uid > id > (nota_id + descricao)
-        
-        item_supabase_encontrado = None
-        item_record_para_atualizar = None
-        
-        # 1º: Tentar por _sys_id (UUID único da linha [SYS_ITEM])
-        if sys_id:
-            try:
-                resposta = supabase.table("empresas_monitoradas").select("*").eq(
-                    "id", sys_id
-                ).execute()
-                if resposta.data and len(resposta.data) > 0:
-                    item_record_para_atualizar = resposta.data[0]
-                    try:
-                        item_supabase_encontrado = ppf.decodificar_item(
-                            item_record_para_atualizar
-                        )
-                        log.debug(
-                            "Item %s encontrado via _sys_id=%s",
-                            item_uid or item_id,
-                            sys_id,
-                        )
-                    except Exception as e:
-                        log.debug(
-                            "Erro decodificar item via _sys_id: %s", e
-                        )
-                        item_record_para_atualizar = None
-            except Exception as e:
-                log.debug("Busca por _sys_id falhou: %s", e)
-        
-        # 2º: Tentar por item_uid (campo único do [SYS_ITEM])
-        if not item_supabase_encontrado and item_uid:
-            try:
-                resposta = supabase.table("empresas_monitoradas").select("*").eq(
-                    "cnpj", item_uid
-                ).eq("regime_tributario", "SYS_ITEM").eq(
-                    "cnae_principal", nota_id or ""
-                ).execute()
-                if resposta.data and len(resposta.data) > 0:
-                    item_record_para_atualizar = resposta.data[0]
-                    try:
-                        item_supabase_encontrado = ppf.decodificar_item(
-                            item_record_para_atualizar
-                        )
-                        log.debug(
-                            "Item encontrado via item_uid=%s", item_uid
-                        )
-                    except Exception as e:
-                        log.debug(
-                            "Erro decodificar item via item_uid: %s", e
-                        )
-                        item_record_para_atualizar = None
-            except Exception as e:
-                log.debug("Busca por item_uid falhou: %s", e)
-        
-        # 3º: Tentar por id (campo id da estrutura codificada)
-        if not item_supabase_encontrado and item_id:
-            try:
-                # Buscar todos [SYS_ITEM] dessa empresa e filtrar em memória por id
-                resposta = supabase.table("empresas_monitoradas").select("*").eq(
-                    "regime_tributario", "SYS_ITEM"
-                ).eq("cnae_principal", nota_id or "").execute()
-                for record in resposta.data or []:
-                    try:
-                        item_dec = ppf.decodificar_item(record)
-                        if item_dec.get("id") == item_id:
-                            item_supabase_encontrado = item_dec
-                            item_record_para_atualizar = record
-                            log.debug(
-                                "Item encontrado via id=%s em memória", item_id
-                            )
-                            break
-                    except Exception:
-                        pass
-            except Exception as e:
-                log.debug("Busca por id falhou: %s", e)
-        
-        # Se não encontrou via estratégia normal, tentar fallback em session_state
-        if not item_supabase_encontrado:
-            fallback_key = f"fallback_itens_{empresa_id}"
-            if fallback_key in st.session_state:
-                fallback_itens = st.session_state[fallback_key]
-                for fallback_item in fallback_itens:
-                    if (
-                        (fallback_item.get("id") == item_id)
-                        or (fallback_item.get("item_uid") == item_uid)
-                        or (
-                            fallback_item.get("nota_id") == nota_id
-                            and fallback_item.get("descricao") == item_input.get("descricao")
-                        )
-                    ):
-                        item_supabase_encontrado = fallback_item
-                        # Não fazer update no Supabase, apenas em memória
-                        log.debug(
-                            "Item %s encontrado em fallback session_state",
-                            item_uid or item_id,
-                        )
-                        break
-        
-        # Se ainda não encontrou, log e skip
-        if not item_supabase_encontrado:
-            log.error(
-                "Item %s não pode ser encontrado (sys_id=%s, item_uid=%s, id=%s)",
-                item_input.get("descricao", "?"),
-                sys_id,
-                item_uid,
-                item_id,
-            )
-            continue
-        
-        # ===== ATUALIZAR DECISÃO NO ITEM =====
-        valor_credito_original = item_supabase_encontrado.get("valor_credito_item", 0)
-        item_supabase_encontrado["classificacao_item"] = classificacao
-        item_supabase_encontrado["status_credito"] = status_credito
-        item_supabase_encontrado["valor_credito_item"] = round(
-            obter_credito_quarentena(item_input), 2
-        ) if decisao == "aprovar" else 0
-        item_supabase_encontrado["justificativa_motor"] = justificativa
-        
-        # Marcar timestamp de decisão
-        from datetime import datetime
-        item_supabase_encontrado["data_decisao_quarentena"] = datetime.utcnow().isoformat()
-        
-        atualizados_registro.append(item_supabase_encontrado)
-        
-        # ===== PERSISTIR NO SUPABASE (se item_record_para_atualizar existe) =====
-        if item_record_para_atualizar:
-            try:
-                # Recodificar para formato [SYS_ITEM]
-                item_codificado = ppf.codificar_item(
-                    item_supabase_encontrado,
-                    empresa_id=empresa_id,
-                    nota_id=nota_id or item_supabase_encontrado.get("nota_id"),
-                )
-                
-                # Update direto no Supabase
-                resposta_update = supabase.table("empresas_monitoradas").update(
-                    item_codificado
-                ).eq("id", item_record_para_atualizar["id"]).execute()
-                
-                if resposta_update.data:
-                    atualizados_count += 1
-                    log.debug(
-                        "Item %s atualizado no Supabase (status=%s)",
-                        item_uid or item_id,
-                        status_credito,
-                    )
-                else:
-                    log.error(
-                        "Update retornou vazio para item %s",
-                        item_uid or item_id,
-                    )
-            except Exception as e:
-                log.error(
-                    "Erro ao persistir decisão de item %s no Supabase: %s",
-                    item_uid or item_id,
-                    e,
-                )
+
+    alvos = []
+    for item in itens:
+        if str(item.get("empresa_id")) != str(empresa_id):
+            raise ValueError("O item selecionado não pertence à empresa ativa.")
+        if eh_uuid_valido(item.get("id")):
+            filtros = {"id": item["id"], "empresa_id": empresa_id}
+        elif item.get("item_uid"):
+            filtros = {"empresa_id": empresa_id, "item_uid": item["item_uid"]}
         else:
-            # Item estava em fallback session_state; apenas contar como atualizado
-            atualizados_count += 1
-            log.debug(
-                "Item %s atualizado em fallback session_state",
-                item_uid or item_id,
+            raise ValueError("O item selecionado não possui identificador persistente.")
+        filtros["classificacao_item"] = "Quarentena Uso/Consumo"
+        alvos.append((item, filtros))
+
+    aplicados = []
+    for item, filtros in alvos:
+        decisao_item = {
+            "classificacao_item": classificacao,
+            "status_credito": status_credito,
+            "valor_credito_item": round(obter_credito_quarentena(item), 2),
+            "justificativa_motor": justificativa,
+        }
+        ok, mensagem, _ = executar_update_seguro(
+            supabase,
+            "itens_nota_fiscal",
+            decisao_item,
+            filtros,
+            fallback_record=item,
+        )
+        if not ok:
+            log.error(
+                "Decisão de quarentena não aplicada ao item %s: %s",
+                item.get("item_uid") or item.get("id"),
+                mensagem,
             )
-    
-    # ===== ATUALIZAR SNAPSHOT EM MEMÓRIA =====
-    if atualizados_count > 0:
-        try:
-            _atualizar_snapshot_itens_quarentena(empresa_id, atualizados_registro)
-        except Exception as e:
-            log.warning("Erro ao atualizar snapshot: %s", e)
-    
+            for item_revertido, filtros_revertidos in reversed(aplicados):
+                filtros_reversao = {
+                    chave: valor
+                    for chave, valor in filtros_revertidos.items()
+                    if chave != "classificacao_item"
+                }
+                executar_update_seguro(
+                    supabase,
+                    "itens_nota_fiscal",
+                    {
+                        "classificacao_item": "Quarentena Uso/Consumo",
+                        "status_credito": "Quarentena",
+                        "valor_credito_item": item_revertido.get(
+                            "valor_credito_item"
+                        ),
+                        "justificativa_motor": item_revertido.get(
+                            "justificativa_motor"
+                        ),
+                    },
+                    filtros_reversao,
+                    fallback_record=item_revertido,
+                )
+            limpar_caches_dados()
+            raise RuntimeError(mensagem)
+        aplicados.append((item, filtros))
+
+    limpar_caches_dados()
     log.info(
         "Decisão de quarentena aplicada: %d itens %s para empresa %s",
-        atualizados_count,
+        len(aplicados),
         decisao,
         empresa_id,
     )
-    
-    return atualizados_count
+    return len(aplicados)
 
 
-def _atualizar_snapshot_itens_quarentena(empresa_id, itens_atualizados: list[dict]):
-    """
-    REFORMULAÇÃO: Atualiza snapshot em st.session_state com itens atualizados.
-    Garante que UI refita mudanças sem reload imediato.
-    """
-    import streamlit as st
-    import logging
-    
-    log = logging.getLogger(__name__)
-    
-    try:
-        # Atualizar em dados_hidratados_por_empresa (estrutura principal)
-        snapshot_key = f"_dados_hidratados_por_empresa_{empresa_id}"
-        if snapshot_key not in st.session_state:
-            # Se snapshot não existe, criar fallback
-            fallback_key = f"fallback_itens_{empresa_id}"
-            if fallback_key in st.session_state:
-                # Atualizar fallback
-                fallback_itens = st.session_state[fallback_key]
-                for item_atualizado in itens_atualizados:
-                    for i, fallback_item in enumerate(fallback_itens):
-                        if (
-                            (fallback_item.get("id") == item_atualizado.get("id"))
-                            or (
-                                fallback_item.get("item_uid")
-                                == item_atualizado.get("item_uid")
-                            )
-                        ):
-                            fallback_itens[i] = item_atualizado
-                            log.debug(
-                                "Snapshot fallback atualizado para item %s",
-                                item_atualizado.get("item_uid")
-                                or item_atualizado.get("id"),
-                            )
-            return
-        
-        snapshot = st.session_state.get(snapshot_key, {})
-        itens_snapshot = snapshot.get("itens", [])
-        
-        # Mapa para busca rápida
-        itens_atualizados_map = {}
-        for item in itens_atualizados:
-            key = item.get("id") or item.get("item_uid")
-            if key:
-                itens_atualizados_map[key] = item
-        
-        # Atualizar itens no snapshot
-        for i, item_snapshot in enumerate(itens_snapshot):
-            key = item_snapshot.get("id") or item_snapshot.get("item_uid")
-            if key in itens_atualizados_map:
-                item_atualizado = itens_atualizados_map[key]
-                itens_snapshot[i].update({
-                    "classificacao_item": item_atualizado.get("classificacao_item"),
-                    "status_credito": item_atualizado.get("status_credito"),
-                    "valor_credito_item": item_atualizado.get("valor_credito_item"),
-                    "justificativa_motor": item_atualizado.get("justificativa_motor"),
-                    "data_decisao_quarentena": item_atualizado.get("data_decisao_quarentena"),
-                })
-                log.debug(
-                    "Snapshot principal atualizado para item %s",
-                    key,
-                )
-        
-        # Manter snapshot atualizado
-        st.session_state[snapshot_key] = snapshot
-        
-    except Exception as e:
-        log.debug("Erro ao atualizar snapshot: %s", e)
 def excluir_empresa_supabase(supabase, empresa_id) -> dict:
+    """Exclusão total de um cliente (dados fiscais, ledger e cadastro).
+
+    Tenta a RPC atômica `excluir_cliente_cascade` (quando existir no banco real)
+    e, caso contrário, remove os dados em Python. Falhas reais são propagadas:
+    o cliente só é dado como excluído depois de confirmada a remoção da linha em
+    `empresas_monitoradas`.
     """
-    REFORMULAÇÃO v2: Exclusão total de cliente com fallback robusto.
-    
-    Estratégia:
-    1. Tenta RPC excluir_cliente_cascade (pode não existir em prod real)
-    2. Se falhar, executa fallback direto: limpar_dados_empresa_supabase + delete empresas_monitoradas
-    3. Trata erro 42P01/PGRST205 (RPC não existe) silenciosamente
-    4. Retorna dict com status de exclusão
-    """
-    import logging
-    
     log = logging.getLogger(__name__)
-    
+
     if supabase is None:
         raise RuntimeError("Supabase indisponível para excluir o cliente.")
-    if empresa_id is None or not str(empresa_id).strip():
-        raise ValueError("ID de cliente inválido.")
-    
+    if not eh_uuid_valido(empresa_id):
+        raise ValueError("ID de cliente inválido (UUID esperado).")
+
     empresa_id_str = str(empresa_id)
-    
-    # ========== TENTAR RPC PRIMEIRO ==========
-    try:
-        resposta = supabase.rpc(
-            "excluir_cliente_cascade",
-            {"p_empresa_id": empresa_id_str},
-        ).execute()
-        resultado = resposta.data
-        if isinstance(resultado, list) and len(resultado) > 0:
-            resultado = resultado[0]
-        
-        if isinstance(resultado, dict):
-            if resultado.get("deleted") is True:
+
+    if not _recurso_ausente("rpc.excluir_cliente_cascade"):
+        try:
+            resposta = supabase.rpc(
+                "excluir_cliente_cascade",
+                {"p_empresa_id": empresa_id_str},
+            ).execute()
+            resultado = resposta.data
+            if isinstance(resultado, list) and len(resultado) > 0:
+                resultado = resultado[0]
+            if isinstance(resultado, dict) and resultado.get("deleted") is True:
                 log.info("Cliente %s excluído via RPC com sucesso", empresa_id_str)
-                _limpar_estado_local_empresa(empresa_id, preservar_perfil=False)
+                _excluir_ledger_sistema_empresa(
+                    supabase, empresa_id_str, preservar_perfil=False
+                )
+                _limpar_estado_local_empresa(empresa_id_str, preservar_perfil=False)
                 return {
                     "deleted": True,
                     "empresa_id": empresa_id_str,
                     "via_rpc": True,
                 }
-    except Exception as e:
-        codigo = _codigo_erro_supabase(e)
-        if codigo not in {"42P01", "PGRST205"}:
-            log.debug("RPC falhou com código %s: %s", codigo, e)
-        else:
-            log.debug("RPC excluir_cliente_cascade não existe (42P01/PGRST205)")
-    
-    # ========== FALLBACK: EXCLUSÃO DIRETO EM PYTHON ==========
-    log.info("Usando fallback direto para excluir empresa %s", empresa_id_str)
-    
-    try:
-        # 1º: Limpar todos dados da empresa (notas, itens, eventos, ledger, etc.)
-        limpar_dados_empresa_supabase(supabase, empresa_id)
-        
-        # 2º: Deletar o registro da empresa em empresas_monitoradas
-        try:
-            supabase.table("empresas_monitoradas").delete().eq(
-                "id", empresa_id_str
-            ).execute()
-            log.info("Registro de empresa %s deletado de empresas_monitoradas", empresa_id_str)
-        except Exception as e:
-            codigo = _codigo_erro_supabase(e)
-            if codigo in {"42P01", "PGRST205"}:
-                log.debug("Tabela empresas_monitoradas não existe?! (erro crítico)")
+        except Exception as erro:
+            if _codigo_erro_supabase(erro) in {"42883", "PGRST202", "42P01", "PGRST205"}:
+                _marcar_recurso_ausente("rpc.excluir_cliente_cascade")
             else:
-                log.error("Erro ao deletar empresa %s: %s", empresa_id_str, e)
-        
-        # 3º: Limpar estado local
-        _limpar_estado_local_empresa(empresa_id, preservar_perfil=False)
-        
-        log.info("Cliente %s excluído via fallback Python com sucesso", empresa_id_str)
-        return {
-            "deleted": True,
-            "empresa_id": empresa_id_str,
-            "via_fallback": True,
-        }
-    
-    except Exception as e:
-        log.error("Falha crítica ao excluir empresa %s: %s", empresa_id_str, e)
+                log.debug("RPC excluir_cliente_cascade falhou: %s", erro)
+
+    try:
+        limpar_dados_empresa_supabase(
+            supabase,
+            empresa_id_str,
+            preservar_perfil=False,
+            incluir_cnpjs=True,
+        )
+        supabase.table("empresas_monitoradas").delete().eq(
+            "id", empresa_id_str
+        ).execute()
+        restante = (
+            supabase.table("empresas_monitoradas")
+            .select("id")
+            .eq("id", empresa_id_str)
+            .limit(1)
+            .execute()
+        )
+        if restante.data:
+            raise RuntimeError("O cadastro do cliente permaneceu no Supabase.")
+    except Exception as erro:
+        log.error("Falha ao excluir empresa %s: %s", empresa_id_str, erro)
         raise RuntimeError(
-            f"Não foi possível excluir o cliente {empresa_id_str}. "
-            "Verifique os logs para mais detalhes."
-        ) from e
+            f"Não foi possível excluir o cliente {empresa_id_str}."
+        ) from erro
+
+    _limpar_estado_local_empresa(empresa_id_str, preservar_perfil=False)
+    log.info("Cliente %s excluído com sucesso", empresa_id_str)
+    return {
+        "deleted": True,
+        "empresa_id": empresa_id_str,
+        "via_fallback": True,
+    }
+
+
+def _excluir_ledger_sistema_empresa(
+    supabase,
+    empresa_id,
+    *,
+    preservar_perfil: bool,
+) -> None:
+    """Remove os registros [SYS_LEDGER] da empresa (opcionalmente preservando o perfil)."""
+    if ppf is None:
+        return
+    linhas = (
+        supabase.table("empresas_monitoradas")
+        .select("id,cnpj,razao_social,regime_tributario")
+        .eq("regime_tributario", ppf.REGIME_TRIBUTARIO_LEDGER)
+        .like("cnpj", f"{ppf.prefixo_cnpj_ledger_empresa(empresa_id)}%")
+        .execute()
+        .data
+        or []
+    )
+    for linha in linhas:
+        payload = ppf.decodificar_ledger(linha)
+        if not payload or str(payload.get("empresa_id")) != str(empresa_id):
+            continue
+        if preservar_perfil and payload.get("item_uid") == ppf.CHAVE_LEDGER_PERFIL_TRIBUTARIO:
+            continue
+        supabase.table("empresas_monitoradas").delete().eq("id", linha["id"]).execute()
 
 
 def _excluir_registros_empresa_supabase(
@@ -2839,22 +2873,31 @@ def _excluir_registros_empresa_supabase(
         tabelas += ("empresa_cnpjs_autorizados",)
 
     for tabela in tabelas:
+        if _recurso_ausente(tabela, "empresa_id"):
+            continue
+        if tabela == "praesidium_ledger_fiscal" and not _ledger_fiscal_disponivel():
+            continue
         consulta = supabase.table(tabela).delete().eq("empresa_id", empresa_id)
         if tabela == "praesidium_ledger_fiscal" and preservar_perfil:
             consulta = consulta.neq(
                 "item_uid",
-                "config:aliquota-ibs-cbs:v1",
+                ppf.CHAVE_LEDGER_PERFIL_TRIBUTARIO if ppf else "config:aliquota-ibs-cbs:v1",
             )
         try:
             consulta.execute()
         except Exception as erro:
-            if _codigo_erro_supabase(erro) not in {"42P01", "PGRST205"}:
+            if not _registrar_recurso_ausente(erro, tabela):
                 raise
-            logging.getLogger(__name__).info(
-                "Tabela %s ausente durante limpeza da empresa %s.",
+            logging.getLogger(__name__).debug(
+                "Tabela/coluna de %s ausente no banco real durante a limpeza da empresa %s.",
                 tabela,
                 empresa_id,
             )
+    _excluir_ledger_sistema_empresa(
+        supabase,
+        empresa_id,
+        preservar_perfil=preservar_perfil,
+    )
 
 
 def _limpar_estado_local_empresa(
@@ -2886,166 +2929,50 @@ def _limpar_estado_local_empresa(
     limpar_caches_dados()
 
 
-def limpar_dados_empresa_supabase(supabase, empresa_id) -> None:
+def limpar_dados_empresa_supabase(
+    supabase,
+    empresa_id,
+    *,
+    preservar_perfil: bool = True,
+    incluir_cnpjs: bool = False,
+) -> None:
+    """Remove notas, itens, devoluções, eventos, espelho e ledger da empresa.
+
+    Por padrão preserva o perfil tributário e os CNPJs autorizados ("Zerar
+    Notas"). Qualquer falha real do Supabase é propagada para que a interface não
+    anuncie uma limpeza que não aconteceu; tabelas/colunas ausentes no banco real
+    são ignoradas.
     """
-    REFORMULAÇÃO v2: Limpeza total de [SYS_NOTA], [SYS_ITEM], [SYS_EVENT], [SYS_LEDGER].
-    
-    Estratégia em cascata:
-    1. Carrega cache de tabelas inexistentes (evita retry desnecessário)
-    2. Deleta [SYS_ITEM] em empresas_monitoradas (regime_tributario="SYS_ITEM")
-    3. Deleta [SYS_NOTA] em empresas_monitoradas (regime_tributario="SYS_NOTA")
-    4. Deleta [SYS_EVENT] com try/except (tabela pode não existir)
-    5. Deleta [SYS_LEDGER] preservando perfil com try/except
-    6. Tenta deletar tabelas legadas (itens_nota_fiscal, notas_fiscais_recebidas, etc.)
-       com try/except silencioso (podem não existir em produção real)
-    7. Limpa estado local (session_state, cache, fallback)
-    8. NUNCA falha - retorna sucesso mesmo que dados parciais permaneçam
-    
-    Args:
-        supabase: Cliente Supabase
-        empresa_id: UUID da empresa a limpar
-    
-    Raises:
-        RuntimeError: Se supabase é None
-        ValueError: Se empresa_id é inválido
-    """
-    log = logging.getLogger(__name__)
-    
-    # ========== VALIDAÇÃO ==========
     if supabase is None:
         raise RuntimeError("Supabase indisponível para zerar os dados do cliente.")
-    if empresa_id is None or not str(empresa_id).strip():
-        raise ValueError("ID de cliente inválido.")
-    
-    empresa_id_str = str(empresa_id)
-    
-    # ========== CACHE DE TABELAS INEXISTENTES ==========
-    try:
-        import streamlit as st
-        tabelas_inexistentes_cache = st.session_state.get("_TABELAS_INEXISTENTES_CACHE", set())
-    except (ImportError, RuntimeError):
-        tabelas_inexistentes_cache = set()
-    
-    if not isinstance(tabelas_inexistentes_cache, set):
-        tabelas_inexistentes_cache = set()
-    
-    # ========== DELETAR [SYS_NOTA] e [SYS_ITEM] ==========
-    log.info("Iniciando limpeza total de dados da empresa %s", empresa_id_str)
-    
-    try:
-        # Primeiro, buscar todas as notas [SYS_NOTA] para saber quais nota_ids deletar
-        resposta_notas = supabase.table("empresas_monitoradas").select("id,razao_social").eq(
-            "regime_tributario", "SYS_NOTA"
-        ).eq("cnae_principal", empresa_id_str).execute()
-        
-        nota_ids_para_deletar = []
-        for record in resposta_notas.data or []:
-            try:
-                nota = ppf.decodificar_nota(record)
-                nota_id = nota.get("id")
-                if nota_id:
-                    nota_ids_para_deletar.append(nota_id)
-                    log.debug("Marcado para deleção: nota [SYS_NOTA] id=%s", nota_id)
-            except Exception as e:
-                log.debug("Erro decodificar nota para deleção: %s", e)
-        
-        # Agora deletar [SYS_ITEM] cujo cnae_principal (nota_id) está em nota_ids_para_deletar
-        if nota_ids_para_deletar:
-            for nota_id in nota_ids_para_deletar:
-                try:
-                    supabase.table("empresas_monitoradas").delete().eq(
-                        "regime_tributario", "SYS_ITEM"
-                    ).eq("cnae_principal", str(nota_id)).execute()
-                    log.debug("Deletados [SYS_ITEM] para nota_id=%s", nota_id)
-                except Exception as e:
-                    codigo = _codigo_erro_supabase(e)
-                    if codigo in {"42P01", "PGRST205"}:
-                        log.debug("Tabela [SYS_ITEM] não existe (esperado em prod)")
-                    else:
-                        log.debug("Erro ao deletar [SYS_ITEM] para nota_id=%s: %s", nota_id, e)
-        
-        log.debug("Deletados [SYS_ITEM] para empresa %s", empresa_id_str)
-    except Exception as e:
-        codigo = _codigo_erro_supabase(e)
-        if codigo in {"42P01", "PGRST205"}:
-            log.debug("Tabela [SYS_NOTA] não existe (silencioso)")
-        else:
-            log.debug("Erro ao limpar [SYS_NOTA]/[SYS_ITEM]: %s", e)
-    
-    # ========== DELETAR [SYS_NOTA] DIRETO ==========
-    try:
-        supabase.table("empresas_monitoradas").delete().eq(
-            "regime_tributario", "SYS_NOTA"
-        ).eq("cnae_principal", empresa_id_str).execute()
-        log.debug("Deletados [SYS_NOTA] para empresa %s", empresa_id_str)
-    except Exception as e:
-        codigo = _codigo_erro_supabase(e)
-        if codigo not in {"42P01", "PGRST205"}:
-            log.debug("Erro ao deletar [SYS_NOTA]: %s", e)
-    
-    # ========== DELETAR [SYS_EVENT] (try/except silencioso) ==========
-    try:
-        supabase.table("empresas_monitoradas").delete().eq(
-            "regime_tributario", "SYS_EVENT"
-        ).eq("cnae_principal", empresa_id_str).execute()
-        log.debug("Deletados [SYS_EVENT] para empresa %s", empresa_id_str)
-    except Exception:
-        log.debug("[SYS_EVENT] não existe ou erro na deleção (ignorado)")
-    
-    # ========== DELETAR [SYS_LEDGER] PRESERVANDO PERFIL ==========
-    try:
-        supabase.table("empresas_monitoradas").delete().eq(
-            "regime_tributario", "SYS_LEDGER"
-        ).eq("cnae_principal", empresa_id_str).neq(
-            "cnpj", "config:aliquota-ibs-cbs:v1"
-        ).execute()
-        log.debug("Deletados [SYS_LEDGER] (preservando perfil) para empresa %s", empresa_id_str)
-    except Exception as e:
-        codigo = _codigo_erro_supabase(e)
-        if codigo not in {"42P01", "PGRST205"}:
-            log.debug("Erro ao deletar [SYS_LEDGER]: %s", e)
-    
-    # ========== DELETAR DE TABELAS LEGADAS (try/except com cache) ==========
-    tabelas_legadas = [
-        ("itens_nota_fiscal", "empresa_id"),
-        ("conciliacao_devolucoes", "empresa_id"),
-        ("notas_fiscais_recebidas", "empresa_id"),
-        ("split_payment_events", "empresa_id"),
-        ("praesidium_empresa_mirror", "empresa_id"),
-        ("praesidium_ledger_fiscal", "empresa_id"),
-        ("empresa_cnpjs_autorizados", "empresa_id"),
-    ]
-    
-    for nome_tabela, coluna_fk in tabelas_legadas:
-        if nome_tabela in tabelas_inexistentes_cache:
-            log.debug("Pulando %s (cache: inexistente)", nome_tabela)
-            continue
-        
-        try:
-            supabase.table(nome_tabela).delete().eq(coluna_fk, empresa_id_str).execute()
-            log.debug("Deletados registros de %s para empresa %s", nome_tabela, empresa_id_str)
-        except Exception as e:
-            codigo = _codigo_erro_supabase(e)
-            if codigo in {"42P01", "PGRST205"}:
-                tabelas_inexistentes_cache.add(nome_tabela)
-                try:
-                    import streamlit as st
-                    st.session_state["_TABELAS_INEXISTENTES_CACHE"] = tabelas_inexistentes_cache
-                except (ImportError, RuntimeError):
-                    pass
-                log.debug("Tabela %s não existe (marcada em cache)", nome_tabela)
-            else:
-                log.debug("Erro ao deletar %s: %s (continuando)", nome_tabela, e)
-    
-    # ========== LIMPAR ESTADO LOCAL EM MEMÓRIA ==========
-    try:
-        _limpar_estado_local_empresa(empresa_id, preservar_perfil=False)
-        log.debug("Limpado estado local da empresa %s", empresa_id_str)
-    except Exception as e:
-        log.debug("Erro ao limpar estado local: %s (não-crítico)", e)
-    
-    log.info("Limpeza total concluída para empresa %s", empresa_id_str)
+    if not eh_uuid_valido(empresa_id):
+        raise ValueError("ID de cliente inválido (UUID esperado).")
 
+    _excluir_registros_empresa_supabase(
+        supabase,
+        str(empresa_id),
+        preservar_perfil=preservar_perfil,
+        incluir_cnpjs=incluir_cnpjs,
+    )
+    _limpar_estado_local_empresa(
+        str(empresa_id),
+        preservar_perfil=preservar_perfil,
+    )
+    logging.getLogger(__name__).info(
+        "Limpeza concluída para a empresa %s", empresa_id
+    )
+
+
+def _hidratacao_vazia(falha: bool = False) -> dict:
+    return {
+        "notas": [],
+        "itens": [],
+        "devolucoes": [],
+        "eventos_split": [],
+        "eventos_liquidacao": [],
+        "perfil_tributario": None,
+        "_falha_hidratacao": falha,
+    }
 
 
 def hidratar_dados_empresa_supabase(
@@ -3053,7 +2980,13 @@ def hidratar_dados_empresa_supabase(
     empresa_id,
     empresa_ativa: dict,
 ) -> dict[str, list[dict]]:
-    """Rebuild the active company's working set exclusively from Supabase."""
+    """Rebuild the active company's working set exclusively from Supabase.
+
+    Falhas de leitura não levantam exceção: a estrutura (possivelmente parcial)
+    é devolvida com `_falha_hidratacao=True` para que o chamador preserve o
+    último snapshot válido, sem reconexões em loop. IDs que não são UUID nunca
+    são enviados ao Supabase.
+    """
     if supabase is None:
         raise RuntimeError("Supabase indisponível para hidratar os dados fiscais.")
     if (
@@ -3061,6 +2994,12 @@ def hidratar_dados_empresa_supabase(
         or str(empresa_ativa.get("id", "")) != str(empresa_id)
     ):
         raise ValueError("A empresa ativa não corresponde ao ID da hidratação.")
+    if not eh_uuid_valido(empresa_id):
+        logging.getLogger(__name__).warning(
+            "Hidratação ignorada: o ID da empresa ativa não é um UUID válido (%s).",
+            empresa_id,
+        )
+        return _hidratacao_vazia(falha=True)
 
     try:
         notas = _consultar_registros_empresa(
@@ -3069,65 +3008,70 @@ def hidratar_dados_empresa_supabase(
             empresa_id,
         )
     except Exception as erro:
-        logging.getLogger(__name__).exception(
-            "Falha ao carregar notas da empresa %s durante a hidratação.",
+        logging.getLogger(__name__).warning(
+            "Falha ao carregar notas da empresa %s durante a hidratação: %s",
             empresa_id,
+            erro,
         )
-        raise RuntimeError("Não foi possível hidratar as notas fiscais do Supabase.") from erro
+        return _hidratacao_vazia(falha=True)
 
     tabelas_primarias = {}
     falhas_leitura = set()
     for tabela in (
         "itens_nota_fiscal",
-        "praesidium_ledger_fiscal",
         "conciliacao_devolucoes",
         "split_payment_events",
     ):
+        tabelas_primarias[tabela] = []
+        if _recurso_ausente(tabela):
+            continue
         try:
             tabelas_primarias[tabela] = _consultar_registros_empresa(
                 supabase,
                 tabela,
                 empresa_id,
             )
-        except Exception:
-            falhas_leitura.add(tabela)
-            tabelas_primarias[tabela] = []
-            logging.getLogger(__name__).exception(
-                "Falha ao ler %s da empresa %s durante a hidratação.",
-                tabela,
-                empresa_id,
-            )
+        except Exception as erro:
+            if not _registrar_recurso_ausente(erro, tabela):
+                falhas_leitura.add(tabela)
+                logging.getLogger(__name__).warning(
+                    "Falha ao ler %s da empresa %s durante a hidratação: %s",
+                    tabela,
+                    empresa_id,
+                    erro,
+                )
 
-    try:
-        linhas_espelho = []
-        inicio = 0
-        while True:
-            resposta = (
-                supabase.table("praesidium_empresa_mirror")
-                .select("record_type,record_key,payload,updated_at")
-                .eq("empresa_id", empresa_id)
-                .range(inicio, inicio + 999)
-                .execute()
-            )
-            pagina = resposta.data or []
-            linhas_espelho.extend(pagina)
-            if len(pagina) < 1000:
-                break
-            inicio += 1000
-        espelho_disponivel = True
-    except Exception:
-        linhas_espelho = []
-        espelho_disponivel = False
-        logging.getLogger(__name__).exception(
-            "Falha ao ler o espelho persistente da empresa %s durante a hidratação.",
-            empresa_id,
-        )
+    linhas_espelho = []
+    if _espelho_disponivel():
+        try:
+            inicio = 0
+            while True:
+                resposta = (
+                    supabase.table("praesidium_empresa_mirror")
+                    .select("record_type,record_key,payload,updated_at")
+                    .eq("empresa_id", empresa_id)
+                    .range(inicio, inicio + 999)
+                    .execute()
+                )
+                pagina = resposta.data or []
+                linhas_espelho.extend(pagina)
+                if len(pagina) < 1000:
+                    break
+                inicio += 1000
+        except Exception as erro:
+            linhas_espelho = []
+            if not _registrar_recurso_ausente(erro, "praesidium_empresa_mirror"):
+                falhas_leitura.add("praesidium_empresa_mirror")
+                logging.getLogger(__name__).warning(
+                    "Falha ao ler o espelho da empresa %s durante a hidratação: %s",
+                    empresa_id,
+                    erro,
+                )
 
-    if falhas_leitura and not espelho_disponivel:
-        raise RuntimeError(
-            "Nem todas as fontes fiscais do Supabase puderam ser lidas."
-        )
-
+    registros_ledger = sorted(
+        _ler_ledger_empresa(supabase, empresa_id),
+        key=lambda registro: str(registro.get("updated_at", "")),
+    )
     espelho: dict[str, list[dict]] = {
         "item": [],
         "devolucao": [],
@@ -3165,13 +3109,7 @@ def hidratar_dados_empresa_supabase(
     ledger_por_uid = {}
     eventos_liquidacao = []
     perfil_tributario = None
-    for registro in sorted(
-        tabelas_primarias["praesidium_ledger_fiscal"],
-        key=lambda item: str(item.get("updated_at", "")),
-    ):
-        payload = registro.get("payload")
-        if not isinstance(payload, dict):
-            continue
+    for payload in registros_ledger:
         tipo_registro = str(payload.get("record_type") or "")
         if tipo_registro == "split_payment_operation_event":
             eventos_liquidacao.append(dict(payload))
@@ -3179,12 +3117,8 @@ def hidratar_dados_empresa_supabase(
         if tipo_registro == "company_tax_profile":
             perfil_tributario = dict(payload)
             continue
-        uid_ledger = str(
-            payload.get("item_uid")
-            or registro.get("item_uid")
-            or ""
-        )
-        if uid_ledger:
+        uid_ledger = str(payload.get("item_uid") or "")
+        if uid_ledger and not uid_ledger.startswith(("config:", "split-event:")):
             ledger_por_uid[uid_ledger] = dict(payload)
     uids_primarios = {
         str(item.get("item_uid") or "")
@@ -3263,8 +3197,8 @@ def hidratar_dados_empresa_supabase(
             "item_uid": _gerar_item_uid(chave, 1),
             "nitem": 1,
             "descricao": "NF-e legada sem detalhamento XML original (quarentena)",
-            "ncm": "",
-            "cfop": "",
+            "ncm": "00000000",
+            "cfop": "0000",
             "quantidade_comercial": 1.0,
             "valor_item": round(valor_nota, 2),
             "aliquota_aplicada": ALIQUOTA_CREDITO_POTENCIAL_QUARENTENA,
@@ -3280,17 +3214,27 @@ def hidratar_dados_empresa_supabase(
                 "quarentena até a reconstituição documental."
             ),
         }
-        ok, mensagem, persistidos = inserir_seguro_supabase(
-            supabase,
-            "itens_nota_fiscal",
-            item_legado,
-        )
-        if not ok:
-            raise RuntimeError(
-                f"Não foi possível persistir o item legado da nota {chave}: {mensagem}"
+        persistido = dict(item_legado)
+        persistido["id"] = f"mirror_{item_legado['item_uid']}"
+        chave_tentativa = f"legado.{nota_id}"
+        if eh_uuid_valido(nota_id) and not _recurso_ausente(chave_tentativa):
+            ok, mensagem, persistidos = inserir_seguro_supabase(
+                supabase,
+                "itens_nota_fiscal",
+                item_legado,
             )
-        persistido = dict(persistidos[0]) if persistidos else item_legado
-        persistido.setdefault("id", f"mirror_{item_legado['item_uid']}")
+            if ok and persistidos:
+                persistido = dict(persistidos[0])
+                persistido.setdefault("id", f"mirror_{item_legado['item_uid']}")
+            else:
+                # Não repete a gravação a cada hidratação; o item segue em memória.
+                _marcar_recurso_ausente(chave_tentativa)
+                falhas_leitura.add("item_legado")
+                logging.getLogger(__name__).warning(
+                    "Item legado da nota %s mantido apenas em memória: %s",
+                    chave,
+                    mensagem,
+                )
         itens_por_uid[item_legado["item_uid"]] = persistido
 
     devolucoes = combinar_registros_espelho(
@@ -3338,6 +3282,7 @@ def hidratar_dados_empresa_supabase(
             if perfil_tributario
             else None
         ),
+        "_falha_hidratacao": bool(falhas_leitura),
     }
 
 
@@ -3745,31 +3690,36 @@ def _carregar_itens_existentes_empresa(
             "Falha ao ler itens atuais da empresa %s antes do reprocessamento.",
             empresa_id,
         )
-    try:
-        linhas_espelho = []
-        inicio = 0
-        while True:
-            resposta = (
-                supabase.table("praesidium_empresa_mirror")
-                .select("record_key,payload")
-                .eq("empresa_id", empresa_id)
-                .eq("record_type", "item")
-                .range(inicio, inicio + 999)
-                .execute()
-            )
-            pagina = resposta.data or []
-            linhas_espelho.extend(pagina)
-            if len(pagina) < 1000:
-                break
-            inicio += 1000
+    linhas_espelho = []
+    leitura_espelho_ok = False
+    if _espelho_disponivel():
+        try:
+            inicio = 0
+            while True:
+                resposta = (
+                    supabase.table("praesidium_empresa_mirror")
+                    .select("record_key,payload")
+                    .eq("empresa_id", empresa_id)
+                    .eq("record_type", "item")
+                    .range(inicio, inicio + 999)
+                    .execute()
+                )
+                pagina = resposta.data or []
+                linhas_espelho.extend(pagina)
+                if len(pagina) < 1000:
+                    break
+                inicio += 1000
+            leitura_espelho_ok = True
+        except Exception as erro:
+            linhas_espelho = []
+            if not _registrar_recurso_ausente(erro, "praesidium_empresa_mirror"):
+                logging.getLogger(__name__).warning(
+                    "Falha ao ler o espelho de itens da empresa %s antes do reprocessamento: %s",
+                    empresa_id,
+                    erro,
+                )
+    else:
         leitura_espelho_ok = True
-    except Exception:
-        linhas_espelho = []
-        leitura_espelho_ok = False
-        logging.getLogger(__name__).exception(
-            "Falha ao ler o espelho de itens da empresa %s antes do reprocessamento.",
-            empresa_id,
-        )
     if not leitura_primaria_ok and not leitura_espelho_ok:
         raise RuntimeError("Não foi possível preservar as decisões de auditoria existentes.")
 
@@ -3990,44 +3940,46 @@ def _limpar_itens_anteriores(
         return True
 
     limpeza_completa = True
-    try:
-        espelho_resposta = (
-            supabase.table("praesidium_empresa_mirror")
-            .select("record_key,payload")
-            .eq("empresa_id", empresa_id)
-            .eq("record_type", "item")
-            .execute()
-        )
-        chaves_espelho = [
-            str(linha.get("record_key"))
-            for linha in (espelho_resposta.data or [])
-            if isinstance(linha.get("payload"), dict)
-            and (
-                str(linha["payload"].get("nota_id")) in nota_ids
-                or any(
-                    str(linha.get("record_key", "")).startswith(
-                        f"{chave}::ITEM::"
-                    )
-                    for chave in (chaves_acesso or set())
-                )
-            )
-            and linha.get("record_key")
-        ]
-        if chaves_espelho:
-            (
+    if _espelho_disponivel():
+        try:
+            espelho_resposta = (
                 supabase.table("praesidium_empresa_mirror")
-                .delete()
+                .select("record_key,payload")
                 .eq("empresa_id", empresa_id)
                 .eq("record_type", "item")
-                .in_("record_key", chaves_espelho)
                 .execute()
             )
-    except Exception:
-        logging.getLogger(__name__).exception(
-            "Falha ao limpar itens do espelho antes do reprocessamento da empresa %s.",
-            empresa_id,
-        )
-        limpeza_completa = False
+            chaves_espelho = [
+                str(linha.get("record_key"))
+                for linha in (espelho_resposta.data or [])
+                if isinstance(linha.get("payload"), dict)
+                and (
+                    str(linha["payload"].get("nota_id")) in nota_ids
+                    or any(
+                        str(linha.get("record_key", "")).startswith(
+                            f"{chave}::ITEM::"
+                        )
+                        for chave in (chaves_acesso or set())
+                    )
+                )
+                and linha.get("record_key")
+            ]
+            if chaves_espelho:
+                (
+                    supabase.table("praesidium_empresa_mirror")
+                    .delete()
+                    .eq("empresa_id", empresa_id)
+                    .eq("record_type", "item")
+                    .in_("record_key", chaves_espelho)
+                    .execute()
+                )
+        except Exception as erro:
+            if not _registrar_recurso_ausente(erro, "praesidium_empresa_mirror"):
+                logging.getLogger(__name__).exception(
+                    "Falha ao limpar itens do espelho antes do reprocessamento da empresa %s.",
+                    empresa_id,
+                )
+                limpeza_completa = False
 
     try:
         supabase.table("itens_nota_fiscal").delete().eq(
@@ -4041,32 +3993,34 @@ def _limpar_itens_anteriores(
         )
         limpeza_completa = False
 
-    try:
-        resposta_ledger = (
-            supabase.table("praesidium_ledger_fiscal")
-            .select("item_uid")
-            .eq("empresa_id", empresa_id)
-            .execute()
-        )
-        uids_ledger = [
-            str(registro.get("item_uid"))
-            for registro in (resposta_ledger.data or [])
-            if registro.get("item_uid")
-            and any(
-                str(registro["item_uid"]).startswith(f"{chave}::ITEM::")
-                for chave in (chaves_acesso or set())
+    if _ledger_fiscal_disponivel():
+        try:
+            resposta_ledger = (
+                supabase.table("praesidium_ledger_fiscal")
+                .select("item_uid")
+                .eq("empresa_id", empresa_id)
+                .execute()
             )
-        ]
-        if uids_ledger:
-            supabase.table("praesidium_ledger_fiscal").delete().eq(
-                "empresa_id", empresa_id
-            ).in_("item_uid", uids_ledger).execute()
-    except Exception:
-        logging.getLogger(__name__).exception(
-            "Falha ao limpar o ledger fiscal antes do reprocessamento da empresa %s.",
-            empresa_id,
-        )
-        limpeza_completa = False
+            uids_ledger = [
+                str(registro.get("item_uid"))
+                for registro in (resposta_ledger.data or [])
+                if registro.get("item_uid")
+                and any(
+                    str(registro["item_uid"]).startswith(f"{chave}::ITEM::")
+                    for chave in (chaves_acesso or set())
+                )
+            ]
+            if uids_ledger:
+                supabase.table("praesidium_ledger_fiscal").delete().eq(
+                    "empresa_id", empresa_id
+                ).in_("item_uid", uids_ledger).execute()
+        except Exception as erro:
+            if not _registrar_recurso_ausente(erro, "praesidium_ledger_fiscal"):
+                logging.getLogger(__name__).exception(
+                    "Falha ao limpar o ledger fiscal antes do reprocessamento da empresa %s.",
+                    empresa_id,
+                )
+                limpeza_completa = False
 
     st.session_state[chave_sessao] = [
             item
@@ -4085,6 +4039,8 @@ def processar_devolucao_nfe_xml(
 ) -> tuple[bool, str]:
     if supabase is None:
         return False, "Supabase indisponível; a devolução não pode ser persistida."
+    if not eh_uuid_valido(empresa_id_ativo):
+        return False, "Devolução cancelada: a empresa ativa não possui um UUID válido."
     try:
         raiz = ET.fromstring(xml_bytes)
     except ET.ParseError:
@@ -4366,225 +4322,6 @@ def processar_devolucao_nfe_xml(
     return True, f"Devolução registrada; estorno de crédito R$ {credito_estornado:,.2f}."
 
 
-# ============================================================================
-# FUNÇÕES AUXILIARES DE PERSISTÊNCIA EM [SYS_NOTA]/[SYS_ITEM]
-# ============================================================================
-
-def _persistir_nota_fiscal_supabase(
-    supabase,
-    empresa_id: str,
-    nota_payload: dict,
-    atualizar: bool = False,
-    nota_id_existente: str | None = None,
-) -> tuple[bool, dict | None]:
-    """
-    Persiste uma nota fiscal em [SYS_NOTA] dentro de empresas_monitoradas.
-    
-    Args:
-        supabase: Cliente Supabase
-        empresa_id: ID da empresa cliente
-        nota_payload: Dicionário com dados da nota
-        atualizar: Se True, faz UPDATE; senão, INSERT
-        nota_id_existente: ID da nota para UPDATE (se aplicável)
-    
-    Returns:
-        (sucesso: bool, nota_registrada: dict | None)
-    """
-    if not ppf or not hasattr(ppf, 'codificar_nota'):
-        logging.getLogger(__name__).warning(
-            "Módulo ppf não disponível; pulando persistência [SYS_NOTA]"
-        )
-        return False, None
-    
-    try:
-        nota_id = str(nota_payload.get("id") or nota_id_existente or str(uuid.uuid4()))
-        chave_acesso = str(nota_payload.get("chave_acesso", ""))
-        numero_nf = str(nota_payload.get("numero_nf", ""))
-        serie_nf = str(nota_payload.get("serie_nf", ""))
-        valor_total = _float_seguro(nota_payload.get("valor_total", 0.0), 0.0)
-        cnpj_fornecedor = str(nota_payload.get("cnpj_fornecedor", ""))
-        razao_fornecedor = str(nota_payload.get("razao_fornecedor", ""))
-        
-        # Codificar nota em formato [SYS_NOTA]
-        nota_registrada = ppf.codificar_nota(
-            empresa_id=empresa_id,
-            nota_id=nota_id,
-            chave_acesso=chave_acesso,
-            numero_nf=numero_nf,
-            serie_nf=serie_nf,
-            valor_total=valor_total,
-            cnpj_fornecedor=cnpj_fornecedor,
-            razao_fornecedor=razao_fornecedor,
-        )
-        
-        # Adicionar metadados da nota
-        nota_registrada["empresa_id"] = empresa_id
-        for chave in ("id", "created_at", "updated_at"):
-            nota_registrada.pop(chave, None)
-        
-        if atualizar and nota_id_existente:
-            # UPDATE [SYS_NOTA] existente
-            supabase.table("empresas_monitoradas").update(nota_registrada).eq(
-                "id", nota_id_existente
-            ).eq("empresa_id", empresa_id).execute()
-            logging.getLogger(__name__).debug(
-                "Nota %s atualizada em [SYS_NOTA]", chave_acesso
-            )
-            return True, {**nota_registrada, "id": nota_id_existente}
-        else:
-            # INSERT nova [SYS_NOTA]
-            resultado = supabase.table("empresas_monitoradas").insert([nota_registrada]).execute()
-            if resultado.data:
-                nota_salva = resultado.data[0]
-                logging.getLogger(__name__).debug(
-                    "Nota %s inserida em [SYS_NOTA] com id=%s", chave_acesso, nota_salva.get("id")
-                )
-                return True, nota_salva
-            else:
-                logging.getLogger(__name__).error(
-                    "INSERT de [SYS_NOTA] retornou sem dados"
-                )
-                return False, None
-    except Exception as erro:
-        logging.getLogger(__name__).error(
-            "Erro ao persistir nota em [SYS_NOTA]: %s", erro
-        )
-        return False, None
-
-
-def _persistir_itens_supabase(
-    supabase,
-    empresa_id: str,
-    itens: list[dict],
-) -> tuple[bool, list[dict]]:
-    """
-    Persiste uma lista de itens em [SYS_ITEM] dentro de empresas_monitoradas.
-    
-    Args:
-        supabase: Cliente Supabase
-        empresa_id: ID da empresa cliente
-        itens: Lista de dicionários de itens
-    
-    Returns:
-        (sucesso: bool, itens_registrados: list[dict])
-    """
-    if not ppf or not hasattr(ppf, 'codificar_item'):
-        logging.getLogger(__name__).warning(
-            "Módulo ppf não disponível; pulando persistência [SYS_ITEM]"
-        )
-        return False, []
-    
-    if not itens:
-        return True, []
-    
-    itens_registrados = []
-    itens_para_insert = []
-    
-    try:
-        for item in itens:
-            item_id = str(item.get("item_uid") or str(uuid.uuid4()))
-            nota_id = str(item.get("nota_id", ""))
-            ncm = str(item.get("ncm", ""))
-            descricao = str(item.get("descricao", ""))
-            valor_item = _float_seguro(item.get("valor_item", 0.0), 0.0)
-            aliquota_ibs = _float_seguro(item.get("aliquota_ibs_aplicada", 0.0), 0.0)
-            aliquota_cbs = _float_seguro(item.get("aliquota_cbs_aplicada", 0.0), 0.0)
-            status_credito = str(item.get("status_credito", "Crédito Validado"))
-            classificacao = str(item.get("classificacao_item", "Operacional"))
-            credito_ibs = _float_seguro(item.get("credito_ibs_gerado", 0.0), 0.0)
-            credito_cbs = _float_seguro(item.get("credito_cbs_gerado", 0.0), 0.0)
-            
-            # Codificar item em formato [SYS_ITEM]
-            item_registrado = ppf.codificar_item(
-                nota_id=nota_id,
-                empresa_id=empresa_id,
-                item_uid=item_id,
-                ncm=ncm,
-                descricao=descricao,
-                valor_item=valor_item,
-                aliquota_ibs=aliquota_ibs,
-                aliquota_cbs=aliquota_cbs,
-                status_credito=status_credito,
-                classificacao_item=classificacao,
-                credito_ibs_gerado=credito_ibs,
-                credito_cbs_gerado=credito_cbs,
-            )
-            
-            # Adicionar metadados
-            item_registrado["empresa_id"] = empresa_id
-            for chave in ("id", "created_at", "updated_at"):
-                item_registrado.pop(chave, None)
-            
-            itens_para_insert.append(item_registrado)
-            itens_registrados.append({**item_registrado, "id": item_id})
-        
-        if itens_para_insert:
-            resultado = supabase.table("empresas_monitoradas").insert(itens_para_insert).execute()
-            if resultado.data and len(resultado.data) == len(itens_para_insert):
-                logging.getLogger(__name__).debug(
-                    "Inseridos %d itens em [SYS_ITEM]", len(resultado.data)
-                )
-                return True, resultado.data
-            else:
-                logging.getLogger(__name__).error(
-                    "INSERT de [SYS_ITEM] retornou %d de %d itens",
-                    len(resultado.data) if resultado.data else 0,
-                    len(itens_para_insert),
-                )
-                return False, []
-    except Exception as erro:
-        logging.getLogger(__name__).error(
-            "Erro ao persistir itens em [SYS_ITEM]: %s", erro
-        )
-        return False, []
-    
-    return True, itens_registrados
-
-
-def _limpar_itens_nota_supabase(
-    supabase,
-    empresa_id: str,
-    nota_id: str,
-) -> bool:
-    """
-    Remove todos os [SYS_ITEM] de uma nota específica.
-    
-    Args:
-        supabase: Cliente Supabase
-        empresa_id: ID da empresa
-        nota_id: ID da nota
-    
-    Returns:
-        True se limpo com sucesso (ou se tabela não existir)
-    """
-    try:
-        # Buscar todos os [SYS_ITEM] onde cnae_principal == nota_id
-        itens = supabase.table("empresas_monitoradas").select("id").eq(
-            "regime_tributario", ppf.REGIME_TRIBUTARIO_ITEM if ppf else "SYS_ITEM"
-        ).eq("cnae_principal", nota_id).execute()
-        
-        ids_para_deletar = [item["id"] for item in (itens.data or [])]
-        if ids_para_deletar:
-            for id_item in ids_para_deletar:
-                supabase.table("empresas_monitoradas").delete().eq(
-                    "id", id_item
-                ).execute()
-            logging.getLogger(__name__).debug(
-                "Deletados %d itens da nota %s", len(ids_para_deletar), nota_id
-            )
-        
-        return True
-    except Exception as erro:
-        codigo = _codigo_erro_supabase(erro)
-        if codigo in {"42P01", "PGRST205"}:
-            # Tabela não existe, mas isso é OK
-            return True
-        logging.getLogger(__name__).error(
-            "Erro ao limpar itens da nota %s: %s", nota_id, erro
-        )
-        return False
-
-
 def processar_xml_lote_bytes(
     arquivos: list[tuple[str, bytes]],
     supabase,
@@ -4592,10 +4329,10 @@ def processar_xml_lote_bytes(
     empresa_ativa: dict,
     cnpjs_adicionais_autorizados: list[str] | None = None,
 ) -> list[tuple[bool, str]]:
-    """
-    REFORMULADO: Processa lote de XMLs com persistência em [SYS_NOTA]/[SYS_ITEM].
-    Mantém 100% da lógica de negócio (classificação, validação, cálculos).
-    Muda apenas persistência: de tabelas inexistentes para registros especiais em empresas_monitoradas.
+    """Processa um lote de NF-e gravando em notas_fiscais_recebidas e itens_nota_fiscal.
+
+    Todo payload passa por `executar_insert_seguro`/`executar_update_seguro`, que
+    sanitizam tipos (inteiros, numéricos, UUID, VARCHAR) conforme o banco real.
     """
     resultados = [(False, "Não foi possível processar o XML.") for _ in arquivos]
     if supabase is None:
@@ -4603,8 +4340,12 @@ def processar_xml_lote_bytes(
             (False, "Supabase indisponível; o XML não foi persistido.")
             for _ in arquivos
         ]
-    
-    # ========== SETUP (IGUAL AO ORIGINAL) ==========
+    if not eh_uuid_valido(empresa_id_ativo):
+        return [
+            (False, "Importação cancelada: a empresa ativa não possui um UUID válido.")
+            for _ in arquivos
+        ]
+
     perfil_tributario = carregar_perfil_tributario_empresa(
         supabase,
         empresa_id_ativo,
@@ -4613,30 +4354,12 @@ def processar_xml_lote_bytes(
         perfil_tributario.get("fator_reducao"),
         1.0,
     )
-    
-    # Carregar notas existentes [SYS_NOTA] (não de notas_fiscais_recebidas que não existe)
-    notas_existentes = {}
+
     try:
-        # Buscar [SYS_NOTA] da empresa
-        notas_sys = supabase.table("empresas_monitoradas").select("*").eq(
-            "regime_tributario",
-            ppf.REGIME_TRIBUTARIO_NOTA if ppf else "SYS_NOTA"
-        ).eq("cnae_principal", empresa_id_ativo).execute()
-        
-        for nota_sys in (notas_sys.data or []):
-            nota_decodificada = ppf.decodificar_nota(nota_sys) if ppf else None
-            if nota_decodificada:
-                chave = str(nota_decodificada.get("chave_acesso", ""))
-                notas_existentes[chave] = {
-                    **nota_decodificada,
-                    "_sys_id": nota_sys.get("id"),
-                }
-    except Exception as erro:
-        logging.getLogger(__name__).debug(
-            "Não foi possível carregar notas existentes [SYS_NOTA]: %s", erro
-        )
-        # Continua mesmo se falhar (notas_existentes = {})
-    
+        notas_existentes = _carregar_notas_existentes(supabase, empresa_id_ativo)
+    except RuntimeError as erro:
+        return [(False, str(erro)) for _ in arquivos]
+
     hashes_lote: set[str] = set()
     chaves_lote: set[str] = set()
     preparados = []
@@ -4693,93 +4416,80 @@ def processar_xml_lote_bytes(
         else:
             novas_notas.append(item_preparado)
 
-    # ========== PERSISTIR NOTAS (MUDANÇA #1: Usar [SYS_NOTA]) ==========
-    
-    # Atualizar notas existentes
+    # Atualiza as notas já registradas e insere as novas pela camada segura.
     for item_preparado, nota_existente in notas_para_atualizar:
         indice, _, nota_payload, _ = item_preparado
-        nota_id_existente = nota_existente.get("_sys_id")
-        
+        nota_id_existente = nota_existente.get("id")
         if nota_id_existente is None:
             resultados[indice] = (
                 False,
                 "A nota existente não possui vínculo persistente para sincronizar.",
             )
             continue
-        
-        ok_atualizacao, nota_atualizada = _persistir_nota_fiscal_supabase(
+        campos_atualizaveis = {
+            campo: valor
+            for campo, valor in nota_payload.items()
+            if campo not in {"empresa_id", "chave_acesso"}
+        }
+        ok_atualizacao, _, notas_atualizadas = executar_update_seguro(
             supabase,
-            empresa_id_ativo,
-            nota_payload,
-            atualizar=True,
-            nota_id_existente=nota_id_existente,
+            "notas_fiscais_recebidas",
+            campos_atualizaveis,
+            {"id": nota_id_existente, "empresa_id": empresa_id_ativo},
         )
-        
-        if not ok_atualizacao:
+        if not ok_atualizacao or not notas_atualizadas:
             resultados[indice] = (
                 False,
                 "Não foi possível atualizar a nota existente.",
             )
             continue
-        
-        notas_por_chave[str(nota_payload["chave_acesso"])] = nota_atualizada
-    
-    # Inserir notas novas
-    if novas_notas:
-        notas_resultado_insercao = []
-        for indice, nome_arquivo, nota_payload, itens_nota in novas_notas:
-            ok_insercao, nota_inserida = _persistir_nota_fiscal_supabase(
-                supabase,
-                empresa_id_ativo,
-                nota_payload,
-                atualizar=False,
-            )
-            
-            if not ok_insercao or not nota_inserida:
-                resultados[indice] = (
-                    False,
-                    "Não foi possível registrar a nota. Tente novamente.",
-                )
-                continue
-            
-            notas_por_chave[str(nota_payload["chave_acesso"])] = nota_inserida
-            notas_resultado_insercao.append((indice, nota_payload, nota_inserida))
-        
-        if not notas_resultado_insercao:
-            # Nenhuma nota foi inserida com sucesso
-            return resultados
-    
-    # Carregar itens existentes [SYS_ITEM] da empresa
-    itens_existentes = {}
-    try:
-        itens_sys = supabase.table("empresas_monitoradas").select("*").eq(
-            "regime_tributario",
-            ppf.REGIME_TRIBUTARIO_ITEM if ppf else "SYS_ITEM"
-        ).eq("cnae_principal", empresa_id_ativo).execute()
-        
-        for item_sys in (itens_sys.data or []):
-            item_decodificado = ppf.decodificar_item(item_sys) if ppf else None
-            if item_decodificado:
-                uid = str(item_decodificado.get("item_uid", ""))
-                itens_existentes[uid] = {
-                    **item_decodificado,
-                    "_sys_id": item_sys.get("id"),
-                }
-    except Exception as erro:
-        logging.getLogger(__name__).debug(
-            "Não foi possível carregar itens existentes [SYS_ITEM]: %s", erro
+        notas_por_chave[str(nota_payload["chave_acesso"])] = {
+            **notas_atualizadas[0],
+            "id": nota_id_existente,
+        }
+
+    ids_notas_novas: set[str] = set()
+    for indice, nome_arquivo, nota_payload, itens_nota in novas_notas:
+        ok_insercao, _, nota_inserida = executar_insert_seguro(
+            "notas_fiscais_recebidas",
+            nota_payload,
+            supabase=supabase,
         )
+        if not ok_insercao or not nota_inserida or nota_inserida[0].get("id") is None:
+            resultados[indice] = (
+                False,
+                "Não foi possível registrar a nota. Tente novamente.",
+            )
+            continue
+        notas_por_chave[str(nota_payload["chave_acesso"])] = nota_inserida[0]
+        ids_notas_novas.add(str(nota_inserida[0]["id"]))
+
+    if not notas_por_chave:
+        return resultados
+
+    try:
+        itens_existentes = _carregar_itens_existentes_empresa(
+            supabase,
+            empresa_id_ativo,
+            notas_existentes,
+        )
+    except RuntimeError as erro:
         itens_existentes = {}
+        for item_preparado, _ in notas_para_atualizar:
+            indice, _, nota_payload, _ = item_preparado
+            resultados[indice] = (False, str(erro))
+            notas_por_chave.pop(str(nota_payload["chave_acesso"]), None)
+        if not notas_por_chave:
+            return resultados
 
     # ========== PREPARAR E CLASSIFICAR ITENS (IGUAL AO ORIGINAL) ==========
-    itens_lote = []
     dados_sucesso = []
     for indice, nome_arquivo, nota_payload, itens in preparados:
         if not resultados[indice][0] and resultados[indice][1] != "Não foi possível processar o XML.":
             continue
         
         nota_resultado = notas_por_chave.get(str(nota_payload["chave_acesso"]))
-        nota_id = nota_resultado.get("nota_id") if nota_resultado else None
+        nota_id = nota_resultado.get("id") if nota_resultado else None
         
         if nota_id is None:
             resultados[indice] = (False, "Não foi possível confirmar o registro da nota.")
@@ -4896,59 +4606,73 @@ def processar_xml_lote_bytes(
             
             itens_da_nota.append(item_persistido)
         
-        itens_lote.extend(itens_da_nota)
         dados_sucesso.append((indice, nome_arquivo, nota_payload, itens_da_nota))
 
-    # ========== PERSISTIR ITENS (MUDANÇA #2: Usar [SYS_ITEM]) ==========
-    if itens_lote:
-        # Limpar itens antigos [SYS_ITEM] de cada nota
-        notas_para_limpar = {
-            str(notas_por_chave[str(nota_payload["chave_acesso"])].get("nota_id", ""))
-            for _, _, nota_payload, _ in dados_sucesso
-            if str(nota_payload["chave_acesso"]) in notas_por_chave
-        }
-        
-        for nota_id in notas_para_limpar:
-            if nota_id:
-                _limpar_itens_nota_supabase(supabase, empresa_id_ativo, nota_id)
-        
-        # Inserir novos [SYS_ITEM]
-        ok_itens, itens_resultado = _persistir_itens_supabase(
+    # Persiste os itens nota a nota para localizar falhas e reverter notas novas.
+    dados_persistidos = []
+    for indice, nome_arquivo, nota_payload, itens_da_nota in dados_sucesso:
+        chave = str(nota_payload["chave_acesso"])
+        nota_id = str(notas_por_chave[chave]["id"])
+        nota_nova = nota_id in ids_notas_novas
+        if not _limpar_itens_anteriores(
             supabase,
             empresa_id_ativo,
-            itens_lote,
-        )
-        
-        if not ok_itens or not itens_resultado:
-            # Fallback: guardar em session_state
-            chave_sessao_itens = f"fallback_itens_{empresa_id_ativo}"
-            st.session_state[chave_sessao_itens] = itens_lote
-            logging.getLogger(__name__).warning(
-                "Itens persistidos no fallback session_state (%s)", chave_sessao_itens
+            {nota_id},
+            {chave},
+        ) and not nota_nova:
+            resultados[indice] = (
+                False,
+                "Não foi possível substituir os itens anteriores da nota.",
             )
-            
-            for indice, _, nota_payload, _ in dados_sucesso:
-                resultados[indice] = (False, "Não foi possível registrar os itens da nota.")
-            
-            return resultados
+            continue
+        if itens_da_nota:
+            ok_itens, mensagem_itens, _ = executar_insert_seguro(
+                "itens_nota_fiscal",
+                itens_da_nota,
+                supabase=supabase,
+                operacao="upsert",
+            )
+            if not ok_itens:
+                logging.getLogger(__name__).error(
+                    "Itens da nota %s não foram gravados: %s", chave, mensagem_itens
+                )
+                if nota_nova:
+                    try:
+                        supabase.table("notas_fiscais_recebidas").delete().eq(
+                            "id", nota_id
+                        ).eq("empresa_id", empresa_id_ativo).execute()
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "Falha ao remover a nota %s após falha nos itens.",
+                            nota_id,
+                        )
+                resultados[indice] = (
+                    False,
+                    "Não foi possível registrar os itens da nota.",
+                )
+                continue
+        dados_persistidos.append((indice, nome_arquivo, nota_payload, itens_da_nota))
 
-    # ========== LIMPEZA E RETORNO ==========
+    if not dados_persistidos:
+        return resultados
+
     limpar_caches_dados()
-    
-    for indice, nome_arquivo, nota, itens in dados_sucesso:
+
+    for indice, nome_arquivo, nota, itens in dados_persistidos:
         credito_bruto = calcular_resumo_creditos(itens)["bruto"]
         resultados[indice] = (
             True,
             f"NF-e {str(nota['chave_acesso'])[:10]}... auditada com sucesso "
             f"({len(itens)} itens processados; crédito bruto R$ {credito_bruto:,.2f}).",
         )
-    
+
     st.toast(
-        "Notas e itens persistidos com sucesso em [SYS_NOTA]/[SYS_ITEM].",
+        "Notas e itens persistidos com sucesso no Supabase.",
         icon="✓",
     )
-    
+
     return resultados
+
 
 def processar_xml_bytes(
     xml_bytes: bytes,
