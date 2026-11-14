@@ -35,6 +35,8 @@ REGIME_TRIBUTARIO_AUTH = "SYS_AUTH"
 REGIME_TRIBUTARIO_LOG = "SYS_LOG"
 
 CHAVE_LEDGER_PERFIL_TRIBUTARIO = "config:aliquota-ibs-cbs:v1"
+CHAVE_LEDGER_COFRE_SALDO = "config:saldo-consolidado:v1"
+TIPO_REGISTRO_COFRE_SALDO = "company_balance_vault"
 
 
 def eh_registro_sistema(razao_social: str, regime_tributario: str) -> bool:

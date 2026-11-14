@@ -53,6 +53,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+xml_engine.injetar_css_anti_truncamento()
 
 # ==========================================
 # 1. DESIGN SYSTEM "DARK LUXURY" BLINDADO P/ MOBILE E DESKTOP
@@ -1239,8 +1240,8 @@ if not st.session_state["autenticado"]:
         aba_entrar, aba_cadastro = st.tabs(["Entrar", "Criar Conta"])
         with aba_entrar:
             with st.form("form_login_mvp", border=False):
-                identificacao_input = st.text_input("Usuário")
-                senha_input = st.text_input("Senha", type="password")
+                identificacao_input = st.text_input("Usuário", autocomplete="off")
+                senha_input = st.text_input("Senha", type="password", autocomplete="off")
                 manter_conectado = st.checkbox("Manter conectado neste aparelho", value=True)
                 btn_entrar = st.form_submit_button("Entrar", width="stretch")
             if btn_entrar:
@@ -1276,9 +1277,9 @@ if not st.session_state["autenticado"]:
                     st.error("Usuário ou senha incorretos. Verifique a grafia.")
         with aba_cadastro:
             with st.form("form_primeiro_acesso", border=False):
-                novo_nome_usuario = st.text_input("Nome")
-                novo_usuario_input = st.text_input("Usuário")
-                nova_senha = st.text_input("Senha", type="password")
+                novo_nome_usuario = st.text_input("Nome", autocomplete="off")
+                novo_usuario_input = st.text_input("Usuário", autocomplete="off")
+                nova_senha = st.text_input("Senha", type="password", autocomplete="off")
                 btn_criar_conta = st.form_submit_button("Criar Conta", width="stretch")
             if btn_criar_conta:
                 novo_usuario = novo_usuario_input.lower()
@@ -1656,36 +1657,12 @@ def hidratar_dados_empresa_supabase(empresa_id: str) -> dict[str, list[dict]]:
         "_dados_hidratados_por_empresa",
         {},
     )
-    try:
-        dados = xml_engine.hidratar_dados_empresa_supabase(
-            supabase,
-            empresa_id,
-            empresa_ativa,
-        )
-    except RuntimeError:
-        logging.getLogger(__name__).warning(
-            "Hidratação indisponível para a empresa %s; usando o último snapshot válido.",
-            empresa_id,
-        )
-        dados = xml_engine.hidratar_dados_empresa_com_cache(
-            supabase,
-            empresa_id,
-            empresa_ativa,
-            cache_hidratacao,
-        )
-        return dados
-    snapshot = cache_hidratacao.get(str(empresa_id))
-    if dados.get("_falha_hidratacao") and snapshot is not None:
-        return snapshot
-    cache_hidratacao[str(empresa_id)] = dados
-    for nome in (
-        "fallback_notas",
-        "fallback_itens",
-        "fallback_devolucoes",
-        "fallback_split_payment",
-    ):
-        st.session_state.pop(f"{nome}_{empresa_id}", None)
-    return dados
+    return xml_engine.hidratar_dados_empresa_protegido(
+        supabase,
+        empresa_id,
+        empresa_ativa,
+        cache_hidratacao,
+    )
 
 
 TAG_TENANT_RE = re.compile(r"\s*\[T:([^\]]+)\]", re.IGNORECASE)
@@ -1875,16 +1852,37 @@ else:
         if extrair_tenant_empresa(e) == tenant_atual
     ]
 
+def reiniciar_formulario_cadastro() -> None:
+    """Nova versão das chaves: todas as caixas do cadastro e da devolução reabrem vazias."""
+    st.session_state["_versao_form_cadastro"] = (
+        int(st.session_state.get("_versao_form_cadastro", 0)) + 1
+    )
+    st.session_state["cnae_secundarios_extras"] = []
+
+
+_chave_selecao_empresa_inicial = f"empresa_ativa_select_{usuario_autenticado}"
+_selecao_empresa_atual = st.session_state.get(_chave_selecao_empresa_inicial)
+_selecao_empresa_anterior = st.session_state.get("_selecao_empresa_anterior")
+if (
+    _selecao_empresa_atual is not None
+    and _selecao_empresa_anterior is not None
+    and _selecao_empresa_atual != _selecao_empresa_anterior
+):
+    reiniciar_formulario_cadastro()
+if _selecao_empresa_atual is not None:
+    st.session_state["_selecao_empresa_anterior"] = _selecao_empresa_atual
+versao_formulario = int(st.session_state.get("_versao_form_cadastro", 0))
+
 with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
-    novo_nome = st.text_input("Razão Social", key="cad_nome")
-    novo_cnpj = st.text_input("CNPJ (Com ou sem pontuação)", key="cad_cnpj")
-    novo_regime = st.selectbox("Regime", ["Simples Nacional", "Simples Híbrido (LC 214)", "Lucro Presumido", "Lucro Real"], key="cad_regime")
+    novo_nome = st.text_input("Razão Social", autocomplete="off", key=f"cad_nome_{versao_formulario}")
+    novo_cnpj = st.text_input("CNPJ (Com ou sem pontuação)", autocomplete="off", key=f"cad_cnpj_{versao_formulario}")
+    novo_regime = st.selectbox("Regime", ["Simples Nacional", "Simples Híbrido (LC 214)", "Lucro Presumido", "Lucro Real"], key=f"cad_regime_{versao_formulario}")
     derivacao_tributaria_nova = st.selectbox(
         "Derivação IBS + CBS",
         list(xml_engine.ALIQUOTAS_REFORMA_TRIBUTARIA),
-        key="cad_derivacao_tributaria",
+        key=f"cad_derivacao_tributaria_{versao_formulario}",
     )
-    cnae_principal_input = st.text_input("Atividade Principal (CNAE 7 dígitos)", placeholder="Ex: 4711302 ou 9602501", key="cad_cnae_prin")
+    cnae_principal_input = st.text_input("Atividade Principal (CNAE 7 dígitos)", placeholder="Ex: 4711302 ou 9602501", autocomplete="off", key=f"cad_cnae_prin_{versao_formulario}")
 
     if "cnae_secundarios_extras" not in st.session_state:
         st.session_state["cnae_secundarios_extras"] = []
@@ -1893,7 +1891,7 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
 
     cnaes_secundarios_coletados = []
     for idx, val_cnae in enumerate(st.session_state["cnae_secundarios_extras"]):
-        c_val = st.text_input(f"CNAE Secundário {idx+1}", value=val_cnae, key=f"sec_cnae_input_{idx}")
+        c_val = st.text_input(f"CNAE Secundário {idx+1}", value=val_cnae, autocomplete="off", key=f"sec_cnae_input_{versao_formulario}_{idx}")
         if c_val.strip():
             cnaes_secundarios_coletados.append("".join(filter(str.isdigit, c_val)))
 
@@ -1933,6 +1931,7 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                 st.session_state["empresa_id_ativa"] = empresa_existente["id"]
                 st.session_state.pop(f"empresa_ativa_select_{usuario_autenticado}", None)
                 st.session_state["_forcar_selecao_empresa"] = True
+                reiniciar_formulario_cadastro()
                 persistir_estado_sessao()
                 st.toast("Cliente já cadastrado; selecionado como cliente ativo.", icon="ℹ️")
                 st.rerun()
@@ -2002,7 +2001,7 @@ with st.sidebar.expander("➕ Cadastrar Novo Cliente", expanded=False):
                                 "Cliente cadastrado, mas não foi possível persistir a derivação IBS/CBS. "
                                 "Salve-a novamente na ficha do cliente."
                             )
-                    st.session_state["cnae_secundarios_extras"] = []
+                    reiniciar_formulario_cadastro()
                     limpar_caches_dados()
                     if empresa_nova and xml_engine.eh_uuid_valido(empresa_nova.get("id")):
                         st.session_state["empresa_id_ativa"] = empresa_nova["id"]
@@ -2183,7 +2182,8 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
         "Atualizar CNAEs (separados por vírgula)",
         value=str(empresa_ativa.get("cnae_principal", "")),
         help="Ex: 9602501 (Salão), 4772500 (Cosméticos), 4711302 (Supermercado)",
-        key=f"edit_cnae_{empresa_id_ativo}"
+        autocomplete="off",
+        key=f"edit_cnae_{empresa_id_ativo}_{int(st.session_state.get('_versao_edit_cnae', 0))}"
     )
     if st.button("💾 Salvar Novo CNAE", width="stretch", key=f"btn_save_cnae_{empresa_id_ativo}"):
         owner_tag = extrair_tenant_empresa(empresa_ativa_bruta) or tenant_atual
@@ -2215,6 +2215,9 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
                 if not ok or not resultado:
                     raise RuntimeError("Atualização não confirmada.")
                 limpar_caches_dados()
+                st.session_state["_versao_edit_cnae"] = (
+                    int(st.session_state.get("_versao_edit_cnae", 0)) + 1
+                )
                 if mensagem_update == "OK":
                     st.sidebar.success("CNAEs atualizados!")
                 else:
@@ -2243,9 +2246,15 @@ with st.sidebar.expander("⚙️ Ajustar CNAE / Resetar Notas", expanded=False):
     memoria_selecionada = xml_engine.calcular_memoria_aliquota(
         derivacao_selecionada
     )
+    fator_legivel = (
+        f"{memoria_selecionada['fator_reducao']:.0%}"
+        if round(memoria_selecionada["fator_reducao"] * 100, 6)
+        == round(memoria_selecionada["fator_reducao"] * 100)
+        else f"{memoria_selecionada['fator_reducao']:.2%}"
+    )
     st.caption(
         f"Base Legal 26,50% (17,70% IBS + 8,80% CBS) → "
-        f"Fator de Redução {memoria_selecionada['fator_reducao']:.0%} → "
+        f"Fator de Redução {fator_legivel} → "
         f"Alíquota Efetiva Final {memoria_selecionada['aliquota_efetiva']:.2f}% "
         f"(IBS {memoria_selecionada['aliquota_ibs_efetiva']:.2f}% + "
         f"CBS {memoria_selecionada['aliquota_cbs_efetiva']:.2f}%)."
@@ -2380,8 +2389,6 @@ itens_mes = [
     if periodo_por_nota.get(str(i.get("nota_id"))) == competencia_atual
 ]
 resumo_creditos_acumulado = xml_engine.calcular_resumo_creditos(itens)
-imposto_quarentena_acumulado = resumo_creditos_acumulado["quarentena"]
-imposto_bruto_acumulado = resumo_creditos_acumulado["bruto"]
 ids_notas_mes = {
     str(n.get("id"))
     for n in notas
@@ -2410,12 +2417,11 @@ imposto_estornado = round(sum(
     for d in devolucoes
 ), 2)
 
-resumo_saldo_credito = xml_engine.calcular_saldo_credito_digital(
-    itens,
-    devolucoes,
-    eventos_split,
-    eventos_liquidacao,
+resumo_saldo_credito = xml_engine.calcular_saldos_com_cofre(
+    dados_empresa_hidratados
 )
+imposto_quarentena_acumulado = resumo_saldo_credito["quarentena"]
+imposto_bruto_acumulado = resumo_saldo_credito["bruto"]
 valor_retido_split_payment = resumo_saldo_credito["valor_retido_split_payment"]
 credito_validado_tempo_real = resumo_saldo_credito["credito_liquido"]
 saldo_credito_disponivel = resumo_saldo_credito["credito_disponivel"]
@@ -2435,16 +2441,7 @@ def renderizar_cards_telemetria() -> None:
         )
         st.caption("Atualização temporariamente indisponível; exibindo o último snapshot válido.")
 
-    itens_live = [
-        xml_engine.normalizar_item_credito(item)
-        for item in dados_live.get("itens", [])
-    ]
-    saldos_live = xml_engine.calcular_saldo_credito_digital(
-        itens_live,
-        dados_live.get("devolucoes", []),
-        dados_live.get("eventos_split", []),
-        dados_live.get("eventos_liquidacao", []),
-    )
+    saldos_live = xml_engine.calcular_saldos_com_cofre(dados_live)
     selo_telemetria = (
         "🟢 Telemetria Hub Split Payment Ativa • Atualização em Tempo Real (&lt; 15s)"
         if TELEMETRIA_AUTOMATICA_15S
@@ -2653,6 +2650,7 @@ def renderizar_fila_quarentena(
             filtro_itens = st.text_input(
                 "Buscar na quarentena",
                 placeholder="Descrição, NCM ou CFOP",
+                autocomplete="off",
                 key=f"busca_quarentena_{empresa_id}",
             ).strip().casefold()
             itens_filtrados = [
@@ -2869,6 +2867,7 @@ def renderizar_fila_quarentena(
                     "CFOP": item.get("cfop", ""),
                     "Valor Contábil (R$)": float(item.get("valor_item", 0.0)),
                     "Status / Decisão do Contador": item.get("classificacao_item", ""),
+                    "Fundamentação Legal": xml_engine.fundamentacao_legal_item(item),
                 }
                 for item in auditados
             ])
@@ -2982,14 +2981,23 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                 )
             )
         ]
-        credito_ibs_danfe = round(sum(
+        credito_ibs_id_op = round(sum(
             float(item.get("credito_ibs_gerado", 0.0) or 0.0)
             for item in itens_danfe
         ), 2)
-        credito_cbs_danfe = round(sum(
+        credito_cbs_id_op = round(sum(
             float(item.get("credito_cbs_gerado", 0.0) or 0.0)
             for item in itens_danfe
         ), 2)
+        credito_ibs_danfe, credito_cbs_danfe = xml_engine.somar_ibs_cbs_itens(
+            itens_danfe
+        )
+        credito_ibs_danfe = round(credito_ibs_danfe, 2)
+        credito_cbs_danfe = round(credito_cbs_danfe, 2)
+        numero_danfe, serie_danfe = xml_engine.resolver_numero_serie(nota_danfe)
+        alerta_fornecedor = xml_engine.alerta_fornecedor_simples(
+            nota_danfe.get("crt_emitente")
+        )
         credito_danfe = round(sum(
             float(item.get("valor_credito_item", 0.0) or 0.0)
             for item in itens_danfe
@@ -3047,21 +3055,24 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                 key=f"baixar_xml_reconstruido_{empresa_id_ativo}_{nota_id_danfe}",
             )
 
-        metricas_danfe = st.columns(5)
-        metricas_danfe[0].metric(
-            "Número / Série",
-            f"{nota_danfe.get('numero', '—')} / {nota_danfe.get('serie', '—')}",
+        st.markdown(
+            xml_engine.html_cartoes_espelho([
+                ("Número / Série", f"{numero_danfe} / {serie_danfe}"),
+                (
+                    "Base de Cálculo / Produtos",
+                    xml_engine.formatar_brl(nota_danfe.get("valor_total_nf", 0.0)),
+                ),
+                ("IBS apurado", xml_engine.formatar_brl(credito_ibs_danfe)),
+                ("CBS apurado", xml_engine.formatar_brl(credito_cbs_danfe)),
+                (
+                    "Crédito Split Payment LC 214/2025",
+                    xml_engine.formatar_brl(credito_danfe),
+                ),
+            ]),
+            unsafe_allow_html=True,
         )
-        metricas_danfe[1].metric(
-            "Base de Cálculo / Produtos",
-            f"R$ {float(nota_danfe.get('valor_total_nf', 0.0)):,.2f}",
-        )
-        metricas_danfe[2].metric("IBS apurado", f"R$ {credito_ibs_danfe:,.2f}")
-        metricas_danfe[3].metric("CBS apurado", f"R$ {credito_cbs_danfe:,.2f}")
-        metricas_danfe[4].metric(
-            "Crédito Split Payment LC 214/2025",
-            f"R$ {credito_danfe:,.2f}",
-        )
+        if alerta_fornecedor:
+            st.warning(alerta_fornecedor)
         st.markdown("**Representação do código de barras / chave de acesso**")
         st.code(
             f"|||| ||| |||||| || |||| ||||||| ||| ||||| ||||\n{chave_acesso}",
@@ -3081,18 +3092,21 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
                             or item.get("qcom")
                             or 0.0
                         ),
-                        "Valor Unitário (R$)": float(
+                        "Valor Unitário (R$)": xml_engine.formatar_brl(
                             item.get("valor_unitario")
                             or (
                                 float(item.get("valor_item", 0.0) or 0.0)
                                 / max(float(item.get("quantidade_comercial") or 1.0), 0.0001)
                             )
                         ),
-                        "Valor Total (R$)": float(item.get("valor_item", 0.0) or 0.0),
+                        "Valor Total (R$)": xml_engine.formatar_brl(
+                            item.get("valor_item", 0.0)
+                        ),
                         "Status de Auditoria": item.get(
                             "classificacao_item",
                             item.get("status_credito", ""),
                         ),
+                        "Fundamentação Legal": xml_engine.fundamentacao_legal_item(item),
                     }
                     for item in itens_danfe
                 ]),
@@ -3114,8 +3128,8 @@ with st.expander(f"📁 5. Notas Fiscais Monitoradas na SEFAZ ({len(notas)} nota
             empresa_id_ativo,
             nota_danfe,
             valor_base_original,
-            credito_ibs_danfe,
-            credito_cbs_danfe,
+            credito_ibs_id_op,
+            credito_cbs_id_op,
         )
         resumo_eventos_operacao = xml_engine.resumir_eventos_liquidacao(
             eventos_liquidacao

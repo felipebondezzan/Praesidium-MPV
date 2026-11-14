@@ -1,4 +1,5 @@
 import base64
+import html
 import io
 import json
 from datetime import datetime, date
@@ -10,6 +11,7 @@ import xml_engine
 
 
 def _payload_danfe(nota: dict, itens: list[dict], empresa: dict) -> dict:
+    numero_nota, serie_nota = xml_engine.resolver_numero_serie(nota)
     payload = {
         "chave_acesso": str(nota.get("chave_acesso", "")),
         "cnpj_emitente": str(nota.get("cnpj_emitente", "")),
@@ -20,8 +22,8 @@ def _payload_danfe(nota: dict, itens: list[dict], empresa: dict) -> dict:
         ),
         "cnpj_destinatario": str(empresa.get("cnpj", "")),
         "nome_destinatario": str(empresa.get("razao_social", "")),
-        "numero": str(nota.get("numero") or nota.get("nNF") or "1"),
-        "serie": str(nota.get("serie") or "1"),
+        "numero": numero_nota if numero_nota != "—" else "1",
+        "serie": serie_nota if serie_nota != "—" else "1",
         "data_emissao": str(nota.get("data_emissao") or date.today().isoformat()),
         "valor_total_nf": float(nota.get("valor_total_nf", 0.0) or 0.0),
         "itens": [
@@ -51,8 +53,8 @@ def _payload_danfe(nota: dict, itens: list[dict], empresa: dict) -> dict:
                     or item.get("valor_total_bruto")
                     or 0.0
                 ),
-                "ibs": float(item.get("credito_ibs_gerado") or 0.0),
-                "cbs": float(item.get("credito_cbs_gerado") or 0.0),
+                "ibs": xml_engine.obter_ibs_cbs_item(item)[0],
+                "cbs": xml_engine.obter_ibs_cbs_item(item)[1],
                 "status": str(
                     item.get("classificacao_item")
                     or item.get("status_credito")
@@ -373,6 +375,7 @@ def injetar_css_blindado_relatorio():
         }
     </style>
     """, unsafe_allow_html=True)
+    xml_engine.injetar_css_anti_truncamento()
 
 
 @st.cache_data(show_spinner=False)
@@ -543,6 +546,10 @@ def montar_dataframe_relacional(
                 if int(resumo_operacao.get("eventos", 0)) > 0
                 else "Aguardando evento de liquidação"
             ),
+            "Fundamentação Legal (LC 214/2025)": xml_engine.fundamentacao_legal_item(item),
+            "Alerta Fornecedor": xml_engine.alerta_fornecedor_simples(
+                nota_info.get("crt_emitente")
+            ) or "",
         })
 
     # ESTRATÉGIA 4: Iterar por notas e itens (lógica original)
@@ -616,12 +623,18 @@ def gerar_html_dossie_analitico(
     if notas_filtradas:
         for n in notas_filtradas:
             hash_curto = str(n.get("hash_sha256_xml", ""))[:24] + "..."
+            alerta_nota = xml_engine.alerta_fornecedor_simples(n.get("crt_emitente"))
+            alerta_html = (
+                f"<div style='color:#fbbf24; font-size:11px; margin-top:4px;'>{html.escape(alerta_nota)}</div>"
+                if alerta_nota
+                else ""
+            )
             linhas_html_notas += f"""
             <tr>
                 <td style="font-family: monospace;">{n.get('chave_acesso', '')}</td>
                 <td>{n.get('cnpj_emitente', '')}</td>
                 <td style="text-align: right; font-weight: bold;">R$ {float(n.get('valor_total_nf', 0.0)):,.2f}</td>
-                <td>{n.get('manifestacao_status', '')}</td>
+                <td>{n.get('manifestacao_status', '')}{alerta_html}</td>
                 <td style="font-family: monospace; font-size: 10px; color: #9ca3af;">{hash_curto}</td>
             </tr>"""
     else:
@@ -640,6 +653,7 @@ def gerar_html_dossie_analitico(
 
             status_txt = str(row["Status Auditoria"])
             cor = "#34d399" if "Aprovado" in status_txt else ("#fbbf24" if "Quarentena" in status_txt else "#f87171")
+            fundamentacao = html.escape(str(row.get("Fundamentação Legal (LC 214/2025)", "") or "—"))
 
             linhas_html_itens += f"""
             <tr>
@@ -652,9 +666,10 @@ def gerar_html_dossie_analitico(
                 <td style="text-align: right; color: #34d399; font-weight: bold;">R$ {vl_cred:,.2f}</td>
                 <td style="text-align: right; color: #fbbf24;">R$ {vl_quar:,.2f}</td>
                 <td style="color: {cor}; font-weight: bold;">{status_txt}</td>
+                <td style="font-size: 11px;">{fundamentacao}</td>
             </tr>"""
     else:
-        linhas_html_itens = "<tr><td colspan='9' style='text-align:center;'>Nenhum item enquadrado nos filtros.</td></tr>"
+        linhas_html_itens = "<tr><td colspan='10' style='text-align:center;'>Nenhum item enquadrado nos filtros.</td></tr>"
 
     return f"""<!DOCTYPE html>
 <html lang="pt-BR">
@@ -719,7 +734,7 @@ def gerar_html_dossie_analitico(
 
     <h2>2. Livro Analítico de Itens ({len(df_itens_filtrados)} registros)</h2>
     <table>
-        <thead><tr><th>Data</th><th>Fornecedor</th><th>Descrição do Item</th><th>NCM</th><th>CFOP</th><th style="text-align: right;">Base Contábil</th><th style="text-align: right;">Crédito IBS/CBS</th><th style="text-align: right;">Quarentena</th><th>Status</th></tr></thead>
+        <thead><tr><th>Data</th><th>Fornecedor</th><th>Descrição do Item</th><th>NCM</th><th>CFOP</th><th style="text-align: right;">Base Contábil</th><th style="text-align: right;">Crédito IBS/CBS</th><th style="text-align: right;">Quarentena</th>        <th>Status</th><th>Fundamentação Legal</th></tr></thead>
         <tbody>{linhas_html_itens}</tbody>
         <tfoot>
             <tr class="tfoot-row">
@@ -728,6 +743,7 @@ def gerar_html_dossie_analitico(
                 <td style="text-align: right; color: #34d399;">R$ {tot_cred:,.2f}</td>
                 <td style="text-align: right; color: #fbbf24;">R$ {tot_quar:,.2f}</td>
                 <td>—</td>
+                        <td>—</td>
             </tr>
         </tfoot>
     </table>
@@ -829,6 +845,7 @@ def renderizar_modulo_relatorio(
                 busca_texto = st.text_input(
                     "🔍 Busca Textual",
                     placeholder="Ex: Cadeira, 22021000, 5556...",
+                    autocomplete="off",
                     key=f"flt_txt_{empresa_ativa['id']}"
                 )
             with f_col5:
@@ -931,6 +948,8 @@ def renderizar_modulo_relatorio(
             "IBS/CBS Compensados / Recolhidos (R$)",
             "Crédito Digital Compensado no Hub (R$)",
             "Glosa Preventiva / Quarentena (R$)",
+            "Fundamentação Legal (LC 214/2025)",
+            "Alerta Fornecedor",
             "Status de Conciliação",
         ]
         if not df_filtrado.empty:

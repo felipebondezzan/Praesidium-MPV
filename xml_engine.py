@@ -47,7 +47,22 @@ ALIQUOTAS_REFORMA_TRIBUTARIA = {
         "fator_reducao": 0.0,
         "reducao_percentual": 100.0,
     },
+    "Alíquota Teste de Transição — 1,00% (0,90% CBS + 0,10% IBS)": {
+        "fator_reducao": 1.0 / 26.5,
+        "reducao_percentual": round((1.0 - 1.0 / 26.5) * 100.0, 4),
+        "aliquota_ibs_efetiva": 0.10,
+        "aliquota_cbs_efetiva": 0.90,
+        "fracao_ibs": 0.10,
+    },
 }
+FRACAO_IBS_PADRAO = 0.177 / 0.265
+CRTS_FORNECEDOR_SIMPLES = {"1": "Simples Nacional", "2": "Simples Nacional", "4": "MEI"}
+CARIMBO_APROVACAO_ART_47 = (
+    "Homologado: Insumo Essencial à Atividade Econômica (Art. 47 da LC 214/2025)"
+)
+CARIMBO_GLOSA_ART_57 = (
+    "Glosado: Uso ou Consumo Pessoal / Alheio à Atividade (Art. 57 da LC 214/2025)"
+)
 TAG_TENANT_PATTERN = re.compile(r"\s*\[T:[^\]]+\]", re.IGNORECASE)
 CHAVE_ACESSO_PATTERN = re.compile(r"\d{44}")
 DESCRICAO_USO_INTERNO_PATTERN = re.compile(
@@ -594,10 +609,21 @@ def calcular_memoria_aliquota(derivacao: str) -> dict[str, float | str]:
         "reducao_percentual": float(regra["reducao_percentual"]),
         "aliquota_ibs_base": 17.7,
         "aliquota_cbs_base": 8.8,
-        "aliquota_ibs_efetiva": _arredondar_dinheiro(17.7 * fator),
-        "aliquota_cbs_efetiva": _arredondar_dinheiro(8.8 * fator),
+        "aliquota_ibs_efetiva": regra.get(
+            "aliquota_ibs_efetiva", _arredondar_dinheiro(17.7 * fator)
+        ),
+        "aliquota_cbs_efetiva": regra.get(
+            "aliquota_cbs_efetiva", _arredondar_dinheiro(8.8 * fator)
+        ),
         "aliquota_efetiva": _arredondar_dinheiro(26.5 * fator),
     }
+
+
+def fracao_ibs_do_perfil(perfil: dict | None) -> float:
+    """Participação do IBS na alíquota efetiva da derivação setorial do cliente."""
+    derivacao = str((perfil or {}).get("derivacao_setorial") or "")
+    regra = ALIQUOTAS_REFORMA_TRIBUTARIA.get(derivacao, {})
+    return float(regra.get("fracao_ibs", FRACAO_IBS_PADRAO))
 
 
 def calcular_id_operacao(
@@ -898,13 +924,19 @@ def _escrever_ledger_empresa(supabase, empresa_id, chave: str, payload: dict) ->
     }
     existente = (
         supabase.table("empresas_monitoradas")
-        .select("id")
+        .select("id,cnpj,razao_social,regime_tributario")
         .eq("regime_tributario", filtros["regime_tributario"])
         .eq("cnpj", filtros["cnpj"])
         .limit(1)
         .execute()
     )
     if existente.data:
+        dono = ppf.decodificar_ledger(existente.data[0]) or {}
+        if str(dono.get("empresa_id")) != str(empresa_id) or dono.get("item_uid") != chave:
+            # Colisão de hash entre empresas: nunca sobrescreve o ledger de outro cliente.
+            raise RuntimeError(
+                "Identificador de ledger já pertence a outro registro; gravação recusada."
+            )
         ok, mensagem, _ = executar_update_seguro(
             supabase,
             "empresas_monitoradas",
@@ -921,8 +953,17 @@ def _escrever_ledger_empresa(supabase, empresa_id, chave: str, payload: dict) ->
         raise RuntimeError(mensagem)
 
 
-def _ler_ledger_empresa(supabase, empresa_id, chave: str | None = None) -> list[dict]:
-    """Payloads do ledger da empresa (ledger fiscal e/ou [SYS_LEDGER])."""
+def _ler_ledger_empresa(
+    supabase,
+    empresa_id,
+    chave: str | None = None,
+    falhas: set | None = None,
+) -> list[dict]:
+    """Payloads do ledger da empresa (ledger fiscal e/ou [SYS_LEDGER]).
+
+    Falhas reais de leitura (exceto tabela/coluna ausente) são acrescentadas a
+    `falhas` para que o chamador saiba que a leitura pode estar incompleta.
+    """
     if supabase is None or not eh_uuid_valido(empresa_id):
         return []
     registros: list[dict] = []
@@ -945,6 +986,8 @@ def _ler_ledger_empresa(supabase, empresa_id, chave: str | None = None) -> list[
                     })
         except Exception as erro:
             if not _registrar_recurso_ausente(erro, "praesidium_ledger_fiscal"):
+                if falhas is not None:
+                    falhas.add("praesidium_ledger_fiscal")
                 logging.getLogger(__name__).warning(
                     "Falha ao ler o ledger fiscal da empresa %s: %s",
                     empresa_id,
@@ -973,6 +1016,8 @@ def _ler_ledger_empresa(supabase, empresa_id, chave: str | None = None) -> list[
                     })
         except Exception as erro:
             if not _registrar_recurso_ausente(erro, "praesidium_empresa_mirror"):
+                if falhas is not None:
+                    falhas.add("praesidium_empresa_mirror")
                 logging.getLogger(__name__).warning(
                     "Falha ao ler o ledger do espelho da empresa %s: %s",
                     empresa_id,
@@ -999,6 +1044,8 @@ def _ler_ledger_empresa(supabase, empresa_id, chave: str | None = None) -> list[
                 payload.pop("_sys_id", None)
                 registros.append(payload)
     except Exception as erro:
+        if falhas is not None:
+            falhas.add("empresas_monitoradas:ledger")
         logging.getLogger(__name__).warning(
             "Falha ao ler o ledger [SYS_LEDGER] da empresa %s: %s",
             empresa_id,
@@ -1053,6 +1100,253 @@ def persistir_perfil_tributario_empresa(
     return memoria
 
 
+def _chave_cofre_saldo() -> str:
+    return ppf.CHAVE_LEDGER_COFRE_SALDO if ppf else "config:saldo-consolidado:v1"
+
+
+def _cofre_valido_da_empresa(cofre, empresa_id) -> dict | None:
+    if (
+        not isinstance(cofre, dict)
+        or cofre.get("record_type") != "company_balance_vault"
+        or str(cofre.get("empresa_id")) != str(empresa_id)
+    ):
+        return None
+    return cofre
+
+
+def _chave_nota_item(item: dict) -> str:
+    """Identificador estável da nota de um item (chave de acesso, senão id da nota)."""
+    chave = re.sub(r"\D", "", str(item.get("chave_acesso") or ""))
+    if len(chave) == 44:
+        return chave
+    encontrada = CHAVE_ACESSO_PATTERN.search(str(item.get("item_uid") or ""))
+    if encontrada:
+        return encontrada.group(0)
+    nota_id = str(item.get("nota_id") or "")
+    return f"id:{nota_id}" if nota_id else "sem_nota"
+
+
+def _contar_itens_por_nota(itens: list[dict] | None) -> dict[str, int]:
+    contagem: dict[str, int] = {}
+    for item in itens or []:
+        chave = _chave_nota_item(item)
+        contagem[chave] = contagem.get(chave, 0) + 1
+    return contagem
+
+
+def consolidar_cofre_saldo(
+    empresa_id,
+    itens: list[dict],
+    saldos: dict[str, float],
+    cofre_anterior: dict | None = None,
+    *,
+    leitura_confiavel: bool = True,
+) -> tuple[dict | None, bool]:
+    """Atualiza o cofre de saldo consolidado (bruto/líquido) de UMA empresa.
+
+    Regras:
+    - leitura incompleta/instável (`leitura_confiavel=False`): o cofre anterior
+      é mantido intacto;
+    - visão parcial (alguma nota já consolidada sumiu da listagem ou perdeu
+      itens): os saldos nunca caem; notas novas somam ao saldo e o restante
+      vale o maior entre o cofre e a apuração atual;
+    - visão completa (todas as notas consolidadas continuam listadas): a
+      apuração atual é autoritativa (decisões da quarentena, estornos e
+      liquidações legítimas refletem no cofre).
+    Cofres de outra empresa são descartados. Só "Zerar Notas" e "Excluir
+    Cliente" apagam o cofre.
+
+    Returns:
+        (cofre, alterado): `cofre` é o registro a exibir/persistir (ou None se
+        a empresa ainda não tem créditos) e `alterado` indica se precisa gravar.
+    """
+    anterior = _cofre_valido_da_empresa(cofre_anterior, empresa_id)
+    if not leitura_confiavel:
+        return anterior, False
+
+    total_itens = len(itens or [])
+    por_nota_atual = _contar_itens_por_nota(itens)
+    apurado = {
+        "saldo_bruto_consolidado": _arredondar_dinheiro(saldos.get("bruto", 0.0)),
+        "saldo_liquido_consolidado": _arredondar_dinheiro(
+            saldos.get("credito_liquido", 0.0)
+        ),
+        "saldo_quarentena_consolidado": _arredondar_dinheiro(
+            saldos.get("quarentena", 0.0)
+        ),
+        "credito_validado_consolidado": _arredondar_dinheiro(
+            saldos.get("validado", 0.0)
+        ),
+    }
+    if anterior is None:
+        if total_itens == 0:
+            return None, False
+        valores, por_nota = apurado, por_nota_atual
+        itens_consolidados = total_itens
+    else:
+        itens_anteriores = int(_float_seguro(anterior.get("itens_consolidados"), 0.0))
+        bruto_por_nota = anterior.get("itens_por_nota")
+        por_nota_anterior = (
+            {str(chave): int(_float_seguro(qtd, 0.0)) for chave, qtd in bruto_por_nota.items()}
+            if isinstance(bruto_por_nota, dict)
+            else None
+        )
+        if por_nota_anterior is not None:
+            # Completa = toda nota já consolidada continua listada, com todos os itens.
+            visao_completa = all(
+                por_nota_atual.get(chave, 0) >= qtd
+                for chave, qtd in por_nota_anterior.items()
+            )
+        else:
+            visao_completa = total_itens >= itens_anteriores
+        if visao_completa:
+            valores, por_nota = apurado, por_nota_atual
+            itens_consolidados = total_itens
+        else:
+            # Notas ainda desconhecidas pelo cofre somam ao saldo; o restante só sobe.
+            conhecidas = por_nota_anterior or {}
+            novas = calcular_resumo_creditos([
+                item for item in itens or []
+                if _chave_nota_item(item) not in conhecidas
+            ]) if por_nota_anterior is not None else {}
+            contribuicao = {
+                "saldo_bruto_consolidado": novas.get("bruto", 0.0),
+                "saldo_liquido_consolidado": novas.get("validado", 0.0),
+                "saldo_quarentena_consolidado": novas.get("quarentena", 0.0),
+                "credito_validado_consolidado": novas.get("validado", 0.0),
+            }
+            valores = {
+                campo: _arredondar_dinheiro(
+                    max(
+                        _arredondar_dinheiro(_float_seguro(anterior.get(campo), 0.0)),
+                        valor - contribuicao[campo],
+                    )
+                    + contribuicao[campo]
+                )
+                for campo, valor in apurado.items()
+            }
+            if por_nota_anterior is not None:
+                por_nota = {
+                    chave: max(por_nota_anterior.get(chave, 0), por_nota_atual.get(chave, 0))
+                    for chave in {*por_nota_anterior, *por_nota_atual}
+                }
+                itens_consolidados = sum(por_nota.values())
+            else:
+                por_nota, itens_consolidados = None, itens_anteriores
+        if (
+            itens_consolidados == itens_anteriores
+            and (por_nota is None) == (por_nota_anterior is None)
+            and (por_nota is None or por_nota == por_nota_anterior)
+            and all(
+                _arredondar_dinheiro(_float_seguro(anterior.get(campo), 0.0)) == valor
+                for campo, valor in valores.items()
+            )
+        ):
+            return anterior, False
+
+    cofre = {
+        **valores,
+        "record_type": "company_balance_vault",
+        "empresa_id": str(empresa_id),
+        "itens_consolidados": itens_consolidados,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if por_nota is not None:
+        cofre["notas_consolidadas"] = sorted(por_nota)
+        cofre["itens_por_nota"] = por_nota
+    return cofre, True
+
+
+def aplicar_cofre_aos_saldos(
+    saldos: dict[str, float],
+    cofre: dict | None,
+) -> dict[str, float]:
+    """Impostômetro exibido: valores do cofre no lugar da apuração momentânea."""
+    exibidos = dict(saldos)
+    if not cofre:
+        return exibidos
+    liquido = _arredondar_dinheiro(
+        _float_seguro(cofre.get("saldo_liquido_consolidado"), saldos["credito_liquido"])
+    )
+    exibidos.update({
+        "bruto": _arredondar_dinheiro(
+            _float_seguro(cofre.get("saldo_bruto_consolidado"), saldos["bruto"])
+        ),
+        "quarentena": _arredondar_dinheiro(
+            _float_seguro(cofre.get("saldo_quarentena_consolidado"), saldos["quarentena"])
+        ),
+        "validado": _arredondar_dinheiro(
+            _float_seguro(cofre.get("credito_validado_consolidado"), saldos["validado"])
+        ),
+        "credito_liquido": liquido,
+        "credito_disponivel": max(0.0, liquido),
+    })
+    return exibidos
+
+
+def persistir_cofre_saldo_empresa(supabase, empresa_id, cofre: dict) -> None:
+    if supabase is None:
+        raise RuntimeError("Supabase indisponível para gravar o cofre de saldo.")
+    if not eh_uuid_valido(empresa_id):
+        raise ValueError("Empresa inválida para gravar o cofre de saldo.")
+    if _cofre_valido_da_empresa(cofre, empresa_id) is None:
+        raise ValueError("O cofre de saldo não pertence à empresa informada.")
+    _escrever_ledger_empresa(supabase, empresa_id, _chave_cofre_saldo(), cofre)
+
+
+def calcular_saldos_com_cofre(dados: dict) -> dict[str, float]:
+    """Saldos do Impostômetro de uma empresa já protegidos pelo cofre."""
+    itens = [normalizar_item_credito(item) for item in dados.get("itens", [])]
+    saldos = calcular_saldo_credito_digital(
+        itens,
+        dados.get("devolucoes", []),
+        dados.get("eventos_split", []),
+        dados.get("eventos_liquidacao", []),
+    )
+    return aplicar_cofre_aos_saldos(saldos, dados.get("cofre_saldo"))
+
+
+def sincronizar_cofre_saldo(
+    supabase,
+    empresa_id,
+    dados: dict,
+    cofre_em_memoria: dict | None = None,
+) -> dict:
+    """Consolida e grava o cofre da empresa; devolve `dados` com `cofre_saldo`.
+
+    `cofre_em_memoria` (último cofre válido da sessão) só substitui o ledger
+    quando a leitura falhou; com leitura íntegra o banco é a verdade, de modo
+    que um "Zerar Notas" feito em outra sessão nunca é desfeito.
+    """
+    resultado = dict(dados)
+    persistido = _cofre_valido_da_empresa(dados.get("cofre_saldo"), empresa_id)
+    if dados.get("_falha_hidratacao"):
+        resultado["cofre_saldo"] = persistido or _cofre_valido_da_empresa(
+            cofre_em_memoria, empresa_id
+        )
+        return resultado
+
+    itens = [normalizar_item_credito(item) for item in dados.get("itens", [])]
+    saldos = calcular_saldo_credito_digital(
+        itens,
+        dados.get("devolucoes", []),
+        dados.get("eventos_split", []),
+        dados.get("eventos_liquidacao", []),
+    )
+    cofre, alterado = consolidar_cofre_saldo(empresa_id, itens, saldos, persistido)
+    if cofre is not None and alterado:
+        try:
+            persistir_cofre_saldo_empresa(supabase, empresa_id, cofre)
+        except Exception as erro:
+            logging.getLogger(__name__).warning(
+                "Cofre de saldo da empresa %s mantido apenas em memória: %s",
+                empresa_id,
+                erro,
+            )
+    resultado["cofre_saldo"] = cofre
+    return resultado
+
+
 def obter_credito_quarentena(item: dict) -> float:
     """Calcula o crédito potencial com a alíquota persistida, compatível com dados legados."""
     item = normalizar_item_credito(item)
@@ -1091,6 +1385,164 @@ def obter_credito_rejeitado(item: dict) -> float:
 
 def obter_versao_regra_nota(nota: dict) -> str:
     return str(nota.get("regra_tributaria_version") or "Legado — versão não registrada")
+
+
+def formatar_brl(valor) -> str:
+    """Moeda no padrão brasileiro: R$ 15.450.890,75."""
+    numero = _arredondar_dinheiro(valor)
+    texto = f"{abs(numero):,.2f}".replace(",", "\0").replace(".", ",").replace("\0", ".")
+    return f"{'-' if numero < 0 else ''}R$ {texto}"
+
+
+def resolver_numero_serie(nota: dict) -> tuple[str, str]:
+    """Número e série da NF-e; se ausentes, extraídos da chave de 44 dígitos.
+
+    A chave carrega a série nas posições 23-25 e o número (nNF) nas 26-34.
+    """
+    chave = re.sub(r"\D", "", str(nota.get("chave_acesso") or ""))
+    numero = str(nota.get("numero") or nota.get("nNF") or "").strip()
+    serie = str(nota.get("serie") or "").strip()
+    if len(chave) == 44:
+        if not numero:
+            numero = chave[25:34].lstrip("0") or "0"
+        if not serie:
+            serie = chave[22:25].lstrip("0") or "0"
+    return numero or "—", serie or "—"
+
+
+def obter_ibs_cbs_item(item: dict) -> tuple[float, float]:
+    """IBS e CBS do crédito do item.
+
+    Usa os valores persistidos; registros legados gravados com IBS/CBS zerados
+    (ou sem a divisão) têm o crédito repartido pela proporção IBS/CBS padrão.
+    """
+    normalizado = normalizar_item_credito(item)
+    ibs = _float_seguro(normalizado.get("credito_ibs_gerado"), 0.0)
+    cbs = _float_seguro(normalizado.get("credito_cbs_gerado"), 0.0)
+    if ibs <= 0:
+        ibs = _float_seguro(normalizado.get("valor_ibs"), 0.0)
+    if cbs <= 0:
+        cbs = _float_seguro(normalizado.get("valor_cbs"), 0.0)
+    credito = _float_seguro(normalizado.get("valor_credito_item"), 0.0)
+    if (
+        (ibs + cbs <= 0 or (cbs <= 0 < ibs))
+        and credito > 0
+        and not normalizado.get("credito_xml_informado")
+    ):
+        aliquota_ibs = _float_seguro(normalizado.get("aliquota_ibs_aplicada"), 0.0)
+        aliquota_cbs = _float_seguro(normalizado.get("aliquota_cbs_aplicada"), 0.0)
+        fracao = (
+            aliquota_ibs / (aliquota_ibs + aliquota_cbs)
+            if aliquota_ibs > 0 and aliquota_cbs > 0
+            else FRACAO_IBS_PADRAO
+        )
+        ibs = _arredondar_dinheiro(credito * fracao)
+        cbs = _arredondar_dinheiro(credito - ibs)
+    return _arredondar_dinheiro(ibs), _arredondar_dinheiro(cbs)
+
+
+def somar_ibs_cbs_itens(itens: list[dict]) -> tuple[float, float]:
+    total_ibs = total_cbs = Decimal("0")
+    for item in itens or []:
+        ibs, cbs = obter_ibs_cbs_item(item)
+        total_ibs += Decimal(str(ibs))
+        total_cbs += Decimal(str(cbs))
+    return float(total_ibs), float(total_cbs)
+
+
+def alerta_fornecedor_simples(crt) -> str | None:
+    """Aviso da LC 214/2025 para fornecedores do Simples Nacional/MEI (CRT 1, 2 ou 4)."""
+    crt = str(crt or "").strip()
+    if crt not in CRTS_FORNECEDOR_SIMPLES:
+        return None
+    rotulo = (
+        "Fornecedor Simples Nacional"
+        if crt in {"1", "2"}
+        else "Fornecedor Simples Nacional — MEI"
+    )
+    return (
+        f"⚠️ {rotulo} (CRT {crt}) — Atenção: Crédito de IBS/CBS limitado à "
+        "alíquota efetiva recolhida no DAS (Art. 28 e Art. 47 da LC 214/2025)."
+    )
+
+
+def fundamentacao_legal_item(item: dict) -> str:
+    """Fundamentação legal exibida no dossiê: decisão do contador ou regra do motor."""
+    classificacao = str(item.get("classificacao_item") or "").strip()
+    if classificacao == "Aprovado Manualmente Contador":
+        return CARIMBO_APROVACAO_ART_47
+    if classificacao == "Rejeitado pelo Contador":
+        return CARIMBO_GLOSA_ART_57
+    return str(item.get("justificativa_motor") or item.get("justificativa") or "")
+
+
+CSS_ANTI_TRUNCAMENTO = """
+<style>
+    [data-testid="stMetricValue"],
+    [data-testid="stMetricValue"] > div,
+    [data-testid="stMetricLabel"],
+    [data-testid="stMetricLabel"] > div {
+        overflow: visible !important;
+        text-overflow: unset !important;
+        white-space: normal !important;
+        word-break: keep-all !important;
+        overflow-wrap: anywhere !important;
+    }
+    [data-testid="stMetricValue"],
+    [data-testid="stMetricValue"] > div {
+        font-size: clamp(1.0rem, 1.3vw, 1.45rem) !important;
+        line-height: 1.25 !important;
+    }
+    .espelho-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr));
+        gap: 12px;
+        margin: 10px 0 14px 0;
+    }
+    .espelho-card {
+        background: #111827;
+        border: 1px solid #374151;
+        border-left: 4px solid #d4af37;
+        border-radius: 8px;
+        padding: 12px 14px;
+    }
+    .espelho-label {
+        color: #9ca3af;
+        font-size: 0.72rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
+        white-space: normal;
+        overflow-wrap: anywhere;
+    }
+    .espelho-valor {
+        color: #ffffff;
+        font-weight: 800;
+        font-size: clamp(1.0rem, 1.3vw, 1.45rem);
+        line-height: 1.25;
+        margin-top: 4px;
+        overflow: visible;
+        text-overflow: unset;
+        white-space: normal;
+        word-break: keep-all;
+        overflow-wrap: anywhere;
+    }
+</style>
+"""
+
+
+def injetar_css_anti_truncamento() -> None:
+    st.markdown(CSS_ANTI_TRUNCAMENTO, unsafe_allow_html=True)
+
+
+def html_cartoes_espelho(cartoes: list[tuple[str, str]]) -> str:
+    """Cabeçalho do espelho da nota em grade responsiva, sem truncar valores."""
+    itens = "".join(
+        f'<div class="espelho-card"><div class="espelho-label">{escape_xml(rotulo)}</div>'
+        f'<div class="espelho-valor">{escape_xml(valor)}</div></div>'
+        for rotulo, valor in cartoes
+    )
+    return f'<div class="espelho-grid">{itens}</div>'
 
 
 def calcular_resumo_creditos(itens: list) -> dict[str, float]:
@@ -1200,6 +1652,7 @@ _TABELAS_SEM_FALLBACK_LOCAL = frozenset({
 TIPOS_REGISTRO_LEDGER = frozenset({
     "split_payment_operation_event",
     "company_tax_profile",
+    "company_balance_vault",
 })
 
 
@@ -1816,7 +2269,7 @@ def sanitizar_payload_supabase(tabela: str, payload, parcial: bool = False):
             cnpj = "".join(filter(str.isdigit, str(atual.get("cnpj_emitente", ""))))
             atual["cnpj_emitente"] = cnpj if len(cnpj) == 14 else _CNPJ_FORNECEDOR_PADRAO
             crt = str(atual.get("crt_emitente", "")).strip()
-            atual["crt_emitente"] = crt if crt in {"1", "2", "3"} else "3"
+            atual["crt_emitente"] = crt if crt in {"1", "2", "3", "4"} else "3"
             atual.setdefault("data_emissao", datetime.now().isoformat())
             atual.setdefault("status_manifestacao", atual["manifestacao_status"])
         elif tabela == "itens_nota_fiscal" and not parcial:
@@ -2061,12 +2514,15 @@ def _guardar_fallback(tabela: str, payload, operacao: str = "insert", filtros: d
 
     for registro_original in registros:
         registro = dict(registro_original)
-        empresa_id = registro.get("empresa_id") or st.session_state.get("empresa_id_ativa")
-        if tabela in {"notas_fiscais_recebidas", "itens_nota_fiscal"} and not empresa_id:
+        tabela_por_empresa = tabela != "empresas_monitoradas"
+        empresa_id = registro.get("empresa_id") or _empresa_id_sessao_valida()
+        if tabela_por_empresa and not eh_uuid_valido(empresa_id):
             logging.getLogger(__name__).error(
-                "Fallback local rejeitado sem empresa_id para a tabela %s.", tabela
+                "Fallback local rejeitado sem empresa_id válido para a tabela %s.", tabela
             )
             continue
+        if tabela_por_empresa:
+            registro["empresa_id"] = empresa_id
         if tabela == "notas_fiscais_recebidas" and not registro.get("id"):
             registro["id"] = str(uuid.uuid4())
         elif tabela == "itens_nota_fiscal" and not registro.get("id"):
@@ -2078,9 +2534,7 @@ def _guardar_fallback(tabela: str, payload, operacao: str = "insert", filtros: d
             registro.update(registro_original)
             for chave, valor in (filtros or {}).items():
                 registro.setdefault(chave, valor)
-        chave_sessao = f"{prefixo}{empresa_id}" if tabela in {
-            "notas_fiscais_recebidas", "itens_nota_fiscal", "conciliacao_devolucoes"
-        } else prefixo
+        chave_sessao = f"{prefixo}{empresa_id}" if tabela_por_empresa else prefixo
         existentes = list(st.session_state.get(chave_sessao, []))
         identificador = registro.get("item_uid") or registro.get("id")
         encontrado = False
@@ -2763,6 +3217,48 @@ def hidratar_dados_empresa_com_cache(
     return dados
 
 
+def hidratar_dados_empresa_protegido(
+    supabase,
+    empresa_id,
+    empresa_ativa: dict,
+    cache: dict[str, dict],
+) -> dict:
+    """Hidratação da empresa ativa com snapshot por empresa e cofre de saldo.
+
+    `cache` é particionado por `str(empresa_id)`; um snapshot nunca é servido
+    para outra empresa.
+    """
+    chave_cache = str(empresa_id)
+    try:
+        dados = hidratar_dados_empresa_supabase(supabase, empresa_id, empresa_ativa)
+    except RuntimeError:
+        logging.getLogger(__name__).warning(
+            "Hidratação indisponível para a empresa %s; usando o último snapshot válido.",
+            empresa_id,
+        )
+        return hidratar_dados_empresa_com_cache(
+            supabase, empresa_id, empresa_ativa, cache
+        )
+    snapshot = cache.get(chave_cache)
+    if dados.get("_falha_hidratacao") and snapshot is not None:
+        return snapshot
+    dados = sincronizar_cofre_saldo(
+        supabase,
+        empresa_id,
+        dados,
+        (snapshot or {}).get("cofre_saldo"),
+    )
+    cache[chave_cache] = dados
+    for nome in (
+        "fallback_notas",
+        "fallback_itens",
+        "fallback_devolucoes",
+        "fallback_split_payment",
+    ):
+        st.session_state.pop(f"{nome}_{chave_cache}", None)
+    return dados
+
+
 def decidir_itens_quarentena_lote(
     supabase,
     empresa_id,
@@ -2795,9 +3291,9 @@ def decidir_itens_quarentena_lote(
     )
     status_credito = "Validado" if decisao == "aprovar" else "Rejeitado"
     justificativa = (
-        "Art. 47/57: aprovação após revalidação documental manual pelo contador."
+        CARIMBO_APROVACAO_ART_47
         if decisao == "aprovar"
-        else "Art. 57: crédito glosado após análise manual do contador."
+        else CARIMBO_GLOSA_ART_57
     )
 
     alvos = []
@@ -2826,7 +3322,7 @@ def decidir_itens_quarentena_lote(
             "itens_nota_fiscal",
             decisao_item,
             filtros,
-            fallback_record=item,
+            fallback_record={**item, "justificativa_motor": justificativa},
         )
         if not ok:
             log.error(
@@ -3095,6 +3591,7 @@ def _hidratacao_vazia(falha: bool = False) -> dict:
         "devolucoes": [],
         "eventos_split": [],
         "eventos_liquidacao": [],
+        "cofre_saldo": None,
         "perfil_tributario": None,
         "_falha_hidratacao": falha,
     }
@@ -3193,10 +3690,12 @@ def hidratar_dados_empresa_supabase(
                     erro,
                 )
 
+    falhas_ledger: set = set()
     registros_ledger = sorted(
-        _ler_ledger_empresa(supabase, empresa_id),
+        _ler_ledger_empresa(supabase, empresa_id, falhas=falhas_ledger),
         key=lambda registro: str(registro.get("updated_at", "")),
     )
+    falhas_leitura.update(falhas_ledger)
     espelho: dict[str, list[dict]] = {
         "item": [],
         "devolucao": [],
@@ -3236,6 +3735,7 @@ def hidratar_dados_empresa_supabase(
     ledger_por_uid = {}
     eventos_liquidacao = []
     perfil_tributario = None
+    cofre_saldo = None
     for payload in registros_ledger:
         tipo_registro = str(payload.get("record_type") or "")
         if tipo_registro == "split_payment_operation_event":
@@ -3243,6 +3743,12 @@ def hidratar_dados_empresa_supabase(
             continue
         if tipo_registro == "company_tax_profile":
             perfil_tributario = dict(payload)
+            continue
+        if tipo_registro == "company_balance_vault":
+            cofre_saldo = _cofre_valido_da_empresa(
+                {**payload, "empresa_id": payload.get("empresa_id", str(empresa_id))},
+                empresa_id,
+            ) or cofre_saldo
             continue
         uid_ledger = str(payload.get("item_uid") or "")
         if uid_ledger and not uid_ledger.startswith(("config:", "split-event:")):
@@ -3288,6 +3794,8 @@ def hidratar_dados_empresa_supabase(
             combinado = dict(normalizado)
             for chave, valor in existente.items():
                 if valor is None:
+                    continue
+                if chave == "justificativa_motor" and not valor and combinado.get(chave):
                     continue
                 if (
                     chave in _CAMPOS_SOMENTE_ESPELHO
@@ -3404,6 +3912,7 @@ def hidratar_dados_empresa_supabase(
         "devolucoes": devolucoes,
         "eventos_split": eventos_split,
         "eventos_liquidacao": eventos_liquidacao,
+        "cofre_saldo": cofre_saldo,
         "perfil_tributario": (
             calcular_memoria_aliquota(
                 str(
@@ -3964,7 +4473,7 @@ def _preparar_xml_nfe(
     data_emissao = _xml_texto(ide, "dhEmi", _xml_texto(ide, "dEmi"))
 
     crt_emitente = _xml_texto(emit, "CRT", "3") or "3"
-    if crt_emitente not in {"1", "2", "3"}:
+    if crt_emitente not in {"1", "2", "3", "4"}:
         crt_emitente = "3"
     valor_total_nf = _float_seguro(
         _xml_texto(total, "vNF", _xml_texto(total, "vProd", "0")),
@@ -4489,6 +4998,7 @@ def processar_xml_lote_bytes(
         perfil_tributario.get("fator_reducao"),
         1.0,
     )
+    fracao_ibs = fracao_ibs_do_perfil(perfil_tributario)
 
     try:
         notas_existentes = _carregar_notas_existentes(supabase, empresa_id_ativo)
@@ -4668,8 +5178,8 @@ def processar_xml_lote_bytes(
                 credito = _arredondar_dinheiro(
                     Decimal(str(valor_item)) * Decimal(str(aliquota_item))
                 )
-                aliquota_ibs = aliquota_item * (0.177 / 0.265)
-                aliquota_cbs = aliquota_item * (0.088 / 0.265)
+                aliquota_ibs = aliquota_item * fracao_ibs
+                aliquota_cbs = aliquota_item * (1.0 - fracao_ibs)
                 credito_ibs = _arredondar_dinheiro(
                     Decimal(str(valor_item)) * Decimal(str(aliquota_ibs))
                 )
@@ -5096,6 +5606,7 @@ def converter_danfe_pdf_para_xml(
 # ==========================================
 @fragment_if_supported
 def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
+    injetar_css_anti_truncamento()
     upload_feedback_key = f"upload_feedback_{empresa_id_ativo}"
     feedback_upload = st.session_state.pop(upload_feedback_key, None)
     if feedback_upload:
@@ -5265,13 +5776,14 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                 "arquivos de terceiros são rejeitados. DANFEs em PDF são reconstruídos "
                 "em memória e passam pela mesma auditoria CNAE."
             )
-            if "up_reset" not in st.session_state:
-                st.session_state["up_reset"] = 0
+            chave_up_reset = f"up_reset_{empresa_id_ativo}"
+            if chave_up_reset not in st.session_state:
+                st.session_state[chave_up_reset] = 0
             arquivos_xml = st.file_uploader(
                 "Selecione um ou mais arquivos .XML ou .PDF (DANFE) de NF-e",
                 type=["xml", "pdf"],
                 accept_multiple_files=True,
-                key=f"xml_up_{empresa_id_ativo}_{st.session_state.get('up_reset', 0)}"
+                key=f"xml_up_{empresa_id_ativo}_{st.session_state.get(chave_up_reset, 0)}"
             )
             if arquivos_xml:
                 if st.button("⚡ Auditar e Importar Arquivos Selecionados", width="stretch", key=f"btn_proc_xml_{empresa_id_ativo}"):
@@ -5324,7 +5836,7 @@ def renderizar_modulo_xml(supabase, empresa_id_ativo, empresa_ativa: dict):
                             resultados_final,
                         )
                     ]
-                    st.session_state["up_reset"] += 1
+                    st.session_state[chave_up_reset] += 1
                     st.session_state[upload_feedback_key] = feedback_processamento
                     if sucessos:
                         limpar_caches_dados()
@@ -5349,10 +5861,11 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
             f"NF-e {str(n.get('chave_acesso', ''))[:12]}... | Fornecedor: {n.get('cnpj_emitente', '')} | R$ {float(n.get('valor_total_nf', 0.0)):,.2f}": n
             for n in notas
         }
+        versao_formulario = f"_v{int(st.session_state.get('_versao_form_cadastro', 0))}"
         nf_escolhida_label = st.selectbox(
             "1. Selecione a Nota Fiscal de Origem:",
             list(opcoes_nf.keys()),
-            key=f"sel_nf_dev_{empresa_ativa['id']}"
+            key=f"sel_nf_dev_{empresa_ativa['id']}{versao_formulario}"
         )
         nf_orig = opcoes_nf[nf_escolhida_label]
         itens_da_nota = [
@@ -5377,7 +5890,7 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
         item_escolhido_label = st.selectbox(
             "2. Selecione a Mercadoria com Avaria / Divergência:",
             list(opcoes_itens.keys()),
-            key=f"sel_item_dev_{nf_orig.get('id', '0')}"
+            key=f"sel_item_dev_{nf_orig.get('id', '0')}{versao_formulario}"
         )
         item_alvo = opcoes_itens[item_escolhido_label]
         vl_max_item = float(item_alvo.get("valor_item", 0.0))
@@ -5389,7 +5902,7 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
             tipo_dev = st.radio(
                 "Modalidade:",
                 ["Devolução Total do Item", "Devolução Parcial (Avaria/Falta)"],
-                key=f"rad_tipo_dev_{item_key_id}"
+                key=f"rad_tipo_dev_{item_key_id}{versao_formulario}"
             )
         with c_d2:
             if tipo_dev == "Devolução Total do Item":
@@ -5398,7 +5911,7 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
                     value=vl_max_item,
                     disabled=True,
                     format="%.2f",
-                    key=f"num_dev_tot_{item_key_id}"
+                    key=f"num_dev_tot_{item_key_id}{versao_formulario}"
                 )
             else:
                 valor_devolvido = st.number_input(
@@ -5408,7 +5921,7 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
                     value=round(vl_max_item * 0.5, 2),
                     step=10.0,
                     format="%.2f",
-                    key=f"num_dev_parc_{item_key_id}"
+                    key=f"num_dev_parc_{item_key_id}{versao_formulario}"
                 )
         with c_d3:
             motivo_dev = st.selectbox(
@@ -5419,7 +5932,7 @@ def renderizar_emissor_devolucao(supabase, empresa_ativa: dict, notas: list, ite
                     "Produto Fora da Especificação / Validade Próxima",
                     "Erro de Faturamento pelo Fornecedor"
                 ],
-                key=f"mot_dev_{item_key_id}"
+                key=f"mot_dev_{item_key_id}{versao_formulario}"
             )
 
         proporcao = (valor_devolvido / vl_max_item) if vl_max_item > 0 else 0.0
